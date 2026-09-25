@@ -1,0 +1,11 @@
+.git
+.github
+data/
+*.db
+*.db-*
+bot.lock
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+tests/
