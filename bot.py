@@ -1,459 +1,284 @@
-import os
 import asyncio
-import time
+import json
+import os
+import tempfile
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import PollType
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    PollAnswerHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, PollAnswerHandler,
+    CallbackQueryHandler, ContextTypes, filters
 )
 
-from quiz_engine import load_questions, score_result
-from pdf_parser import parse_pdf, parse_txt, parse_text_to_questions, save_questions
+from pdf_parser import parse_pdf, parse_source_text, save_questions
+from quiz_engine import validate_questions, result_text
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+TOKEN = os.getenv("BOT_TOKEN")
+QUESTIONS_FILE = "questions.json"
+TIMEOUT = 30
 
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.environ.get("ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
-}
+sessions = {}          # user_id -> session
+poll_to_session = {}  # poll_id -> (user_id, question_index)
 
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
-QUIZ_FILE = DATA_DIR / "questions.json"
-
-TIME_LIMIT = 30
-
-# (chat_id, quiz_starter_user_id) -> session
-SESSIONS = {}
-
-LOCK = asyncio.Lock()
-
-
-def is_admin(user_id):
-    return bool(ADMIN_IDS) and user_id in ADMIN_IDS
-
-
-def start_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️ Quiz Start", callback_data="start_quiz")]
-    ])
-
-
-def stop_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛑 Quiz बंद करें", callback_data="stop_quiz")]
-    ])
-
-
-def key(chat_id, user_id):
-    return (chat_id, user_id)
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📚 Quiz Bot\n\n"
-        "Native Telegram Quiz mode में प्रश्न आएगा।\n"
-        "एक समय में एक प्रश्न होगा।\n"
-        "हर प्रश्न के लिए 30 सेकंड होंगे।",
-        reply_markup=start_keyboard(),
-    )
-
-
-async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start_quiz(
-        context.bot,
-        update.effective_chat.id,
-        update.effective_user.id,
-    )
-
-
-async def start_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    await start_quiz(
-        context.bot,
-        query.message.chat_id,
-        query.from_user.id,
-    )
-
-
-async def start_quiz(bot, chat_id, user_id):
-    questions = load_questions(QUIZ_FILE)[:100]
-
-    if not questions:
-        await bot.send_message(
-            chat_id,
-            "❌ अभी कोई Quiz उपलब्ध नहीं है।\n"
-            "Admin पहले PDF/Text से Quiz तैयार करे।"
-        )
-        return
-
-    session_key = key(chat_id, user_id)
-
-    async with LOCK:
-        old = SESSIONS.get(session_key)
-
-        if old and not old["finished"]:
-            await bot.send_message(
-                chat_id,
-                "⚠️ आपकी Quiz पहले से चल रही है।"
-            )
-            return
-
-        SESSIONS[session_key] = {
-            "questions": questions,
-            "index": 0,
-            "correct": 0,
-            "wrong": 0,
-            "skipped": 0,
-            "finished": False,
-            "poll_id": None,
-            "poll_message_id": None,
-            "timer_task": None,
-            "started": time.time(),
-        }
-
-    await bot.send_message(
-        chat_id,
-        f"🚀 Quiz शुरू!\n\nकुल प्रश्न: {len(questions)}"
-    )
-
-    await send_next_poll(bot, chat_id, user_id)
-
-
-async def send_next_poll(bot, chat_id, user_id):
-    session_key = key(chat_id, user_id)
-
-    async with LOCK:
-        session = SESSIONS.get(session_key)
-
-        if not session or session["finished"]:
-            return
-
-        if session["index"] >= len(session["questions"]):
-            session["finished"] = True
-            result = score_result(session)
-
-            await bot.send_message(
-                chat_id,
-                result,
-                reply_markup=start_keyboard(),
-            )
-            return
-
-        old_timer = session.get("timer_task")
-        if old_timer and not old_timer.done():
-            old_timer.cancel()
-
-        q = session["questions"][session["index"]]
-
-        poll = await bot.send_poll(
-            chat_id=chat_id,
-            question=f"प्रश्न {session['index'] + 1}/{len(session['questions'])}\n\n{q['question']}",
-            options=q["options"],
-            type="quiz",
-            correct_option_id=q["correct"],
-            is_anonymous=False,
-            allows_multiple_answers=False,
-        )
-
-        session["poll_id"] = poll.poll.id
-        session["poll_message_id"] = poll.message_id
-        session["poll_started"] = time.monotonic()
-
-        session["timer_task"] = asyncio.create_task(
-            poll_timeout(bot, chat_id, user_id, poll.poll.id)
-        )
-
-    # Stop button is separate so the question itself remains Telegram's
-    # native Quiz UI.
-    await bot.send_message(
-        chat_id,
-        f"📝 प्रश्न {session['index'] + 1}/{len(session['questions'])} चल रहा है।",
-        reply_markup=stop_keyboard(),
-    )
-
-
-async def poll_timeout(bot, chat_id, user_id, poll_id):
+def load_bank():
+    if not Path(QUESTIONS_FILE).exists():
+        return []
     try:
-        await asyncio.sleep(TIME_LIMIT)
-    except asyncio.CancelledError:
-        return
-
-    session_key = key(chat_id, user_id)
-
-    async with LOCK:
-        session = SESSIONS.get(session_key)
-
-        if not session or session["finished"]:
-            return
-
-        if session.get("poll_id") != poll_id:
-            return
-
-        session["skipped"] += 1
-        session["index"] += 1
-
-    try:
-        await bot.stop_poll(chat_id=chat_id, message_id=session["poll_message_id"])
+        data = json.loads(Path(QUESTIONS_FILE).read_text(encoding="utf-8"))
+        validate_questions(data)
+        return data
     except Exception:
-        pass
+        return []
 
-    await bot.send_message(
-        chat_id,
-        "⏰ 30 सेकंड पूरे — प्रश्न skip हो गया।"
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📚 Quiz Bot तैयार है।\n\n"
+        "/quiz — quiz शुरू करें\n"
+        "/stop — quiz बंद करें\n\n"
+        "Admin PDF या text source भेजकर question bank बदल सकता है।"
     )
 
-    await send_next_poll(bot, chat_id, user_id)
+async def start_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    bank = load_bank()
+    if not bank:
+        await update.message.reply_text("❌ अभी कोई valid question bank उपलब्ध नहीं है।")
+        return
 
+    sessions[user.id] = {
+        "chat_id": update.effective_chat.id,
+        "index": 0,
+        "correct": 0,
+        "wrong": 0,
+        "skipped": 0,
+        "total": len(bank),
+        "questions": bank,
+        "poll_id": None,
+        "timeout_task": None,
+    }
+    await send_next(user.id, context)
+
+async def send_next(user_id, context):
+    session = sessions.get(user_id)
+    if not session:
+        return
+
+    if session["index"] >= session["total"]:
+        await finish_quiz(user_id, context)
+        return
+
+    q = session["questions"][session["index"]]
+
+    # Full original question is always sent first so no source text is lost.
+    full_question = (
+        f"प्रश्न {q['number']}.\n\n{q['question']}\n\n"
+        f"A) {q['options'][0]['text']}\n\n"
+        f"B) {q['options'][1]['text']}\n\n"
+        f"C) {q['options'][2]['text']}\n\n"
+        f"D) {q['options'][3]['text']}"
+    )
+    chat_id = session["chat_id"]
+
+    # Telegram messages have a 4096-character limit.
+    if len(full_question) <= 4000:
+        await context.bot.send_message(chat_id=chat_id, text=full_question)
+
+    labels = [x["text"] for x in q["options"]]
+    correct_id = "ABCD".index(q["correct"])
+
+    poll = await context.bot.send_poll(
+        chat_id=chat_id,
+        question=f"प्रश्न {q['number']} — अपना उत्तर चुनें",
+        options=labels,
+        type=PollType.QUIZ,
+        correct_option_id=correct_id,
+        is_anonymous=False,
+        allows_multiple_answers=False,
+    )
+
+    session["poll_id"] = poll.poll.id
+    poll_to_session[poll.poll.id] = (user_id, session["index"])
+
+    async def timeout():
+        await asyncio.sleep(TIMEOUT)
+        current = sessions.get(user_id)
+        if not current:
+            return
+        if current["index"] == session["index"] and current.get("poll_id") == poll.poll.id:
+            current["skipped"] += 1
+            current["index"] += 1
+            current["poll_id"] = None
+            poll_to_session.pop(poll.poll.id, None)
+            await context.bot.send_message(chat_id=chat_id, text="⏱️ समय समाप्त — प्रश्न छोड़ा गया।")
+            await send_next(user_id, context)
+
+    session["timeout_task"] = asyncio.create_task(timeout())
 
 async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = update.poll_answer
+    mapping = poll_to_session.get(answer.poll_id)
+    if not mapping:
+        return
 
-    # Find the session whose current poll this is.
-    target = None
+    user_id, idx = mapping
+    session = sessions.get(user_id)
+    if not session or session["index"] != idx:
+        return
 
-    async with LOCK:
-        for session_key, session in SESSIONS.items():
-            if (
-                not session["finished"]
-                and session.get("poll_id") == answer.poll_id
-            ):
-                target = (session_key, session)
-                break
+    if session["timeout_task"]:
+        session["timeout_task"].cancel()
 
-        if not target:
-            return
+    q = session["questions"][idx]
+    selected = answer.option_ids[0] if answer.option_ids else None
+    correct_id = "ABCD".index(q["correct"])
 
-        (chat_id, starter_user_id), session = target
+    if selected == correct_id:
+        session["correct"] += 1
+        msg = "✅ सही उत्तर!"
+    else:
+        session["wrong"] += 1
+        msg = f"❌ गलत उत्तर! सही उत्तर: {q['correct']}"
 
-        # Only the user who started the quiz advances it.
-        # Other group members can see the native poll but do not control
-        # the quiz sequence.
-        if answer.user.id != starter_user_id:
-            return
+    session["index"] += 1
+    session["poll_id"] = None
+    poll_to_session.pop(answer.poll_id, None)
 
-        elapsed = time.monotonic() - session["poll_started"]
-
-        if elapsed >= TIME_LIMIT:
-            return
-
-        selected = answer.option_ids[0] if answer.option_ids else None
-
-        if selected is None:
-            return
-
-        q = session["questions"][session["index"]]
-
-        if selected == q["correct"]:
-            session["correct"] += 1
-        else:
-            session["wrong"] += 1
-
-        session["index"] += 1
-
-        timer = session.get("timer_task")
-        if timer and not timer.done():
-            timer.cancel()
-
-        message_id = session.get("poll_message_id")
-
-    # Close the current native Telegram quiz poll.
-    try:
-        await context.bot.stop_poll(
-            chat_id=chat_id,
-            message_id=message_id
-        )
-    except Exception:
-        pass
-
-    await send_next_poll(
-        context.bot,
-        chat_id,
-        starter_user_id,
-    )
-
+    await context.bot.send_message(chat_id=session["chat_id"], text=msg)
+    await send_next(user_id, context)
 
 async def stop_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in sessions:
+        await update.message.reply_text("कोई active quiz नहीं है।")
+        return
+    await finish_quiz(user_id, context)
+
+async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    chat_id = query.message.chat_id
     user_id = query.from_user.id
-    session_key = key(chat_id, user_id)
+    if user_id in sessions:
+        await finish_quiz(user_id, context)
 
-    async with LOCK:
-        session = SESSIONS.get(session_key)
+async def finish_quiz(user_id, context):
+    session = sessions.pop(user_id, None)
+    if not session:
+        return
+    if session.get("timeout_task"):
+        session["timeout_task"].cancel()
+    if session.get("poll_id"):
+        poll_to_session.pop(session["poll_id"], None)
 
-        if not session or session["finished"]:
-            await query.message.reply_text("कोई active Quiz नहीं है।")
-            return
-
-        session["finished"] = True
-
-        timer = session.get("timer_task")
-        if timer and not timer.done():
-            timer.cancel()
-
-        result = score_result(session, stopped=True)
-
-        poll_message_id = session.get("poll_message_id")
-
-    if poll_message_id:
-        try:
-            await context.bot.stop_poll(
-                chat_id=chat_id,
-                message_id=poll_message_id
-            )
-        except Exception:
-            pass
-
-    await query.message.reply_text(
-        result,
-        reply_markup=start_keyboard(),
+    text = result_text(
+        session["total"],
+        session["correct"],
+        session["wrong"],
+        session["skipped"],
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 फिर से Quiz", callback_data="restart_quiz")]
+    ])
+    await context.bot.send_message(
+        chat_id=session["chat_id"],
+        text=text,
+        reply_markup=keyboard
     )
 
+async def restart_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    bank = load_bank()
+    if not bank:
+        await query.message.reply_text("Question bank उपलब्ध नहीं है।")
+        return
+    sessions[user_id] = {
+        "chat_id": query.message.chat_id,
+        "index": 0, "correct": 0, "wrong": 0, "skipped": 0,
+        "total": len(bank), "questions": bank,
+        "poll_id": None, "timeout_task": None
+    }
+    await send_next(user_id, context)
 
-async def source_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Admin sends PDF/TXT/plain MCQ text.
-    The new source REPLACES the previous question bank.
-    Maximum 100 questions.
-    """
+def admin_allowed(update):
+    admin_ids = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+    return not admin_ids or update.effective_user.id in admin_ids
 
-    if not is_admin(update.effective_user.id):
+async def source_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_allowed(update):
         return
 
-    questions = []
+    document = update.message.document
+    if not document:
+        return
 
-    if update.message.document:
-        document = update.message.document
-        filename = (document.file_name or "").lower()
+    if not document.file_name.lower().endswith(".pdf"):
+        await update.message.reply_text("❌ केवल PDF भेजें।")
+        return
 
-        if not (filename.endswith(".pdf") or filename.endswith(".txt")):
-            await update.message.reply_text(
-                "❌ केवल PDF या TXT file भेजें।"
-            )
-            return
-
-        suffix = ".pdf" if filename.endswith(".pdf") else ".txt"
-        path = DATA_DIR / f"source_{update.effective_user.id}{suffix}"
-
-        tg_file = await document.get_file()
+    fd, path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    try:
+        tg_file = await context.bot.get_file(document.file_id)
         await tg_file.download_to_drive(path)
 
-        try:
-            questions = (
-                parse_pdf(path)
-                if suffix == ".pdf"
-                else parse_txt(path)
-            )
-        except Exception as e:
-            await update.message.reply_text(
-                f"❌ Source पढ़ने में समस्या:\n{e}"
-            )
-            return
+        questions = parse_pdf(path, max_questions=100)
+        validate_questions(questions)
 
-    elif update.message.text:
-        try:
-            questions = parse_text_to_questions(update.message.text)
-        except Exception as e:
-            await update.message.reply_text(
-                f"❌ Text process नहीं हुआ:\n{e}"
-            )
-            return
+        # Atomic replacement: old bank remains if parsing/validation fails.
+        tmp = QUESTIONS_FILE + ".tmp"
+        save_questions(questions, tmp)
+        os.replace(tmp, QUESTIONS_FILE)
 
-    if not questions:
         await update.message.reply_text(
-            "❌ Valid MCQ नहीं मिले।\n\n"
-            "हर प्रश्न में A/B/C/D options और स्पष्ट सही उत्तर/answer key होना चाहिए।\n"
-            "Bot सही उत्तर अनुमान से नहीं बनाएगा।"
+            f"✅ Question bank update हो गया।\n"
+            f"कुल प्रश्न: {len(questions)}\n"
+            f"अब /quiz से एक ही quiz में सभी प्रश्न चलेंगे।"
         )
+    except Exception as e:
+        await update.message.reply_text(f"❌ PDF process नहीं हुआ:\n{e}")
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+async def source_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_allowed(update):
         return
+    text = update.message.text or ""
+    if not text.strip():
+        return
+    try:
+        questions = parse_source_text(text, max_questions=100)
+        validate_questions(questions)
+        tmp = QUESTIONS_FILE + ".tmp"
+        save_questions(questions, tmp)
+        os.replace(tmp, QUESTIONS_FILE)
+        await update.message.reply_text(f"✅ Text source से {len(questions)} प्रश्न तैयार हो गए।")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Text parse नहीं हुआ:\n{e}")
 
-    questions = questions[:100]
-    save_questions(questions, QUIZ_FILE)
-
-    # End currently active sessions because the source changed.
-    async with LOCK:
-        for session in SESSIONS.values():
-            if not session["finished"]:
-                session["finished"] = True
-                timer = session.get("timer_task")
-                if timer and not timer.done():
-                    timer.cancel()
-
-    await update.message.reply_text(
-        f"✅ नई Quiz तैयार है!\n\n"
-        f"📝 कुल प्रश्न: {len(questions)}\n"
-        f"📌 अधिकतम: 100\n\n"
-        f"अब /quiz भेजें।"
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "/start - Quiz menu\n"
-        "/quiz - Quiz शुरू करें\n"
-        "/help - Help\n\n"
-        "Admin PDF/TXT/MCQ text भेजकर नई Quiz बना सकता है।"
-    )
-
+async def error_handler(update, context):
+    print("ERROR:", context.error)
 
 def main():
-    if not BOT_TOKEN:
-        raise SystemExit(
-            "Railway Variables में BOT_TOKEN सेट करें।"
-        )
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable missing")
 
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("quiz", quiz_command))
-    app.add_handler(CommandHandler("help", help_command))
-
-    app.add_handler(
-        CallbackQueryHandler(
-            start_button,
-            pattern=r"^start_quiz$"
-        )
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(
-            stop_quiz,
-            pattern=r"^stop_quiz$"
-        )
-    )
-
-    # Native Telegram Quiz/Poll answers.
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("quiz", start_quiz))
+    app.add_handler(CommandHandler("stop", stop_quiz))
+    app.add_handler(MessageHandler(filters.Document.PDF, source_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, source_text))
     app.add_handler(PollAnswerHandler(poll_answer))
+    app.add_handler(CallbackQueryHandler(restart_callback, pattern="^restart_quiz$"))
+    app.add_error_handler(error_handler)
 
-    # Admin-only source upload / text.
-    app.add_handler(
-        MessageHandler(
-            (
-                filters.Document.PDF
-                | filters.Document.FileExtension("txt")
-                | filters.TEXT
-            ) & ~filters.COMMAND,
-            source_message,
-        )
-    )
-
-    print("Bot started...")
-    app.run_polling()
-
+    print("Bot running...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
-    
