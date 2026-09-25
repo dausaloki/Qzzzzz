@@ -87,7 +87,7 @@ def test_code_creates_exactly_one_application_and_poller():
 
 def test_deployment_files():
     req = (ROOT / "requirements.txt").read_text()
-    assert "python-telegram-bot[job-queue,rate-limiter]==22.5" in req and "PyMuPDF" in req
+    assert "python-telegram-bot[job-queue,rate-limiter]==22.8" in req and "PyMuPDF" in req
     assert (ROOT / "Procfile").read_text().strip() == "worker: python bot.py"
     import json
     rj = json.loads((ROOT / "railway.json").read_text())

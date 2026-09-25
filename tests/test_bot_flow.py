@@ -25,6 +25,13 @@ def isolated(tmp_path, monkeypatch):
 
 
 class Harness:
+    """``pre_verified``: users count as already-verified members of the required
+    group (the join gate itself is tested in test_round5.py)."""
+
+    def __init__(self, pre_verified: bool = True):
+        self.pre_verified = pre_verified
+        self._verified: set[int] = set()
+
     async def __aenter__(self):
         self.api = FakeTelegram()
         self.app = botmod.build_application(TOKEN, request=self.api, get_updates_request=FakeTelegram(),
@@ -40,13 +47,30 @@ class Harness:
         await self.app.shutdown()
 
     async def send(self, update):
+        u = update.effective_user
+        if self.pre_verified and u is not None and u.id not in self._verified:
+            self._verified.add(u.id)
+            db.upsert_user(u)
+            db.set_member_verified(u.id, time.time())
         await self.app.process_update(update)
 
     async def text(self, user, text, chat_id=None):
         await self.send(self.f.message(user, text, chat_id=chat_id))
 
-    async def cb(self, user, data, chat_id=None):
-        await self.send(self.f.callback(user, data, chat_id=chat_id))
+    async def cb(self, user, data, chat_id=None, message_id=1):
+        await self.send(self.f.callback(user, data, chat_id=chat_id, message_id=message_id))
+
+    _go_ids = iter(range(50000, 10 ** 9))
+
+    async def start(self, user, qid):
+        """▶️ Start Quiz → ready card → "I'm ready" (each tap is a new ready message)."""
+        await self.cb(user, f"q:run:{qid}")
+        ready = self.api.sent("sendMessage", user["id"])[-1]
+        assert [b["callback_data"] for b in buttons(ready["reply_markup"])] == [f"r:go:{qid}"], ready
+        await self.cb(user, f"r:go:{qid}", message_id=next(self._go_ids))
+
+    async def go(self, user, qid):
+        await self.cb(user, f"r:go:{qid}", message_id=next(self._go_ids))
 
     async def wait(self, cond, timeout=6.0, msg="condition"):
         end = time.time() + timeout
@@ -99,8 +123,8 @@ def test_main_menu_has_all_buttons():
             await h.text(u, "/start")
             m = h.api.sent("sendMessage", 111)[-1]
             labels = [b["text"] for b in buttons(m["reply_markup"])]
-            assert labels == ["➕ New Quiz", "📚 My Quizzes", "📥 Import PDF/Text", "▶️ Start Quiz",
-                              "📊 Quiz Stats", "⚙️ Settings", "ℹ️ Help"]
+            assert labels == ["➕ New Quiz", "📚 My Quizzes", "📥 Import", "▶️ Start Quiz",
+                              "📊 Statistics", "⚙️ Settings", "❓ Help"]
             for data in ("m:help", "m:set", "m:stats", "m:start", "m:my", "m:home"):
                 await h.cb(u, data)
     run(t())
@@ -111,35 +135,50 @@ def test_manual_wizard_all_formats_then_full_run_restart_stop_stats():
         async with Harness() as h:
             u = h.f.user(111, "Asha")
             await h.cb(u, "m:new")
-            await h.text(u, "राजस्थान GK")                                     # step 1
-            await h.text(u, "अभ्यास quiz")                                     # step 2
-            await h.cb(u, "c:skippre")                                         # step 3 skip
+            assert "सबसे पहले अपने Quiz का <b>नाम</b> भेजें" in h.all_text(111)
+            await h.text(u, "राजस्थान GK")                                     # title
+            assert "/skip" in h.all_text(111).split("\n")[-1] or "/skip" in h.api.texts(111)[-1]
+            await h.text(u, "अभ्यास quiz")                                     # description
+            assert "Step" not in h.all_text(111)
+            # the question prompt comes with the native quiz-poll creation button (private chat only)
+            kbd = [m for m in h.api.sent("sendMessage", 111) if "keyboard" in (m.get("reply_markup") or {})][-1]
+            assert kbd["reply_markup"]["keyboard"][0][0]["request_poll"] == {"type": "quiz"}
+            # Q1: statement question typed with options, answer and explanation in ONE message
             stmt_q = ("निम्नलिखित कथनों पर विचार कीजिए—\n1. कथन एक\n2. कथन दो\n3. कथन तीन\n"
                       "उपर्युक्त में से कौन-से कथन सही हैं?")
-            await h.text(u, stmt_q)                                            # step 4
-            await h.text(u, "केवल 1, 2 और 4\nकेवल 1 और 3\nकेवल 2 और 3\nसभी कथन सही हैं")  # step 5
-            await h.cb(u, "c:correct:0")                                       # step 6
-            await h.text(u, "exp1")                                            # step 7
-            await h.cb(u, "c:more")                                            # step 8
-            # Q2: pre-question text, matching question pasted together with options
+            await h.text(u, stmt_q + "\n(A) केवल 1, 2 और 4\n(B) केवल 1 और 3\n(C) केवल 2 और 3\n"
+                                     "(D) सभी कथन सही हैं\nउत्तर: A\nव्याख्या: exp1")
+            assert "प्रश्न 1 जुड़ गया" in h.all_text(111)
+            # Q2: pre-question text, then a matching question (first A-D block is data, second = options);
+            # no answer given → the bot asks, never guesses
             await h.text(u, "नीचे दी गई सूची ध्यान से पढ़ें।")
+            assert "प्रश्न 2 से पहले दिखाया जाएगा" in h.all_text(111)
+            assert len(db.get_questions(db.get_owner_quizzes(111)[0]["id"])) == 1      # not a question
             match_q = ("सुमेलित कीजिए\n(A) रामदेवजी\n(B) गोगाजी\n(C) तेजाजी\n(D) पाबूजी\n"
                        "I. कोलू\nII. गोगामेड़ी\nIII. रामदेवरा\nIV. खरनाल\nकूट:\n"
                        "(A) A-III, B-II, C-IV, D-I\n(B) A-II, B-III, C-I, D-IV\n"
                        "(C) A-IV, B-I, C-II, D-III\n(D) A-I, B-IV, C-III, D-II")
             await h.text(u, match_q)
-            assert "4 options मिले" in h.all_text(111)
-            await h.cb(u, "c:useopts")
+            assert "सही उत्तर कौन-सा है" in h.all_text(111)
+            await h.text(u, "A")                                               # must use the buttons
+            assert "buttons से सही उत्तर चुनें" in h.all_text(111)
             await h.cb(u, "c:correct:0")
-            await h.cb(u, "c:skipexpl")
-            await h.cb(u, "c:more")
-            # Q3: photo as pre-question media, very long question + very long option
+            assert "explanation भेजें" in h.api.texts(111)[-1]
+            await h.text(u, "/skip")
+            assert "प्रश्न 2 जुड़ गया" in h.all_text(111)
+            # Q3: photo as pre-question media, very long question + very long option (text message)
             await h.send(h.f.photo(u, "PHOTO1", caption="चित्र देखें"))
-            await h.text(u, LONG_Q)
-            await h.text(u, f"(A) {LONG_OPT}\n(B) छोटा\n(C) मध्यम\n(D) अन्य")
+            await h.text(u, f"{LONG_Q}\n(A) {LONG_OPT}\n(B) छोटा\n(C) मध्यम\n(D) अन्य")
             await h.cb(u, "c:correct:1")
             await h.text(u, "यह explanation दो सौ अक्षरों से लंबी है। " * 8)
+            assert "प्रश्न 3 जुड़ गया" in h.all_text(111)
             await h.text(u, "/done")
+            assert "✅ Quiz तैयार है!" in h.all_text(111)
+            assert any("remove_keyboard" in (m.get("reply_markup") or {}) for m in h.api.sent("sendMessage", 111))
+            card = h.api.sent("sendMessage", 111)[-1]
+            assert card["text"].startswith("📚 <b>राजस्थान GK</b>") and "📝 Questions: 3" in card["text"]
+            assert [b["text"] for b in buttons(card["reply_markup"])][:6] == [
+                "▶️ Start Quiz", "📤 Share Quiz", "✏️ Edit Quiz", "📊 Statistics", "⚙️ Settings", "🗑️ Delete Quiz"]
 
             quizzes = db.get_owner_quizzes(111)
             assert len(quizzes) == 1 and quizzes[0]["status"] == "ready"
@@ -149,7 +188,9 @@ def test_manual_wizard_all_formats_then_full_run_restart_stop_stats():
             assert qs[0]["question"] == stmt_q and qs[0]["qtype"] == "statement"
             assert qs[0]["options"][0] == "केवल 1, 2 और 4" and qs[0]["explanation"] == "exp1"
             assert qs[1]["options"][0] == "A-III, B-II, C-IV, D-I" and "(D) पाबूजी" in qs[1]["question"]
-            assert qs[1]["pre_text"] == "नीचे दी गई सूची ध्यान से पढ़ें।"
+            assert qs[1]["pre_text"] == "नीचे दी गई सूची ध्यान से पढ़ें।" and qs[1]["explanation"] == ""
+            assert qs[0]["correct_index"] == 0 and qs[1]["correct_index"] == 0 and qs[2]["correct_index"] == 1
+            assert qs[2]["pre_text"] == "चित्र देखें"
             assert qs[2]["pre_media_type"] == "photo" and qs[2]["pre_media_id"] == "PHOTO1"
             assert qs[2]["question"] == LONG_Q and qs[2]["options"][0] == LONG_OPT
             assert "https://t.me/TestQuizBot?start=quiz_" + qid in h.all_text(111)
@@ -157,9 +198,16 @@ def test_manual_wizard_all_formats_then_full_run_restart_stop_stats():
             # ---- run the quiz
             h.api.reset_calls()
             await h.cb(u, f"q:run:{qid}")
+            ready = h.api.sent("sendMessage", 111)[-1]["text"]
+            assert "Get ready" in ready and "3 questions" in ready and "/stop" in ready
+            assert not h.polls_for(111)                                  # nothing starts before "ready"
+            await h.cb(u, f"r:go:{qid}", message_id=777)
+            await h.cb(u, f"r:go:{qid}", message_id=777)                 # double tap: ignored
             await h.wait(lambda: len(h.polls_for(111)) == 1, msg="poll 1")
+            await asyncio.sleep(0.1)
+            assert len(h.polls_for(111)) == 1 and len(db.user_history(111, qid)) == 0
             p1 = h.polls_for(111)[0][1]
-            assert p1["question"].startswith("[1/3] निम्नलिखित") and p1["explanation"] == "exp1"
+            assert p1["question"].startswith(config.QUESTION_TAG + "\n\n[1/3] निम्नलिखित") and p1["explanation"] == "exp1"
             assert p1["options"][0] == "केवल 1, 2 और 4"
             await h.answer_current(u, correct=True)
             await h.wait(lambda: len(h.polls_for(111)) == 2, msg="poll 2")
@@ -179,20 +227,21 @@ def test_manual_wizard_all_formats_then_full_run_restart_stop_stats():
             await h.wait(lambda: "🏁" in h.all_text(111), msg="result")
             res = h.all_text(111)
             assert "Explanation:" in res and "यह explanation दो सौ" in res
-            for s in ("Quiz Complete", "Total: 3", "Correct: 2", "Wrong: 1", "Skipped: 0",
-                      "Score: 2/3", "Percentage: 66.67%", "Time:"):
+            for s in ("📊 <b>Result</b>", "Quiz: राजस्थान GK", "Total: 3", "Correct: 2", "Wrong: 1",
+                      "Skipped: 0", "Score: 2/3", "Percentage: 66.67%", "Time:"):
                 assert s in res, s
             final = h.api.sent("sendMessage", 111)[-1]
-            assert [b["text"] for b in buttons(final["reply_markup"])] == ["🔁 Restart", "📊 Stats", "🏠 Main Menu"]
+            assert [b["text"] for b in buttons(final["reply_markup"])] == [
+                "🔁 Try Again", "📤 Share Quiz", "📊 Statistics", "🏠 Main Menu"]
 
             # ---- restart then stop
-            await h.cb(u, f"q:run:{qid}")
+            await h.start(u, qid)
             await h.wait(lambda: len(h.polls_for(111)) == 4, msg="restart poll")
             await h.answer_current(u, correct=True)
             await h.wait(lambda: len(h.polls_for(111)) == 5, msg="restart poll 2")
             await h.text(u, "/stop")
             res = h.all_text(111)
-            assert "Quiz Stopped" in res and "Not attempted: 2" in res
+            assert "Quiz stopped" in res and "Not attempted: 2" in res
             att = db.user_history(111, qid)
             assert [a["status"] for a in att] == ["stopped", "finished"]
             assert att[0]["correct"] == 1
@@ -216,20 +265,24 @@ def test_done_requires_a_question_and_cancel_deletes_draft():
             u = h.f.user(5)
             await h.text(u, "/newquiz")
             await h.text(u, "Empty")
-            await h.cb(u, "c:skipdesc")
+            await h.text(u, "/skip")
             await h.text(u, "/done")
             assert "कम से कम 1 प्रश्न" in h.all_text(5)
             await h.text(u, "/cancel")
-            assert db.get_owner_quizzes(5) == []
-            await h.cb(u, "c:skipdesc")                                             # stale button
+            assert db.get_owner_quizzes(5) == [] and db.get_state(5)[0] is None
+            await h.cb(u, "c:correct:0")                                            # stale button
             assert any(a == "answerCallbackQuery" and p.get("show_alert") for a, p in h.api.calls)
             await h.text(u, "/newquiz")
             await h.text(u, "Opt test")
-            await h.cb(u, "c:skipdesc")
-            await h.cb(u, "c:skippre")
-            await h.text(u, "Q?")
-            await h.text(u, "only one line")
-            assert "2 से 12 options चाहिए" in h.all_text(5)
+            await h.text(u, "/skip")
+            await h.text(u, "Q?\n(A) only one option")
+            assert "2–12 options" in h.all_text(5)
+            await h.text(u, "Q?\n(A) x\n(B) y\nउत्तर: C")                           # answer not among options
+            assert "केवल 2 options हैं" in h.all_text(5)
+            assert db.count_questions(db.get_owner_quizzes(5)[0]["id"]) == 0
+            await h.send(h.f.user_poll(u, "Multi?", ["a", "b"], quiz=False, multiple=True))
+            assert "एक से अधिक उत्तर" in h.all_text(5)
+            assert db.count_questions(db.get_owner_quizzes(5)[0]["id"]) == 0
     run(t())
 
 
@@ -239,6 +292,8 @@ def test_timer_expiry_skips_and_continues():
             u = h.f.user(222)
             qid = make_quiz(owner=111, n=2, timer=1)       # 1s timer (test-only value)
             await h.text(u, f"/start quiz_{qid}")          # deep link from another user
+            assert "Get ready" in h.all_text(222)
+            await h.go(u, qid)
             await h.wait(lambda: len(h.polls_for(222)) == 1, msg="poll 1")
             await h.wait(lambda: len(h.polls_for(222)) == 2, timeout=5, msg="auto next after timeout")
             assert "समय समाप्त" in h.all_text(222)
@@ -250,11 +305,11 @@ def test_timer_expiry_skips_and_continues():
             assert [a["status"] for a in ans] == ["skipped", "skipped"]
             # a real timer value is passed to Telegram as open_period
             db.update_quiz(qid, timer=90)
-            await h.cb(u, f"q:run:{qid}")
+            await h.start(u, qid)
             await h.wait(lambda: len(h.polls_for(222)) == 3)
             assert h.polls_for(222)[-1][1]["open_period"] == 90
             db.update_quiz(qid, timer=0)
-            await h.cb(u, f"q:run:{qid}")                   # restarting stops the previous run
+            await h.start(u, qid)                   # restarting stops the previous run
             await h.wait(lambda: len(h.polls_for(222)) == 4)
             assert h.polls_for(222)[-1][1]["open_period"] is None
             assert "पिछला quiz रोक दिया" in h.all_text(222)
@@ -266,7 +321,7 @@ def test_answer_just_before_timeout_is_not_double_counted():
         async with Harness() as h:
             u = h.f.user(223)
             qid = make_quiz(n=1, timer=1)
-            await h.cb(u, f"q:run:{qid}")
+            await h.start(u, qid)
             await h.wait(lambda: len(h.polls_for(223)) == 1)
             await h.answer_current(u, correct=True)
             await h.wait(lambda: "🏁" in h.all_text(223))
@@ -282,7 +337,7 @@ def test_shuffle_questions_and_options_mapping():
         async with Harness() as h:
             u = h.f.user(333)
             qid = make_quiz(n=20, sq=1, so=1)
-            await h.cb(u, f"q:run:{qid}")
+            await h.start(u, qid)
             for i in range(20):
                 await h.wait(lambda: len(h.polls_for(333)) == i + 1, msg=f"poll {i + 1}")
                 await h.answer_current(u, correct=True)
@@ -311,7 +366,7 @@ def test_skip_command_and_button():
         async with Harness() as h:
             u = h.f.user(444)
             qid = make_quiz(n=3, timer=0)
-            await h.cb(u, f"q:run:{qid}")
+            await h.start(u, qid)
             await h.wait(lambda: len(h.polls_for(444)) == 1)
             await h.text(u, "/skip")
             await h.wait(lambda: len(h.polls_for(444)) == 2)
@@ -339,12 +394,20 @@ def test_deep_link_group_redirect_and_share():
             assert h.polls_for(-1001) == []
             await h.text(other, f"/quiz {qid}", chat_id=-1001)
             assert "Start Privately" in str(h.api.sent("sendMessage", -1001)[-1]["reply_markup"])
-            # private deep link starts immediately
+            # private deep link → ready card → the user's own session
             await h.text(other, f"/start quiz_{qid}")
+            ready = h.api.sent("sendMessage", 555)[-1]
+            assert "Get ready" in ready["text"] and h.polls_for(555) == []
+            await h.cb(other, f"r:go:{qid}", chat_id=-1001)                 # a group tap only redirects
+            assert h.polls_for(-1001) == [] and h.polls_for(555) == []
+            await h.go(other, qid)
             await h.wait(lambda: len(h.polls_for(555)) == 1)
-            # share
+            # share: deep link + share-url + inline card button (bot has inline mode on)
             await h.cb(owner, f"q:share:{qid}")
             assert f"https://t.me/TestQuizBot?start=quiz_{qid}" in h.all_text(111)
+            sm = buttons(h.api.sent("sendMessage", 111)[-1]["reply_markup"])
+            assert any(b.get("switch_inline_query") == f"quiz_{qid}" for b in sm)
+            assert any(b.get("url", "").startswith("https://t.me/share/url?") for b in sm)
             # non-owner cannot edit/delete
             await h.cb(other, f"q:del:{qid}")
             await h.cb(other, f"q:delok:{qid}")
@@ -361,8 +424,8 @@ def test_two_users_run_same_quiz_independently():
         async with Harness() as h:
             a, b = h.f.user(601), h.f.user(602)
             qid = make_quiz(n=3)
-            await h.cb(a, f"q:run:{qid}")
-            await h.cb(b, f"q:run:{qid}")
+            await h.start(a, qid)
+            await h.start(b, qid)
             await h.wait(lambda: len(h.polls_for(601)) == 1 and len(h.polls_for(602)) == 1)
             await h.answer_current(a, True)
             await h.wait(lambda: len(h.polls_for(601)) == 2)
@@ -403,7 +466,7 @@ def test_import_pdf_document():
             assert len(qs) == 6 and qs[1]["options"][0] == "A-III, B-II, C-IV, D-I"
             assert qs[0]["explanation"].startswith("गुरु शिखर")
             # the imported quiz runs end-to-end
-            await h.cb(u, f"q:run:{quizzes[0]['id']}")
+            await h.start(u, quizzes[0]['id'])
             for i in range(6):
                 await h.wait(lambda: len(h.polls_for(777)) == i + 1)
                 await h.answer_current(u, True)
@@ -490,10 +553,14 @@ def test_edit_quiz_features():
             await h.text(u, "नया शीर्षक")
             await h.cb(u, f"e:desc:{qid}")
             await h.text(u, "नया विवरण")
+            await h.cb(u, f"q:set:{qid}")                            # ⚙️ Settings of this quiz
             await h.cb(u, f"e:timer:{qid}")
             await h.cb(u, f"e:settimer:{qid}:120")
             await h.cb(u, f"e:sq:{qid}")
             await h.cb(u, f"e:so:{qid}")
+            sm = h.api.sent("editMessageText", 111)[-1]
+            assert [b["callback_data"] for b in buttons(sm["reply_markup"])] == [
+                f"e:timer:{qid}", f"e:sq:{qid}", f"e:so:{qid}", f"q:view:{qid}"]
             quiz = db.get_quiz(qid)
             assert (quiz["title"], quiz["description"], quiz["timer"], quiz["shuffle_questions"],
                     quiz["shuffle_options"]) == ("नया शीर्षक", "नया विवरण", 120, 1, 1)
@@ -501,12 +568,11 @@ def test_edit_quiz_features():
             assert db.get_quiz(qid)["shuffle_options"] == 0
             # add question
             await h.cb(u, f"e:addq:{qid}")
-            await h.cb(u, "c:skippre")
-            await h.text(u, "जोड़ा गया प्रश्न?")
-            await h.text(u, "w\nx\ny\nz")
+            await h.text(u, "जोड़ा गया प्रश्न?\n(A) w\n(B) x\n(C) y\n(D) z")
             await h.cb(u, "c:correct:3")
-            await h.cb(u, "c:skipexpl")
-            await h.cb(u, "c:done")
+            await h.text(u, "/skip")
+            await h.text(u, "/done")
+            assert "अब कुल 3 प्रश्न" in h.all_text(111) and db.get_state(111)[0] is None
             qs = db.get_questions(qid)
             assert len(qs) == 3 and qs[2]["question"] == "जोड़ा गया प्रश्न?" and qs[2]["correct_index"] == 3
             assert db.get_quiz(qid)["status"] == "ready"
@@ -524,6 +590,46 @@ def test_edit_quiz_features():
             await h.cb(u, f"e:delqx:{qid}:{qs[1]['id']}")
             await h.cb(u, f"e:delqok:{qid}:{qs[1]['id']}")
             assert [q["id"] for q in db.get_questions(qid)] == [qs[0]["id"], qs[2]["id"]]
+            # question detail: edit text, options (+ answer, atomically), correct answer, reorder
+            a, c = qs[0]["id"], qs[2]["id"]
+            await h.cb(u, f"e:list:{qid}:0")
+            await h.cb(u, f"e:q:{qid}:{c}")
+            assert "जोड़ा गया प्रश्न?" in h.all_text(111) and "(D) z ✅" in h.all_text(111)
+            await h.cb(u, f"e:qt:{qid}:{c}")
+            await h.text(u, "संशोधित प्रश्न\nदूसरी line")
+            assert db.get_question(qid, c)["question"] == "संशोधित प्रश्न\nदूसरी line"
+            await h.cb(u, f"e:qo:{qid}:{c}")
+            await h.text(u, "एक\nदो\nतीन")
+            assert db.get_question(qid, c)["options"] == ["w", "x", "y", "z"]     # nothing saved yet
+            await h.text(u, "random text")                                        # must pick via button
+            await h.cb(u, f"e:oc:{qid}:{c}:5")                                    # out of range
+            assert db.get_question(qid, c)["options"] == ["w", "x", "y", "z"]
+            await h.cb(u, f"e:oc:{qid}:{c}:1")
+            qc = db.get_question(qid, c)
+            assert qc["options"] == ["एक", "दो", "तीन"] and qc["correct_index"] == 1
+            await h.cb(u, f"e:oc:{qid}:{c}:2")                                    # stale picker
+            assert db.get_question(qid, c)["correct_index"] == 1
+            await h.cb(u, f"e:qc:{qid}:{c}")
+            await h.cb(u, f"e:sc:{qid}:{c}:2")
+            assert db.get_question(qid, c)["correct_index"] == 2
+            await h.cb(u, f"e:sc:{qid}:{c}:9")
+            assert db.get_question(qid, c)["correct_index"] == 2
+            await h.cb(u, f"e:up:{qid}:{c}")
+            assert [q["id"] for q in db.get_questions(qid)] == [c, a]
+            await h.cb(u, f"e:up:{qid}:{c}")                                      # already first
+            assert [q["id"] for q in db.get_questions(qid)] == [c, a]
+            await h.cb(u, f"e:dn:{qid}:{c}")
+            assert [q["id"] for q in db.get_questions(qid)] == [a, c]
+            # another user cannot touch this quiz's questions; ids of another quiz are rejected
+            intruder = h.f.user(999)
+            await h.cb(intruder, f"e:sc:{qid}:{c}:0")
+            await h.cb(intruder, f"e:up:{qid}:{c}")
+            other_q = make_quiz(owner=111, n=1, title="other")
+            foreign = db.get_questions(other_q)[0]["id"]
+            await h.cb(u, f"e:sc:{qid}:{foreign}:1")
+            assert db.get_question(other_q, foreign)["correct_index"] == 0
+            assert db.get_question(qid, c)["correct_index"] == 2
+            assert [q["id"] for q in db.get_questions(qid)] == [a, c]
             # settings defaults apply to new quizzes
             await h.cb(u, "s:settimer:15")
             await h.cb(u, "s:sq")
@@ -533,7 +639,7 @@ def test_edit_quiz_features():
             await h.cb(u, f"q:del:{qid}")
             await h.cb(u, f"q:delok:{qid}")
             assert db.get_quiz(qid) is None
-            await h.cb(u, f"q:run:{qid}")                                   # deleted quiz button
+            await h.cb(u, f"q:run:{qid}")                          # deleted quiz button
             assert any(p.get("show_alert") for a, p in h.api.calls if a == "answerCallbackQuery")
     run(t())
 
@@ -543,7 +649,7 @@ def test_session_survives_restart_and_timer_rearmed():
         qid = make_quiz(n=2, timer=1)
         async with Harness() as h:
             u = h.f.user(1234)
-            await h.cb(u, f"q:run:{qid}")
+            await h.start(u, qid)
             await h.wait(lambda: len(h.polls_for(1234)) == 1)
             first_poll = h.polls_for(1234)[0][0]
             for job in h.app.job_queue.jobs():                   # simulate crash: timer lost
@@ -569,7 +675,7 @@ def test_poll_rejection_falls_back_and_never_crashes():
             u = h.f.user(1500)
             qid = make_quiz(n=2)
             h.api.fail_next["sendPoll"] = "Bad Request: poll options length must not exceed 100"
-            await h.cb(u, f"q:run:{qid}")
+            await h.start(u, qid)
             await h.wait(lambda: len(h.polls_for(1500)) == 1)
             assert h.polls_for(1500)[0][1]["options"] == ["(A)", "(B)", "(C)", "(D)"]
             assert "प्रश्न संख्या 1?" in h.all_text(1500)                    # full text shown
@@ -632,7 +738,7 @@ def test_import_needing_review_requires_the_review_button_and_plays_5_options():
             assert len(qz) == 1
             qs = db.get_questions(qz[0]["id"])
             assert [len(x["options"]) for x in qs] == [5, 5, 3] and qs[0]["correct_index"] == 4
-            await h.cb(u, f"q:run:{qz[0]['id']}")
+            await h.start(u, qz[0]['id'])
             await h.wait(lambda: len(h.polls_for(1201)) == 1)
             poll = h.polls_for(1201)[0][1]
             assert len(poll["options"]) == 5 and poll["options"][poll["correct_option_id"]] == "इनमें से कोई नहीं"
@@ -652,7 +758,7 @@ def test_twelve_long_options_use_compact_labels_and_never_break_limits():
             opts = [f"विकल्प {i}: " + "बहुत लंबा विवरण " * 8 for i in range(12)]
             db.add_question(qid, "बारह विकल्पों वाला प्रश्न?", opts, 11, "व्याख्या")
             u = h.f.user(1301)
-            await h.cb(u, f"q:run:{qid}")
+            await h.start(u, qid)
             await h.wait(lambda: len(h.polls_for(1301)) == 1)
             poll = h.polls_for(1301)[0][1]
             assert poll["options"] == [f"({c})" for c in "ABCDEFGHIJKL"]
@@ -676,14 +782,13 @@ def test_manual_wizard_two_options():
             await h.cb(u, "m:new")
             await h.text(u, "True/False")
             await h.text(u, "desc")
-            await h.cb(u, "c:skippre")
-            await h.text(u, "पृथ्वी गोल है?")
-            await h.text(u, "सत्य\nअसत्य")
+            await h.text(u, "पृथ्वी गोल है?\n(A) सत्य\n(B) असत्य")
             m = h.api.sent("sendMessage", 1401)[-1]
             assert [b["callback_data"] for b in buttons(m["reply_markup"])][:2] == ["c:correct:0", "c:correct:1"]
             await h.cb(u, "c:correct:5")                                    # out of range: ignored
+            assert db.get_state(1401)[0] == "c_correct"
             await h.cb(u, "c:correct:0")
-            await h.cb(u, "c:skipexpl")
+            await h.text(u, "/skip")
             await h.text(u, "/done")
             qz = db.get_owner_quizzes(1401)
             assert db.get_questions(qz[0]["id"])[0]["options"] == ["सत्य", "असत्य"]
@@ -739,7 +844,7 @@ def test_production_poll_limits_utf16_multiline_and_2_3_5_12_options():
             for q, opts, c in cases:
                 db.add_question(qid, q, opts, c, None)
             u = h.f.user(1601)
-            await h.cb(u, f"q:run:{qid}")
+            await h.start(u, qid)
             for n in range(1, len(cases) + 1):
                 await h.wait(lambda: len(h.polls_for(1601)) == n)
                 await h.answer_current(u, True)

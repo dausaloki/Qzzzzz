@@ -45,7 +45,7 @@ LONG_O = "यह विकल्प एक सौ अक्षरों से �
 def test_short_question_native_poll():
     q = {"question": "राजधानी?", "options": ["a", "b", "c", "d"], "correct_index": 1, "explanation": "क्योंकि"}
     p = E.build_poll_payload(q, [0, 1, 2, 3], 2, 10)
-    assert p.question == "[3/10] राजधानी?" and p.options == ["a", "b", "c", "d"]
+    assert p.question == E.tag_text("[3/10] राजधानी?") and p.options == ["a", "b", "c", "d"]
     assert p.full_text_chunks == [] and not p.compact and p.explanation == "क्योंकि"
 
 
