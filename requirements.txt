@@ -1,2 +1,0 @@
-python-telegram-bot[job-queue,rate-limiter]==22.5
-PyMuPDF==1.26.4
