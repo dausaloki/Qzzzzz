@@ -1,37 +1,23 @@
-import json
+import random
 
-def load_questions(path="questions.json"):
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, list):
-        raise ValueError("questions.json must contain a list")
-    return data
+def build_order(questions, shuffle_questions=False):
+    items = list(questions)
+    if shuffle_questions:
+        random.shuffle(items)
+    return items
 
-def validate_questions(questions):
-    if not questions:
-        raise ValueError("Question bank is empty")
-    if len(questions) > 100:
-        raise ValueError("Maximum 100 questions allowed")
-    for q in questions:
-        if not q.get("question"):
-            raise ValueError(f"Question {q.get('number')} is empty")
-        if len(q.get("options", [])) != 4:
-            raise ValueError(f"Question {q.get('number')} must have 4 options")
-        labels = [x.get("label") for x in q["options"]]
-        if labels != ["A", "B", "C", "D"]:
-            raise ValueError(f"Question {q.get('number')} options must be A-D")
-        if q.get("correct") not in ["A", "B", "C", "D"]:
-            raise ValueError(f"Question {q.get('number')} has invalid answer")
-    return True
+def poll_data(question, shuffle_options=False):
+    options = list(question["options"])
+    correct = question["correct_index"]
+    pairs = list(enumerate(options))
+    if shuffle_options:
+        random.shuffle(pairs)
+    new_options = [text for _, text in pairs]
+    new_correct = next(i for i, (old_i, _) in enumerate(pairs) if old_i == correct)
+    return new_options, new_correct
 
-def result_text(total, correct, wrong, skipped):
-    answered = correct + wrong
-    percentage = (correct / total * 100) if total else 0
-    return (
-        "🏁 Quiz समाप्त\n\n"
-        f"कुल प्रश्न: {total}\n"
-        f"✅ सही: {correct}\n"
-        f"❌ गलत: {wrong}\n"
-        f"⏭️ छोड़े गए: {skipped}\n"
-        f"📊 प्रतिशत: {percentage:.2f}%"
-    )
+def short_text(text, limit):
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[:max(0, limit-1)] + "…"
