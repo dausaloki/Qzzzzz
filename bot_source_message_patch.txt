@@ -1,0 +1,94 @@
+# ADD/REPLACE these imports near the top of bot.py
+from pdf_parser import parse_pdf, parse_txt, parse_text_to_questions, save_questions
+
+# ------------------------------------------------------------------
+# Replace the existing pdf_message() with this version.
+# ------------------------------------------------------------------
+
+async def source_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin can send either:
+      - PDF document
+      - TXT document
+      - plain text containing MCQs + explicit answer key
+    The bot creates/replaces the current quiz question bank.
+    """
+    if not is_admin(update.effective_user.id):
+        return
+
+    questions = []
+
+    # PDF / TXT document
+    if update.message.document:
+        document = update.message.document
+        filename = (document.file_name or "").lower()
+
+        if not (filename.endswith(".pdf") or filename.endswith(".txt")):
+            return
+
+        suffix = ".pdf" if filename.endswith(".pdf") else ".txt"
+        path = DATA_DIR / f"source_{update.effective_user.id}{suffix}"
+
+        tg_file = await document.get_file()
+        await tg_file.download_to_drive(path)
+
+        try:
+            if suffix == ".pdf":
+                questions = parse_pdf(path)
+            else:
+                questions = parse_txt(path)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Source पढ़ने में समस्या: {e}")
+            return
+
+    # Plain text message
+    elif update.message.text:
+        try:
+            questions = parse_text_to_questions(update.message.text)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Text process नहीं हुआ: {e}")
+            return
+
+    if not questions:
+        await update.message.reply_text(
+            "❌ Valid MCQ नहीं मिले।\n\n"
+            "हर प्रश्न में A, B, C, D चार options और स्पष्ट सही उत्तर/answer key होना चाहिए।\n"
+            "Bot सही उत्तर का अनुमान नहीं लगाता।\n\n"
+            "उदाहरण:\n"
+            "1. प्रश्न?\n"
+            "A. विकल्प 1\n"
+            "B. विकल्प 2\n"
+            "C. विकल्प 3\n"
+            "D. विकल्प 4\n"
+            "उत्तर: B"
+        )
+        return
+
+    save_questions(questions, QUIZ_FILE)
+
+    await update.message.reply_text(
+        f"✅ नई Quiz तैयार है!\n\n"
+        f"📝 प्रश्न: {len(questions)}\n"
+        f"📌 अधिकतम: 100\n\n"
+        f"अब Group में /quiz भेजकर इसे शुरू किया जा सकता है।"
+    )
+
+
+# ------------------------------------------------------------------
+# In main(), replace the old PDF-only handler:
+#
+# app.add_handler(MessageHandler(filters.Document.PDF, pdf_message))
+#
+# with:
+#
+# app.add_handler(
+#     MessageHandler(
+#         (filters.Document.PDF | filters.Document.FileExtension("txt") | filters.TEXT)
+#         & ~filters.COMMAND,
+#         source_message
+#     )
+# )
+#
+# NOTE: Because this handler accepts ordinary text, only ADMIN_IDS users
+# can change the question bank. Normal users' messages are ignored.
+# ------------------------------------------------------------------
