@@ -8,239 +8,513 @@ from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, MessageHandler, filters
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 from quiz_engine import load_questions, score_result
-from pdf_parser import parse_pdf
+from pdf_parser import parse_pdf, parse_txt, parse_text_to_questions, save_questions
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+
+# Example Railway variable:
+# ADMIN_IDS=123456789,987654321
 ADMIN_IDS = {
-    int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",")
+    int(x.strip())
+    for x in os.environ.get("ADMIN_IDS", "").split(",")
     if x.strip().isdigit()
 }
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
+
 QUIZ_FILE = DATA_DIR / "questions.json"
 
-SESSIONS = {}
-LOCK = asyncio.Lock()
 TIME_LIMIT = 30
 
+# Each user in each chat has a separate session.
+SESSIONS = {}
+
+# Prevent race conditions when a timeout and a button press happen together.
+LOCK = asyncio.Lock()
+
+
 def is_admin(user_id: int) -> bool:
-    return not ADMIN_IDS or user_id in ADMIN_IDS
+    # Security: if ADMIN_IDS is not configured, nobody can replace the quiz source.
+    return bool(ADMIN_IDS) and user_id in ADMIN_IDS
 
-def keyboard_start():
+
+def start_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶️ Quiz Start", callback_data="start")],
-        [InlineKeyboardButton("📊 Leaderboard", callback_data="leaderboard")]
+        [InlineKeyboardButton("▶️ Quiz Start", callback_data="quiz:start")],
     ])
 
-def keyboard_stop():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛑 Quiz बंद करें", callback_data="stop")]
+
+def question_keyboard(session):
+    buttons = []
+
+    for i, option in enumerate(session["question"]["options"]):
+        buttons.append([
+            InlineKeyboardButton(
+                f"{chr(65 + i)}. {option}",
+                callback_data=f"quiz:answer:{session['token']}:{i}"
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "🛑 Quiz बंद करें",
+            callback_data=f"quiz:stop:{session['token']}"
+        )
     ])
 
-def keyboard_question(session):
-    rows = []
-    for i, opt in enumerate(session["question"]["options"]):
-        rows.append([InlineKeyboardButton(
-            f"{chr(65+i)}. {opt}", callback_data=f"ans:{session['id']}:{i}"
-        )])
-    rows.append([InlineKeyboardButton("🛑 Quiz बंद करें", callback_data=f"stop:{session['id']}")])
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(buttons)
 
-async def send_question(bot, chat_id, user_id):
-    key = (chat_id, user_id)
+
+def session_key(chat_id, user_id):
+    return (chat_id, user_id)
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📚 <b>Quiz Bot</b>\n\n"
+        "▶️ Quiz Start दबाएँ।\n"
+        "• एक समय में केवल 1 प्रश्न\n"
+        "• हर प्रश्न के लिए 30 सेकंड\n"
+        "• उत्तर देते ही अगला प्रश्न\n"
+        "• समय समाप्त होने पर प्रश्न skip\n"
+        "• बीच में बंद करने पर तुरंत result",
+        parse_mode=ParseMode.HTML,
+        reply_markup=start_keyboard(),
+    )
+
+
+async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_quiz(
+        context.bot,
+        update.effective_chat.id,
+        update.effective_user.id,
+    )
+
+
+async def start_quiz(bot, chat_id, user_id):
+    questions = load_questions(QUIZ_FILE)
+
+    if not questions:
+        await bot.send_message(
+            chat_id,
+            "❌ अभी कोई Quiz उपलब्ध नहीं है।\n"
+            "Admin पहले PDF/Text भेजकर Quiz तैयार करे।"
+        )
+        return
+
+    key = session_key(chat_id, user_id)
+
+    async with LOCK:
+        old = SESSIONS.get(key)
+
+        if old and not old["finished"]:
+            await bot.send_message(
+                chat_id,
+                "⚠️ आपकी Quiz पहले से चल रही है।\n"
+                "पहले उसे पूरा करें या 🛑 Quiz बंद करें।"
+            )
+            return
+
+        SESSIONS[key] = {
+            "questions": questions[:100],
+            "index": 0,
+            "correct": 0,
+            "wrong": 0,
+            "skipped": 0,
+            "finished": False,
+            "token": "",
+            "question": None,
+            "question_started": 0,
+            "timer_task": None,
+            "question_message_id": None,
+        }
+
+    await bot.send_message(
+        chat_id,
+        f"🚀 <b>Quiz शुरू!</b>\n\n"
+        f"कुल प्रश्न: {len(questions[:100])}",
+        parse_mode=ParseMode.HTML,
+    )
+
+    await send_next_question(bot, chat_id, user_id)
+
+
+async def send_next_question(bot, chat_id, user_id):
+    key = session_key(chat_id, user_id)
+
     async with LOCK:
         session = SESSIONS.get(key)
+
         if not session or session["finished"]:
             return
-        idx = session["index"]
-        questions = session["questions"]
-        if idx >= len(questions):
+
+        if session["index"] >= len(session["questions"]):
             session["finished"] = True
             result = score_result(session)
-            await bot.send_message(chat_id, result, reply_markup=keyboard_start())
+
+            await bot.send_message(
+                chat_id,
+                result,
+                parse_mode=ParseMode.HTML,
+                reply_markup=start_keyboard(),
+            )
             return
 
-        old_task = session.get("timer_task")
-        if old_task and not old_task.done():
-            old_task.cancel()
+        old_timer = session.get("timer_task")
 
-        q = questions[idx]
-        session["question"] = q
+        if old_timer and not old_timer.done():
+            old_timer.cancel()
+
+        question = session["questions"][session["index"]]
+
+        session["question"] = question
+        session["token"] = uuid.uuid4().hex[:16]
         session["question_started"] = time.monotonic()
-        session["id"] = uuid.uuid4().hex[:12]
 
         text = (
-            f"📝 <b>प्रश्न {idx+1}/{len(questions)}</b>\n\n"
-            f"{q['question']}\n\n"
-            f"⏱️ समय: {TIME_LIMIT} सेकंड"
-        )
-        await bot.send_message(
-            chat_id, text, parse_mode=ParseMode.HTML,
-            reply_markup=keyboard_question(session)
-        )
-        session["timer_task"] = asyncio.create_task(
-            timeout_question(bot, chat_id, user_id, session["id"])
+            f"📝 <b>प्रश्न {session['index'] + 1}/"
+            f"{len(session['questions'])}</b>\n\n"
+            f"{question['question']}\n\n"
+            f"⏱️ <b>समय: {TIME_LIMIT} सेकंड</b>"
         )
 
-async def timeout_question(bot, chat_id, user_id, question_id):
-    await asyncio.sleep(TIME_LIMIT)
-    key = (chat_id, user_id)
+        message = await bot.send_message(
+            chat_id,
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=question_keyboard(session),
+        )
+
+        session["question_message_id"] = message.message_id
+
+        session["timer_task"] = asyncio.create_task(
+            question_timeout(
+                bot,
+                chat_id,
+                user_id,
+                session["token"],
+            )
+        )
+
+
+async def question_timeout(bot, chat_id, user_id, token):
+    try:
+        await asyncio.sleep(TIME_LIMIT)
+    except asyncio.CancelledError:
+        return
+
+    key = session_key(chat_id, user_id)
+
     async with LOCK:
         session = SESSIONS.get(key)
-        if not session or session["finished"] or session.get("id") != question_id:
+
+        if not session or session["finished"]:
             return
+
+        # Ignore timeout belonging to an older question.
+        if session.get("token") != token:
+            return
+
         session["skipped"] += 1
         session["index"] += 1
-    await bot.send_message(chat_id, "⏰ <b>समय समाप्त</b> — प्रश्न छोड़ दिया गया।",
-                           parse_mode=ParseMode.HTML)
-    await send_question(bot, chat_id, user_id)
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📚 <b>Telegram Quiz Bot</b>\n\n"
-        "एक समय में एक प्रश्न आएगा।\n"
-        "हर प्रश्न के लिए 30 सेकंड मिलेंगे।\n"
-        "बीच में Quiz बंद करके भी result देख सकते हैं।",
+        message_id = session.get("question_message_id")
+
+    if message_id:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+    await bot.send_message(
+        chat_id,
+        "⏰ <b>समय समाप्त</b>\nप्रश्न skip हो गया।",
         parse_mode=ParseMode.HTML,
-        reply_markup=keyboard_start()
     )
 
-async def quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start_quiz(update.effective_chat.id, update.effective_user.id, context)
+    await send_next_question(bot, chat_id, user_id)
 
-async def start_quiz(chat_id, user_id, context):
-    questions = load_questions(QUIZ_FILE)
-    if not questions:
-        await context.bot.send_message(chat_id, "❌ अभी कोई Quiz उपलब्ध नहीं है।")
-        return
 
-    key = (chat_id, user_id)
-    old = SESSIONS.get(key)
-    if old and not old["finished"]:
-        await context.bot.send_message(
-            chat_id, "⚠️ आपकी एक Quiz पहले से चल रही है। पहले उसे पूरा करें या Quiz बंद करें."
-        )
-        return
-
-    SESSIONS[key] = {
-        "questions": questions[:100],
-        "index": 0,
-        "correct": 0,
-        "wrong": 0,
-        "skipped": 0,
-        "finished": False,
-        "timer_task": None,
-        "id": ""
-    }
-    await context.bot.send_message(chat_id, "🚀 <b>Quiz शुरू हो गई!</b>",
-                                   parse_mode=ParseMode.HTML)
-    await send_question(context.bot, chat_id, user_id)
-
-async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
-    chat_id = query.message.chat_id
-    user_id = query.from_user.id
-    key = (chat_id, user_id)
 
-    if data == "start":
-        await start_quiz(chat_id, user_id, context)
+    data = query.data or ""
+
+    if data == "quiz:start":
+        await start_quiz(
+            context.bot,
+            query.message.chat_id,
+            query.from_user.id,
+        )
         return
 
-    if data == "leaderboard":
-        await query.message.reply_text("📊 इस version में leaderboard session के दौरान तैयार किया जाता है।")
-        return
+    if data.startswith("quiz:stop:"):
+        token = data.split(":")[2]
 
-    if data.startswith("stop:"):
-        session_id = data.split(":", 1)[1]
+        chat_id = query.message.chat_id
+        user_id = query.from_user.id
+        key = session_key(chat_id, user_id)
+
         async with LOCK:
             session = SESSIONS.get(key)
-            if not session or session["finished"] or session.get("id") != session_id:
+
+            if (
+                not session
+                or session["finished"]
+                or session.get("token") != token
+            ):
                 return
+
             session["finished"] = True
-            task = session.get("timer_task")
-            if task and not task.done():
-                task.cancel()
+
+            timer = session.get("timer_task")
+            if timer and not timer.done():
+                timer.cancel()
+
             result = score_result(session, stopped=True)
-        await query.message.reply_text(result, parse_mode=ParseMode.HTML,
-                                       reply_markup=keyboard_start())
+
+        try:
+            await query.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        await query.message.reply_text(
+            result,
+            parse_mode=ParseMode.HTML,
+            reply_markup=start_keyboard(),
+        )
         return
 
-    if data.startswith("ans:"):
-        _, session_id, answer = data.split(":")
-        answer = int(answer)
+    if data.startswith("quiz:answer:"):
+        parts = data.split(":")
+
+        if len(parts) != 4:
+            return
+
+        token = parts[2]
+
+        try:
+            selected = int(parts[3])
+        except ValueError:
+            return
+
+        chat_id = query.message.chat_id
+        user_id = query.from_user.id
+        key = session_key(chat_id, user_id)
+
         async with LOCK:
             session = SESSIONS.get(key)
-            if not session or session["finished"] or session.get("id") != session_id:
+
+            if (
+                not session
+                or session["finished"]
+                or session.get("token") != token
+            ):
                 return
-            if time.monotonic() - session["question_started"] > TIME_LIMIT:
+
+            elapsed = time.monotonic() - session["question_started"]
+
+            if elapsed >= TIME_LIMIT:
                 return
-            q = session["question"]
-            if answer == q["correct"]:
+
+            question = session["question"]
+
+            if not 0 <= selected < len(question["options"]):
+                return
+
+            if selected == question["correct"]:
                 session["correct"] += 1
-                msg = "✅ सही उत्तर!"
+                result_text = "✅ सही उत्तर!"
             else:
                 session["wrong"] += 1
-                correct_text = q["options"][q["correct"]]
-                msg = f"❌ गलत उत्तर!\nसही उत्तर: {correct_text}"
+                correct_text = question["options"][question["correct"]]
+                result_text = (
+                    "❌ गलत उत्तर!\n"
+                    f"सही उत्तर: {correct_text}"
+                )
+
             session["index"] += 1
-            task = session.get("timer_task")
-            if task and not task.done():
-                task.cancel()
-        await query.message.reply_text(msg)
-        await send_question(context.bot, chat_id, user_id)
 
-async def pdf_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    document = update.message.document
-    if not document or not document.file_name.lower().endswith(".pdf"):
-        return
+            timer = session.get("timer_task")
+            if timer and not timer.done():
+                timer.cancel()
 
-    path = DATA_DIR / f"upload_{update.effective_user.id}.pdf"
-    tg_file = await document.get_file()
-    await tg_file.download_to_drive(path)
+            old_message_id = session.get("question_message_id")
 
-    try:
-        questions = parse_pdf(path)
-        questions = questions[:100]
-        if not questions:
-            raise ValueError("कोई valid MCQ नहीं मिला।")
-        QUIZ_FILE.write_text(json.dumps(questions, ensure_ascii=False, indent=2), encoding="utf-8")
-        await update.message.reply_text(
-            f"✅ PDF से {len(questions)} प्रश्न तैयार हुए।\n"
-            f"अब group में /quiz चलाकर Quiz शुरू कर सकते हैं।"
+        # Remove buttons from the answered question.
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=old_message_id,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+        await query.message.reply_text(result_text)
+
+        # Next question is shown only after the answer.
+        await send_next_question(
+            context.bot,
+            chat_id,
+            user_id,
         )
-    except Exception as e:
-        await update.message.reply_text(f"❌ PDF process नहीं हो सकी: {e}")
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def source_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only source importer.
+
+    Accepted:
+    - PDF document
+    - TXT document
+    - plain text containing MCQs + explicit answers
+
+    Every new source REPLACES the previous question bank.
+    Maximum 100 questions.
+    """
+
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        return
+
+    questions = []
+
+    if update.message.document:
+        document = update.message.document
+        filename = (document.file_name or "").lower()
+
+        if not (filename.endswith(".pdf") or filename.endswith(".txt")):
+            await update.message.reply_text(
+                "❌ केवल PDF या TXT file भेजें।"
+            )
+            return
+
+        suffix = ".pdf" if filename.endswith(".pdf") else ".txt"
+        path = DATA_DIR / f"source_{user_id}{suffix}"
+
+        tg_file = await document.get_file()
+        await tg_file.download_to_drive(path)
+
+        try:
+            if suffix == ".pdf":
+                questions = parse_pdf(path)
+            else:
+                questions = parse_txt(path)
+
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Source पढ़ने में समस्या:\n{e}"
+            )
+            return
+
+    elif update.message.text:
+        try:
+            questions = parse_text_to_questions(
+                update.message.text
+            )
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Text process नहीं हुआ:\n{e}"
+            )
+            return
+
+    if not questions:
+        await update.message.reply_text(
+            "❌ Valid MCQ नहीं मिले।\n\n"
+            "हर प्रश्न में 4 options और स्पष्ट सही उत्तर/answer key होना चाहिए।\n"
+            "Bot सही उत्तर का अनुमान नहीं लगाएगा।\n\n"
+            "उदाहरण:\n\n"
+            "1. भारत की राजधानी क्या है?\n"
+            "A. मुंबई\n"
+            "B. नई दिल्ली\n"
+            "C. जयपुर\n"
+            "D. भोपाल\n"
+            "उत्तर: B"
+        )
+        return
+
+    questions = questions[:100]
+
+    save_questions(questions, QUIZ_FILE)
+
+    # Stop currently running sessions because the source has changed.
+    async with LOCK:
+        for session in SESSIONS.values():
+            if not session["finished"]:
+                session["finished"] = True
+                timer = session.get("timer_task")
+                if timer and not timer.done():
+                    timer.cancel()
+
     await update.message.reply_text(
-        "/start - Bot menu\n"
-        "/quiz - Quiz शुरू करें\n\n"
-        "Admin: PDF भेजकर questions update कर सकता है।"
+        "✅ <b>नई Quiz तैयार हो गई!</b>\n\n"
+        f"📝 कुल प्रश्न: {len(questions)}\n"
+        "📌 अधिकतम सीमा: 100\n\n"
+        "अब Group में /quiz भेजें।",
+        parse_mode=ParseMode.HTML,
     )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📚 Quiz Bot Commands\n\n"
+        "/start - Quiz menu\n"
+        "/quiz - Quiz शुरू करें\n"
+        "/help - Help\n\n"
+        "Admin PDF/TXT या MCQ text भेजकर नई Quiz बना सकता है।"
+    )
+
 
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("Railway Variables में BOT_TOKEN सेट करें।")
+        raise SystemExit(
+            "❌ Railway Variables में BOT_TOKEN सेट करें।"
+        )
 
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("quiz", quiz_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CallbackQueryHandler(callback))
-    app.add_handler(MessageHandler(filters.Document.PDF, pdf_message))
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("quiz", quiz_command))
+    app.add_handler(CommandHandler("help", help_command))
+
+    app.add_handler(
+        CallbackQueryHandler(callback_handler)
+    )
+
+    # Admin-only function internally checks ADMIN_IDS.
+    app.add_handler(
+        MessageHandler(
+            (
+                filters.Document.PDF
+                | filters.Document.FileExtension("txt")
+                | filters.TEXT
+            )
+            & ~filters.COMMAND,
+            source_message,
+        )
+    )
 
     print("Bot started...")
     app.run_polling()
 
+
 if __name__ == "__main__":
     main()
+    
