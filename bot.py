@@ -12,17 +12,23 @@ import os
 import sys
 import time
 
-from telegram import BotCommand, InlineKeyboardButton as B, InlineKeyboardMarkup as M, Update
+from telegram import (
+    BotCommand, ChatMember, InlineKeyboardButton as B, InlineKeyboardMarkup as M, InlineQueryResultArticle,
+    InlineQueryResultsButton, InputTextMessageContent, Update,
+)
 from telegram.constants import ChatType, ParseMode
-from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, TimedOut
+from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, TelegramError, TimedOut
 from telegram.ext import (
-    AIORateLimiter, Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler,
-    ContextTypes, MessageHandler, PollAnswerHandler, filters,
+    AIORateLimiter, Application, ApplicationBuilder, ApplicationHandlerStop, CallbackQueryHandler,
+    ChatMemberHandler, CommandHandler, ContextTypes, InlineQueryHandler, MessageHandler, PollAnswerHandler,
+    TypeHandler, filters,
 )
 
 import config
 import database as db
+import group_runner
 import keyboards as kb
+import membership
 import quiz_creator as creator
 import quiz_engine as engine
 import quiz_runner as runner
@@ -30,18 +36,31 @@ import stats as st
 from keyboards import esc
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)          # request URLs contain the bot token
+logging.getLogger("telegram").setLevel(logging.INFO)          # PTB DEBUG logs the API URL (with token)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 log = logging.getLogger("quizbot")
 
-_bot_username_cache: dict[str, str] = {}
+_bot_username_cache: dict[str, object] = {}
+
+
+async def _cache_me(bot) -> None:
+    me = await bot.get_me()
+    _bot_username_cache["u"] = me.username
+    # inline mode is a BotFather setting; only offer inline sharing when it is on
+    _bot_username_cache["inline"] = bool(getattr(me, "supports_inline_queries", False))
 
 
 async def bot_username(context) -> str:
     if "u" not in _bot_username_cache:
-        me = await context.bot.get_me()
-        _bot_username_cache["u"] = me.username
+        await _cache_me(context.bot)
     return _bot_username_cache["u"]
+
+
+async def inline_enabled(context) -> bool:
+    if "inline" not in _bot_username_cache:
+        await _cache_me(context.bot)
+    return bool(_bot_username_cache["inline"])
 
 
 def is_private(update: Update) -> bool:
@@ -49,24 +68,101 @@ def is_private(update: Update) -> bool:
 
 
 async def group_redirect(update: Update, context, qid: str | None = None) -> None:
-    """In groups, never run a shared sequential session — send a private deep link."""
+    """In groups: the quiz card (▶️ play it in this group with native quiz polls,
+    or 👤 start privately); without a quiz — a link to the bot's private chat."""
     username = await bot_username(context)
-    if qid and db.get_quiz(qid):
-        quiz = db.get_quiz(qid)
+    quiz = db.get_quiz(qid) if qid else None
+    if quiz and quiz.get("status") == "ready" and quiz.get("question_count"):
         link = engine.deep_link(username, qid)
-        text = (f"🎯 <b>{esc(quiz['title'])}</b>\n📝 {quiz['question_count']} प्रश्न • "
-                f"⏱ {config.timer_label(quiz['timer'])}\n\n"
-                "हर participant नीचे button दबाकर अपना <b>अलग private session</b> शुरू करे 👇")
+        await update.effective_chat.send_message(group_runner.ready_text(quiz), parse_mode=ParseMode.HTML,
+                                                 reply_markup=kb.group_card(qid, link))
+        return
+    if quiz:
+        link = engine.deep_link(username, qid)
+        text = f"🎯 <b>{esc(quiz['title'])}</b>\n\n⚠️ यह quiz अभी तैयार नहीं है (draft / कोई प्रश्न नहीं)।"
     else:
         link = f"https://t.me/{username}"
         text = "🤖 Quiz बनाने/खेलने के लिए bot को private chat में खोलें 👇"
     await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=kb.start_privately(link))
 
 
+# ------------------------------------------------------------ join gate
+async def membership_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs before every handler (group -1).  Private chats and inline queries
+    are blocked until membership of the required group is VERIFIED with
+    getChatMember.  Not gated: poll answers and chat_member updates (group
+    quiz participants are never forced into a private chat), group messages
+    (group actions check the acting user themselves) and the j:check button."""
+    if not membership.enabled():
+        return
+    if update.poll_answer or update.chat_member or update.my_chat_member or update.poll:
+        return
+    user = update.effective_user
+    if user is None or user.is_bot:
+        return
+    if update.inline_query:
+        if not await membership.has_access(context.bot, user.id):
+            await update.inline_query.answer(
+                [], cache_time=0, is_personal=True,
+                button=InlineQueryResultsButton(text="📢 पहले Group Join करें", start_parameter="join"))
+            raise ApplicationHandlerStop
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != ChatType.PRIVATE:
+        return
+    cq = update.callback_query
+    if cq is not None and (cq.data or "").startswith("j:"):
+        return
+    msg = update.effective_message
+    force, payload = False, ""
+    if cq is None and msg is not None and msg.text and msg.text.split()[0].split("@")[0] == "/start":
+        # every /start asks Telegram again — a user who left must join again
+        force = True
+        parts = msg.text.split(maxsplit=1)
+        payload = parts[1].strip() if len(parts) > 1 else ""
+    if await membership.has_access(context.bot, user.id, force=force):
+        return
+    db.upsert_user(user)
+    if payload == "join":
+        payload = ""
+    if cq is not None:
+        await cq.answer("🔒 पहले Telegram Group Join करें।")
+    await chat.send_message(membership.WELCOME_TEXT, reply_markup=membership.join_markup(payload))
+    raise ApplicationHandlerStop
+
+
+async def join_check(update: Update, context) -> None:
+    """✅/🔄 I've Joined — the click itself proves nothing; getChatMember decides."""
+    q = update.callback_query
+    user = update.effective_user
+    db.upsert_user(user)
+    parts = (q.data or "").split(":", 2)
+    payload = parts[2] if len(parts) > 2 else ""
+    ok = await membership.verify_now(context.bot, user.id) if membership.enabled() else True
+    if ok is True:
+        await q.answer("✅ Verified")
+        await creator.respond(update, membership.VERIFIED_TEXT, None)
+        qid = engine.parse_start_payload(payload) if payload else None
+        if qid and db.get_quiz(qid):
+            await runner.send_ready(context.application, user, update.effective_chat.id, qid)
+        else:
+            await show_main_menu(update, context, edit=False)
+        return
+    await q.answer("❌ Membership verify नहीं हुई" if ok is False else "⚠️ अभी verify नहीं हो सका")
+    text = membership.NOT_JOINED_TEXT if ok is False else membership.CHECK_FAILED_TEXT
+    try:
+        await creator.respond(update, text, membership.join_markup(payload, retry=True))
+    except BadRequest as exc:              # same text again → "message is not modified"
+        if "not modified" not in str(exc).lower():
+            raise
+
+
 # ------------------------------------------------------------ commands
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     db.upsert_user(user)
+    if context.args and context.args[0] == "join":      # from the inline "join first" button
+        context.args = []
     qid = engine.parse_start_payload(context.args[0]) if context.args else None
     if not is_private(update):
         await group_redirect(update, context, qid)
@@ -78,7 +174,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.effective_chat.send_message("❌ यह quiz मौजूद नहीं है (शायद delete हो गया)।",
                                                      reply_markup=kb.main_menu())
             return
-        await runner.start_quiz(context.application, user, update.effective_chat.id, qid)
+        await runner.send_ready(context.application, user, update.effective_chat.id, qid)
         return
     await show_main_menu(update, context, edit=False)
 
@@ -125,8 +221,32 @@ async def cancel_cmd(update: Update, context) -> None:
         await creator.cancel(update, context)
 
 
+async def undo_cmd(update: Update, context) -> None:
+    if is_private(update):
+        await creator.undo(update, context)
+
+
+async def is_group_admin(bot, chat_id: int, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+    except TelegramError:
+        return False
+    return member.status in (ChatMember.OWNER, ChatMember.ADMINISTRATOR)
+
+
 async def stop_cmd(update: Update, context) -> None:
     if not is_private(update):
+        chat = update.effective_chat
+        s = db.get_active_group_session(chat.id)
+        if not s:
+            await chat.send_message("ℹ️ इस group में अभी कोई quiz नहीं चल रहा।")
+            return
+        uid = update.effective_user.id
+        if s["started_by"] != uid and not await is_group_admin(context.bot, chat.id, uid):
+            await chat.send_message("⛔ Quiz केवल उसे शुरू करने वाला या group admin रोक सकता है।")
+            return
+        if not await group_runner.stop_group_quiz(context.application, chat.id):
+            await chat.send_message("ℹ️ इस group में अभी कोई quiz नहीं चल रहा।")
         return
     done = await runner.stop_quiz(context.application, update.effective_user.id)
     if not done:
@@ -135,6 +255,9 @@ async def stop_cmd(update: Update, context) -> None:
 
 async def skip_cmd(update: Update, context) -> None:
     if not is_private(update):
+        return
+    # during quiz creation /skip skips the optional step (description / explanation)
+    if await creator.skip(update, context):
         return
     res = await runner.skip_current(context.application, update.effective_user.id)
     if res == "none":
@@ -175,7 +298,7 @@ async def quiz_cmd(update: Update, context) -> None:
     if not qid or not db.get_quiz(qid):
         await update.effective_chat.send_message("Usage: /quiz QUIZ_ID")
         return
-    await runner.start_quiz(context.application, update.effective_user, update.effective_chat.id, qid)
+    await runner.send_ready(context.application, update.effective_user, update.effective_chat.id, qid)
 
 
 # ------------------------------------------------------------ menus
@@ -210,31 +333,63 @@ async def show_start_menu(update: Update, context) -> None:
     await creator.respond(update, "▶️ <b>कौन-सा quiz शुरू करें?</b>", M(rows))
 
 
-async def show_quiz_card(update: Update, qid: str) -> None:
-    quiz = db.get_quiz(qid)
-    if not quiz:
-        await creator.respond(update, "❌ Quiz नहीं मिला।", kb.main_menu())
-        return
-    await creator.respond(update, creator.quiz_summary(quiz),
-                          kb.quiz_card(qid, quiz["owner_id"] == update.effective_user.id))
-
-
 async def show_settings(update: Update, edit: bool = True) -> None:
     user = db.ensure_user_row(update.effective_user.id)
     await creator.respond(update, "⚙️ <b>Settings</b>\n\nये defaults आपके <b>नए</b> quizzes पर लागू होंगे। "
-                                  "किसी मौजूदा quiz की settings: My Quizzes → Quiz → ✏️ Edit.",
+                                  "किसी मौजूदा quiz की settings: My Quizzes → Quiz → ⚙️ Settings.",
                           kb.settings_menu(user), edit=edit)
 
 
 async def share_quiz(update: Update, context, qid: str) -> None:
     quiz = db.get_quiz(qid)
-    link = engine.deep_link(await bot_username(context), qid)
+    username = await bot_username(context)
+    link = engine.deep_link(username, qid)
+    ready = quiz.get("status") == "ready" and quiz.get("question_count")
     await update.effective_chat.send_message(
         f"🔗 <b>Share: {esc(quiz['title'])}</b>\n\n{link}\n\n"
-        "Link खोलने वाला हर user bot की private chat में अपना अलग quiz session शुरू करेगा। "
-        "Group में भी यह link डाल सकते हैं।",
-        parse_mode=ParseMode.HTML, reply_markup=kb.share_markup(link, quiz["title"]),
+        "Link खोलने वाला हर user bot की private chat में अपना अलग quiz session शुरू करेगा।\n"
+        "👥 <b>Group में Quiz चलाएँ</b> → group चुनें → वहाँ ▶️ दबाएँ: quiz उसी group में native quiz "
+        "polls से चलेगा और अंत में leaderboard आएगा।",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb.share_markup(link, quiz["title"], qid, inline=await inline_enabled(context),
+                                     group_url=engine.group_link(username, qid) if ready else ""),
         disable_web_page_preview=True)
+
+
+# ------------------------------------------------------------ inline mode
+async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline sharing (works only if inline mode is enabled for the bot in BotFather).
+
+    ``quiz_<id>`` → that quiz's card; any other query → the user's own quizzes
+    whose title matches.  The card contains a Start button (deep link) — every
+    user who taps it gets an independent private session."""
+    iq = update.inline_query
+    if iq is None:
+        return
+    username = await bot_username(context)
+    query = (iq.query or "").strip()
+    quizzes = []
+    if query.startswith("quiz_"):
+        quiz = db.get_quiz(query[5:])
+        if quiz and quiz.get("status") == "ready" and quiz.get("question_count"):
+            quizzes = [quiz]
+    else:
+        needle = query.lower()
+        quizzes = [db.get_quiz(q["id"]) for q in db.get_owner_quizzes(iq.from_user.id, include_drafts=False)
+                   if q.get("question_count") and needle in q["title"].lower()][:20]
+        quizzes = [q for q in quizzes if q]
+    results = []
+    for quiz in quizzes:
+        link = engine.deep_link(username, quiz["id"])
+        n = quiz["question_count"]
+        text = (f"🎲 <b>{esc(quiz['title'])}</b>\n🖊 {n} {'question' if n == 1 else 'questions'} · "
+                f"⏱ {config.timer_label(quiz['timer'])}\n\nनीचे button दबाकर private chat में quiz शुरू करें 👇")
+        results.append(InlineQueryResultArticle(
+            id=quiz["id"][:64], title=quiz["title"][:100],
+            description=f"{n} questions · ⏱ {config.timer_label(quiz['timer'])}",
+            input_message_content=InputTextMessageContent(text, parse_mode=ParseMode.HTML),
+            reply_markup=kb.start_privately(link)))
+    await iq.answer(results, cache_time=5, is_personal=True)
 
 
 # ------------------------------------------------------------ callbacks
@@ -247,12 +402,22 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if not is_private(update):
         parts = data.split(":")
+        if prefix == "g" and len(parts) > 2 and parts[1] == "go":
+            await group_go(update, context, parts[2])
+            return
         await q.answer()
-        await group_redirect(update, context, parts[2] if prefix == "q" and len(parts) > 2 else None)
+        target = parts[2] if prefix in ("q", "r") and len(parts) > 2 else None
+        await group_redirect(update, context, target)
         return
 
+    if prefix == "j":
+        await join_check(update, context)
+        return
     if prefix == "c":
         await creator.handle_creator_callback(update, context)
+        return
+    if prefix == "f":
+        await creator.handle_forward_callback(update, context)
         return
     if prefix == "e":
         await creator.handle_edit_callback(update, context)
@@ -304,6 +469,15 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if prefix == "r":
         action = data[2:]
+        if action.startswith("go:"):
+            qid = action[3:]
+            if not db.get_quiz(qid):
+                await q.answer("❌ Quiz नहीं मिला (delete हो चुका है)।", show_alert=True)
+                return
+            await q.answer("🚀")
+            await runner.start_quiz(context.application, user, update.effective_chat.id, qid,
+                                    start_msg_id=q.message.message_id if q.message else None)
+            return
         if action == "stop":
             await q.answer("⏹ Stopping…")
             done = await runner.stop_quiz(context.application, user.id)
@@ -326,14 +500,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.answer("❌ Quiz नहीं मिला (delete हो चुका है)।", show_alert=True)
             return
         owner = quiz["owner_id"] == user.id
-        if action in ("edit", "del", "delok") and not owner:
+        if action in ("edit", "del", "delok", "set") and not owner:
             await q.answer("⛔ यह quiz आपका नहीं है।", show_alert=True)
             return
         await q.answer()
         if action == "view":
-            await show_quiz_card(update, qid)
+            await creator.send_quiz_card(update, qid, edit=True)
         elif action == "run":
-            await runner.start_quiz(context.application, user, update.effective_chat.id, qid)
+            await runner.send_ready(context.application, user, update.effective_chat.id, qid)
+        elif action == "set":
+            await creator.show_quiz_settings(update, qid)
         elif action == "share":
             await share_quiz(update, context, qid)
         elif action == "edit":
@@ -352,6 +528,23 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await q.answer("⌛ यह button अब valid नहीं है।")
 
 
+async def group_go(update: Update, context, qid: str) -> None:
+    """▶️ Start Quiz in this Group — one session per group at a time."""
+    q = update.callback_query
+    user = update.effective_user
+    if not await membership.has_access(context.bot, user.id, allow_unverified=True):
+        await q.answer(f"🔒 Quiz शुरू करने के लिए पहले {config.REQUIRED_CHAT} Join करें।", show_alert=True)
+        return
+    res = await group_runner.start_group_quiz(context.application, update.effective_chat.id, qid, user)
+    if res == "ok":
+        await q.answer("🚀 Quiz शुरू!")
+        return
+    await q.answer({"busy": "⏳ इस group में पहले से एक quiz चल रहा है। पहले वह पूरा होने दें या /stop करें।",
+                    "missing": "❌ Quiz नहीं मिला (delete हो चुका है)।",
+                    "empty": "⚠️ इस quiz में कोई प्रश्न नहीं है।",
+                    "draft": "⚠️ यह quiz अभी draft है।"}.get(res, "⚠️ Quiz शुरू नहीं हो सका।"), show_alert=True)
+
+
 # ------------------------------------------------------------ messages
 async def private_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -364,6 +557,9 @@ async def private_message_router(update: Update, context: ContextTypes.DEFAULT_T
         if state.startswith("c_"):
             await creator.handle_creator_message(update, context, state, data)
             return
+        if state.startswith("fw_"):
+            await creator.handle_forward_message(update, context, state, data)
+            return
         if state.startswith("e_"):
             await creator.handle_edit_message(update, context, state, data)
             return
@@ -375,9 +571,10 @@ async def private_message_router(update: Update, context: ContextTypes.DEFAULT_T
         db.set_state(user.id, "imp_wait", {"buffer": ""})
         await creator.handle_import_document(update, context)
         return
-    if msg.poll:
-        await msg.reply_text("ℹ️ Poll forward करने के बजाय ➕ New Quiz या 📥 Import का उपयोग करें।",
-                             reply_markup=kb.main_menu())
+    item = creator.item_from_message(msg)
+    if item and creator.is_question_item(item):
+        # a (forwarded) quiz poll / MCQ text with no quiz open → ask which quiz
+        await creator.begin_forward_import(update, item)
         return
     await msg.reply_text("👇 नीचे menu से विकल्प चुनें (PDF/Text import के लिए 📥 दबाएँ)।",
                          reply_markup=kb.main_menu())
@@ -422,21 +619,29 @@ BOT_COMMANDS = [
     BotCommand("start", "Main menu"), BotCommand("newquiz", "नया quiz बनाएँ"),
     BotCommand("myquizzes", "मेरे quizzes"), BotCommand("import", "PDF/Text से quiz"),
     BotCommand("stats", "मेरे results"), BotCommand("done", "Quiz creation पूरा करें"),
-    BotCommand("skip", "प्रश्न skip करें"), BotCommand("stop", "Quiz रोकें"),
+    BotCommand("undo", "आख़िरी प्रश्न हटाएँ (creation)"),
+    BotCommand("skip", "Skip (प्रश्न / optional step)"), BotCommand("stop", "Quiz रोकें"),
     BotCommand("cancel", "रद्द करें"), BotCommand("help", "Help"),
 ]
 
 
 async def post_init(app: Application) -> None:
-    me = await app.bot.get_me()
-    _bot_username_cache["u"] = me.username
-    log.info("Logged in as @%s (id %s)", me.username, me.id)
+    await _cache_me(app.bot)
+    log.info("Logged in as @%s (inline mode: %s)", _bot_username_cache["u"],
+             "on" if _bot_username_cache["inline"] else "off")
     try:
         await app.bot.set_my_commands(BOT_COMMANDS)
     except Exception as exc:  # noqa: BLE001
         log.warning("set_my_commands failed: %s", exc)
     rec = await runner.recover_sessions(app)
     log.info("Session recovery: %s", rec)
+    grec = await group_runner.recover_group_sessions(app)
+    log.info("Group session recovery: %s", grec)
+    if membership.enabled():
+        log.info("Join gate: users must be members of %s (the bot must be a member/admin there)",
+                 config.REQUIRED_CHAT)
+    else:
+        log.info("Join gate disabled (REQUIRED_CHAT empty)")
     try:
         import pdf_extract
         ok, info = pdf_extract.ocr_status()
@@ -465,6 +670,7 @@ def build_application(token: str, request=None, get_updates_request=None, rate_l
     if app.job_queue is None:
         raise RuntimeError("JobQueue missing: install python-telegram-bot[job-queue]")
 
+    app.add_handler(TypeHandler(Update, membership_gate), group=-1)
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("newquiz", newquiz_cmd))
@@ -474,11 +680,14 @@ def build_application(token: str, request=None, get_updates_request=None, rate_l
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("done", done_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("skip", skip_cmd))
     app.add_handler(CommandHandler("quiz", quiz_cmd))
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(PollAnswerHandler(runner.handle_poll_answer))
+    app.add_handler(ChatMemberHandler(membership.on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(InlineQueryHandler(inline_query_handler))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND & (
             filters.TEXT | filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.ANIMATION

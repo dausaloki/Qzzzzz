@@ -18,6 +18,7 @@ from telegram.ext import Application, ContextTypes
 
 import config
 import database as db
+import group_runner
 import keyboards as kb
 import quiz_engine as engine
 from keyboards import esc
@@ -66,8 +67,45 @@ async def _send_text(bot, chat_id: int, text: str, **kw):
 
 
 # ------------------------------------------------------------ start / stop
-async def start_quiz(app: Application, user, chat_id: int, qid: str, chat_type: str = ChatType.PRIVATE) -> Optional[int]:
-    """Start a new attempt for ``user``. Returns attempt id or None."""
+def ready_text(quiz: dict) -> str:
+    """The "get ready" card shown before a quiz starts (Start button: r:go)."""
+    n = quiz.get("question_count", db.count_questions(quiz["id"]))
+    lines = [f"🎲 <b>Get ready for the quiz “{esc(quiz['title'])}”</b>"]
+    if quiz.get("description"):
+        lines.append(esc(quiz["description"]))
+    lines += ["",
+              f"🖊 {n} {'question' if n == 1 else 'questions'}",
+              f"⏱ {config.timer_label(quiz['timer'])} per question" if quiz.get("timer")
+              else "⏱ No time limit",
+              f"🔀 {'Questions and answers shuffled' if quiz['shuffle_questions'] and quiz['shuffle_options'] else 'Questions shuffled' if quiz['shuffle_questions'] else 'Answers shuffled' if quiz['shuffle_options'] else 'No shuffle'}",
+              "",
+              "तैयार होने पर नीचे button दबाएँ। रोकने के लिए /stop, प्रश्न छोड़ने के लिए /skip भेजें।"]
+    return "\n".join(lines)
+
+
+async def send_ready(app: Application, user, chat_id: int, qid: str) -> bool:
+    """Show the ready card; the quiz itself starts on the r:go button."""
+    bot = app.bot
+    quiz = db.get_quiz(qid)
+    if not quiz:
+        await bot.send_message(chat_id, "❌ Quiz नहीं मिला (शायद delete हो चुका है)।", reply_markup=kb.main_menu())
+        return False
+    if quiz.get("status") == "draft" and quiz["owner_id"] != user.id:
+        await bot.send_message(chat_id, "⚠️ यह quiz अभी तैयार नहीं हुआ है।")
+        return False
+    if not quiz.get("question_count"):
+        await bot.send_message(chat_id, "⚠️ इस quiz में अभी कोई प्रश्न नहीं है।", reply_markup=kb.main_menu())
+        return False
+    await bot.send_message(chat_id, ready_text(quiz), parse_mode=ParseMode.HTML, reply_markup=kb.ready_markup(qid))
+    return True
+
+
+async def start_quiz(app: Application, user, chat_id: int, qid: str, chat_type: str = ChatType.PRIVATE,
+                     start_msg_id: Optional[int] = None) -> Optional[int]:
+    """Start a new attempt for ``user``. Returns attempt id or None.
+
+    ``start_msg_id`` is the message whose button started the quiz: a second
+    tap on the same button while that attempt is running is ignored."""
     bot = app.bot
     if chat_type != ChatType.PRIVATE:
         # Safety net: sessions are always private (see bot.py group handling).
@@ -86,25 +124,15 @@ async def start_quiz(app: Application, user, chat_id: int, qid: str, chat_type: 
 
     async with user_lock(user.id):
         old = db.get_active_attempt(user.id)
+        if old and start_msg_id is not None and old.get("start_msg_id") == start_msg_id \
+                and old["quiz_id"] == qid:
+            return None                      # double tap on the same Start button
         if old:
             await _stop_locked(app, old, notify=True, reason="नया quiz शुरू करने पर पिछला quiz रोक दिया गया।")
         order = engine.build_order([q["id"] for q in questions], bool(quiz["shuffle_questions"]))
         attempt_id = db.create_attempt(qid, user.id, chat_id, order, int(quiz["timer"] or 0),
-                                       bool(quiz["shuffle_options"]), time.time())
-    intro = [f"🎯 <b>{esc(quiz['title'])}</b>"]
-    if quiz.get("description"):
-        intro.append(esc(quiz["description"]))
-    intro += [
-        "",
-        f"📝 प्रश्न: {len(order)}",
-        f"⏱ Timer: {config.timer_label(quiz['timer'])} प्रति प्रश्न",
-        f"🔀 Shuffle: questions {'ON' if quiz['shuffle_questions'] else 'OFF'}, "
-        f"options {'ON' if quiz['shuffle_options'] else 'OFF'}",
-        "",
-        "/skip — प्रश्न छोड़ें  •  /stop — quiz रोकें",
-    ]
+                                       bool(quiz["shuffle_options"]), time.time(), start_msg_id)
     try:
-        await bot.send_message(chat_id, "\n".join(intro), parse_mode=ParseMode.HTML)
         if quiz.get("pre_text"):
             await _send_text(bot, chat_id, quiz["pre_text"])
     except Forbidden:
@@ -214,7 +242,7 @@ async def _send_poll(bot, chat_id: int, payload: engine.PollPayload, open_period
         question=payload.question,
         options=payload.options,
         type="quiz",
-        correct_option_id=payload.correct_option_id,
+        correct_option_ids=[payload.correct_option_id],     # Bot API 9.6+ field
         is_anonymous=False,
         allows_multiple_answers=False,
         explanation=payload.explanation,
@@ -231,8 +259,12 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not ans.option_ids:  # vote retracted (not possible for quizzes, but be safe)
         return
     att = db.get_attempt_by_poll(ans.poll_id)
-    if not att or att["user_id"] != ans.user.id:
-        return  # expired session / someone else's poll
+    if not att:
+        # not a private session → maybe a poll of a group quiz session
+        await group_runner.handle_group_answer(update, context)
+        return
+    if att["user_id"] != ans.user.id:
+        return  # someone else's poll
     app = context.application
     async with user_lock(ans.user.id):
         att = db.get_attempt(att["id"])
@@ -322,17 +354,22 @@ async def skip_current(app: Application, user_id: int, message_id: Optional[int]
 def result_text(att: dict, quiz_title: str, stopped: bool) -> str:
     r = engine.compute_result(att["total"], att["correct"], att["wrong"], att["skipped"],
                               att.get("duration_sec") or 0)
-    head = "⏹ <b>Quiz Stopped</b> (partial result saved)" if stopped else "🏁 <b>Quiz Complete</b>"
-    lines = [head, f"📘 {esc(quiz_title)}", "",
-             f"📝 Total: {r.total}",
-             f"✅ Correct: {r.correct}",
-             f"❌ Wrong: {r.wrong}",
-             f"⏭ Skipped: {r.skipped}"]
+    head = "⏹ <b>Quiz stopped</b> — partial result saved" if stopped else "🏁 <b>The quiz has finished!</b>"
+    lines = [head, "", "📊 <b>Result</b>",
+             f"Quiz: {esc(quiz_title)}",
+             f"Total: {r.total}",
+             f"Correct: {r.correct} ✅",
+             f"Wrong: {r.wrong} ❌",
+             f"Skipped: {r.skipped} ⌛"]
     if r.unanswered:
-        lines.append(f"⏸ Not attempted: {r.unanswered}")
-    lines += [f"🎯 Score: {r.score}/{r.total}",
-              f"📈 Percentage: {r.percentage:.2f}%",
-              f"⏱ Time: {engine.format_duration(r.duration_sec)}"]
+        lines.append(f"Not attempted: {r.unanswered}")
+    lines += [f"Score: {r.score}/{r.total}",
+              f"Percentage: {r.percentage:.2f}%",
+              f"Time: {engine.format_duration(r.duration_sec)}"]
+    if not stopped:
+        rank, n = db.user_rank(att["quiz_id"], att["user_id"])
+        if rank and n > 1:
+            lines += ["", f"🏆 आपकी rank (best attempt): {rank} / {n} participants"]
     return "\n".join(lines)
 
 

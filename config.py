@@ -30,7 +30,7 @@ CAPTION_MAX = int(MessageLimit.CAPTION_LENGTH)              # 1024
 SAFE_MESSAGE_CHUNK = 4000
 
 MAX_QUESTIONS = 100
-MIN_OPTIONS = int(PollLimit.MIN_OPTION_NUMBER)             # 2
+MIN_OPTIONS = max(2, int(PollLimit.MIN_OPTION_NUMBER))     # 2 — a quiz question needs a choice (PTB 22.8 reports 1)
 MAX_OPTIONS = int(PollLimit.MAX_OPTION_NUMBER)             # 12
 OPTION_LABELS = "ABCDEFGHIJKL"[:MAX_OPTIONS]
 
@@ -48,6 +48,30 @@ TIMER_GRACE = float(os.getenv("TIMER_GRACE", "1.0"))
 # Active sessions older than this are expired on startup.
 SESSION_EXPIRY_HOURS = int(os.getenv("SESSION_EXPIRY_HOURS", "24"))
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # Bot API getFile limit
+
+# ---------------------------------------------------------------- question tag
+# Prepended (once) to EVERY question the bot sends — private and group polls
+# and the full-text message used for long questions.  Empty string disables it.
+QUESTION_TAG = os.getenv("QUESTION_TAG", "जय श्री श्याम").strip()
+
+# ---------------------------------------------------------------- join gate
+# Users must be members of this group/channel before they can use the bot.
+# "@username" or a numeric chat id (-100…).  The bot must be a member of the
+# group (for a channel: an administrator), otherwise Telegram's getChatMember
+# cannot report membership.  Empty string disables the gate.
+REQUIRED_CHAT = os.getenv("REQUIRED_CHAT", "@kalam_kranti").strip()
+REQUIRED_CHAT_URL = os.getenv("REQUIRED_CHAT_URL", "").strip() or (
+    f"https://t.me/{REQUIRED_CHAT.lstrip('@')}" if REQUIRED_CHAT.startswith("@") else "")
+# A verified membership is re-checked with getChatMember after this many seconds
+# (and on every /start), so users who left the group must join again.
+MEMBERSHIP_RECHECK_SECONDS = int(os.getenv("MEMBERSHIP_RECHECK_SECONDS", "600"))
+
+# ---------------------------------------------------------------- group quizzes
+# Seconds per question in a group when the quiz itself has "No timer"
+# (a group quiz needs a time limit to move on to the next question).
+GROUP_DEFAULT_TIMER = int(os.getenv("GROUP_DEFAULT_TIMER", "30"))
+# Pause between a group question closing and the next one.
+GROUP_NEXT_DELAY = float(os.getenv("GROUP_NEXT_DELAY", "2.0"))
 
 
 def timer_label(seconds: int) -> str:

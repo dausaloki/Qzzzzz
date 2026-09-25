@@ -66,7 +66,9 @@ CREATE TABLE IF NOT EXISTS users (
     default_shuffle_questions INTEGER DEFAULT 0,
     default_shuffle_options INTEGER DEFAULT 0,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    last_seen TEXT DEFAULT CURRENT_TIMESTAMP
+    last_seen TEXT DEFAULT CURRENT_TIMESTAMP,
+    member_verified_ts REAL DEFAULT 0,
+    member_checked_ts REAL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS quizzes (
@@ -102,6 +104,7 @@ CREATE TABLE IF NOT EXISTS questions (
     pre_media_type TEXT DEFAULT '',
     pre_media_id TEXT DEFAULT '',
     source_number INTEGER,
+    source_ref TEXT DEFAULT '',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(quiz_id) REFERENCES quizzes(id) ON DELETE CASCADE
 );
@@ -131,7 +134,8 @@ CREATE TABLE IF NOT EXISTS attempts (
     cur_perm_json TEXT,
     cur_correct INTEGER,
     cur_sent_ts REAL,
-    cur_post_explanation TEXT DEFAULT ''
+    cur_post_explanation TEXT DEFAULT '',
+    start_msg_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS answers (
@@ -145,6 +149,62 @@ CREATE TABLE IF NOT EXISTS answers (
     elapsed REAL DEFAULT 0,
     answered_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(attempt_id) REFERENCES attempts(id) ON DELETE CASCADE
+);
+
+-- one quiz running inside a Telegram group (quiz_id + chat_id + session id);
+-- any number of groups (and private chats) can run the same quiz at once.
+CREATE TABLE IF NOT EXISTS group_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    quiz_id TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    started_by INTEGER,
+    status TEXT DEFAULT 'active',
+    order_json TEXT DEFAULT '[]',
+    current_index INTEGER DEFAULT 0,
+    asked INTEGER DEFAULT 0,
+    total INTEGER DEFAULT 0,
+    timer INTEGER DEFAULT 30,
+    shuffle_options INTEGER DEFAULT 0,
+    started_ts REAL DEFAULT 0,
+    finished_ts REAL,
+    cur_poll_id TEXT,
+    cur_message_id INTEGER,
+    cur_question_id INTEGER,
+    cur_sent_ts REAL,
+    cur_post_explanation TEXT DEFAULT ''
+);
+
+-- every poll sent in a group session (answers can be mapped back even later)
+CREATE TABLE IF NOT EXISTS group_polls (
+    poll_id TEXT PRIMARY KEY,
+    session_id INTEGER NOT NULL,
+    question_id INTEGER NOT NULL,
+    q_index INTEGER NOT NULL,
+    perm_json TEXT NOT NULL,
+    correct_display INTEGER NOT NULL,
+    message_id INTEGER,
+    sent_ts REAL,
+    FOREIGN KEY(session_id) REFERENCES group_sessions(id) ON DELETE CASCADE
+);
+
+-- one row per participant per question: A's answer can never overwrite B's
+CREATE TABLE IF NOT EXISTS group_answers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    quiz_id TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    poll_id TEXT NOT NULL,
+    question_id INTEGER NOT NULL,
+    q_index INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    chosen_display INTEGER NOT NULL,
+    chosen_index INTEGER NOT NULL,
+    is_correct INTEGER NOT NULL,
+    score INTEGER NOT NULL DEFAULT 0,          -- points for this answer (1 correct / 0 wrong)
+    elapsed REAL DEFAULT 0,
+    answered_ts REAL,
+    UNIQUE(session_id, question_id, user_id),
+    FOREIGN KEY(session_id) REFERENCES group_sessions(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS user_states (
@@ -162,6 +222,9 @@ CREATE INDEX IF NOT EXISTS idx_attempts_user ON attempts(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_attempts_poll ON attempts(cur_poll_id);
 CREATE INDEX IF NOT EXISTS idx_answers_attempt ON answers(attempt_id);
 CREATE INDEX IF NOT EXISTS idx_quizzes_owner ON quizzes(owner_id);
+CREATE INDEX IF NOT EXISTS idx_gsessions_chat ON group_sessions(chat_id, status);
+CREATE INDEX IF NOT EXISTS idx_gpolls_session ON group_polls(session_id);
+CREATE INDEX IF NOT EXISTS idx_ganswers_session ON group_answers(session_id, user_id);
 """
 
 # Columns that may be missing in databases created by the previous version.
@@ -171,6 +234,8 @@ _MIGRATION_COLUMNS = {
         "default_shuffle_questions": "INTEGER DEFAULT 0",
         "default_shuffle_options": "INTEGER DEFAULT 0",
         "last_seen": "TEXT",
+        "member_verified_ts": "REAL DEFAULT 0",
+        "member_checked_ts": "REAL DEFAULT 0",
     },
     "quizzes": {
         "pre_text": "TEXT DEFAULT ''",
@@ -184,6 +249,7 @@ _MIGRATION_COLUMNS = {
         "pre_media_type": "TEXT DEFAULT ''",
         "pre_media_id": "TEXT DEFAULT ''",
         "source_number": "INTEGER",
+        "source_ref": "TEXT DEFAULT ''",
         "created_at": "TEXT",
     },
     "attempts": {
@@ -195,6 +261,7 @@ _MIGRATION_COLUMNS = {
         "started_ts": "REAL DEFAULT 0",
         "duration_sec": "REAL DEFAULT 0",
         "cur_poll_id": "TEXT",
+        "start_msg_id": "INTEGER",
         "cur_message_id": "INTEGER",
         "cur_question_id": "INTEGER",
         "cur_perm_json": "TEXT",
@@ -411,7 +478,7 @@ def count_questions(qid: str) -> int:
 def add_question(qid: str, question: str, options: list[str], correct_index: int,
                  explanation: str = "", *, qtype: str = "mcq", pre_text: str = "",
                  pre_media_type: str = "", pre_media_id: str = "",
-                 source_number: Optional[int] = None) -> int:
+                 source_number: Optional[int] = None, source_ref: str = "") -> int:
     if not isinstance(options, (list, tuple)) or not (
             config.MIN_OPTIONS <= len(options) <= config.MAX_OPTIONS):
         raise ValueError(f"{config.MIN_OPTIONS}-{config.MAX_OPTIONS} options are required")
@@ -429,11 +496,12 @@ def add_question(qid: str, question: str, options: list[str], correct_index: int
                           (qid,)).fetchone()[0]
         cur = con.execute("""
             INSERT INTO questions(quiz_id,position,question,options_json,correct_index,
-                                  explanation,qtype,pre_text,pre_media_type,pre_media_id,source_number)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                                  explanation,qtype,pre_text,pre_media_type,pre_media_id,source_number,
+                                  source_ref)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
         """, (qid, pos, question, json.dumps(list(options), ensure_ascii=False),
               int(correct_index), explanation or "", qtype, pre_text or "",
-              pre_media_type or "", pre_media_id or "", source_number))
+              pre_media_type or "", pre_media_id or "", source_number, source_ref or ""))
         con.execute("UPDATE quizzes SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (qid,))
         return cur.lastrowid
 
@@ -466,15 +534,76 @@ def get_question(qid: Optional[str], question_id: int) -> Optional[dict]:
 
 
 def update_question(question_id: int, **fields) -> None:
-    allowed = {"question", "explanation", "correct_index", "pre_text", "qtype"}
+    """Update a question.  ``options`` and ``correct_index`` are validated
+    together inside one transaction, so an edit can never leave a question
+    whose correct answer points outside its options."""
+    allowed = {"question", "explanation", "correct_index", "pre_text", "qtype", "options"}
     bad = set(fields) - allowed
     if bad:
         raise ValueError(f"Invalid question field(s): {bad}")
     if not fields:
         return
-    sets = ", ".join(f"{k}=?" for k in fields)
+    if "question" in fields and not str(fields["question"] or "").strip():
+        raise ValueError("Question text is empty")
     with connect() as con:
+        row = con.execute("SELECT options_json, correct_index, quiz_id FROM questions WHERE id=?",
+                          (question_id,)).fetchone()
+        if row is None:
+            raise ValueError("Question not found")
+        options = fields.pop("options", None)
+        if options is not None:
+            if not isinstance(options, (list, tuple)) or not (
+                    config.MIN_OPTIONS <= len(options) <= config.MAX_OPTIONS):
+                raise ValueError(f"{config.MIN_OPTIONS}-{config.MAX_OPTIONS} options are required")
+            if any(not str(o).strip() for o in options):
+                raise ValueError("An option is empty")
+            fields["options_json"] = json.dumps(list(options), ensure_ascii=False)
+        n_opts = len(options) if options is not None else len(json.loads(row["options_json"]))
+        correct = int(fields.get("correct_index", row["correct_index"]))
+        if not 0 <= correct < n_opts:
+            raise ValueError(f"correct_index must be 0..{n_opts - 1}")
+        if "correct_index" in fields:
+            fields["correct_index"] = correct
+        sets = ", ".join(f"{k}=?" for k in fields)
         con.execute(f"UPDATE questions SET {sets} WHERE id=?", (*fields.values(), question_id))
+        con.execute("UPDATE quizzes SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (row["quiz_id"],))
+
+
+def move_question(qid: str, question_id: int, delta: int) -> bool:
+    """Move a question up (delta=-1) or down (+1).  Positions are renumbered
+    1..n in the same transaction, so the order stays dense and consistent."""
+    with connect() as con:
+        ids = [r["id"] for r in con.execute(
+            "SELECT id FROM questions WHERE quiz_id=? ORDER BY position,id", (qid,)).fetchall()]
+        if question_id not in ids:
+            return False
+        i = ids.index(question_id)
+        j = i + (1 if delta > 0 else -1)
+        if not 0 <= j < len(ids):
+            return False
+        ids[i], ids[j] = ids[j], ids[i]
+        for pos, x in enumerate(ids, 1):
+            con.execute("UPDATE questions SET position=? WHERE id=?", (pos, x))
+        con.execute("UPDATE quizzes SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (qid,))
+        return True
+
+
+def user_rank(qid: str, user_id: int) -> tuple[int, int]:
+    """(rank, participants) by each user's best finished attempt:
+    more correct first, then faster.  (0, n) if the user has none."""
+    with connect() as con:
+        rows = con.execute("""
+            SELECT user_id, correct, duration_sec FROM attempts a
+            WHERE quiz_id=? AND status='finished' AND id = (
+                SELECT b.id FROM attempts b WHERE b.quiz_id=a.quiz_id AND b.user_id=a.user_id
+                  AND b.status='finished'
+                ORDER BY b.correct DESC, b.duration_sec ASC, b.id ASC LIMIT 1)
+            ORDER BY correct DESC, duration_sec ASC, id ASC
+        """, (qid,)).fetchall()
+    for i, r in enumerate(rows, 1):
+        if r["user_id"] == user_id:
+            return i, len(rows)
+    return 0, len(rows)
 
 
 def delete_question(question_id: int, qid: str) -> bool:
@@ -490,14 +619,15 @@ def delete_question(question_id: int, qid: str) -> bool:
 
 # --------------------------------------------------------------- attempts
 def create_attempt(qid: str, user_id: int, chat_id: int, order: list[int],
-                   timer: int, shuffle_options: bool, started_ts: float) -> int:
+                   timer: int, shuffle_options: bool, started_ts: float,
+                   start_msg_id: Optional[int] = None) -> int:
     with connect() as con:
         cur = con.execute("""
             INSERT INTO attempts(quiz_id,user_id,chat_id,status,order_json,current_index,total,
-                                 timer,shuffle_options,started_ts)
-            VALUES(?,?,?,'active',?,0,?,?,?,?)
+                                 timer,shuffle_options,started_ts,start_msg_id)
+            VALUES(?,?,?,'active',?,0,?,?,?,?,?)
         """, (qid, user_id, chat_id, json.dumps(order), len(order), int(timer or 0),
-              int(bool(shuffle_options)), started_ts))
+              int(bool(shuffle_options)), started_ts, start_msg_id))
         return cur.lastrowid
 
 
@@ -672,3 +802,161 @@ def get_state(user_id: int) -> tuple[Optional[str], dict]:
 def clear_state(user_id: int) -> None:
     with connect() as con:
         con.execute("DELETE FROM user_states WHERE user_id=?", (user_id,))
+
+
+# --------------------------------------------------------------- membership (join gate)
+def get_membership(user_id: int) -> tuple[float, float]:
+    """(verified_ts, checked_ts); verified_ts == 0 → never verified / left."""
+    row = ensure_user_row(user_id)
+    return float(row.get("member_verified_ts") or 0), float(row.get("member_checked_ts") or 0)
+
+
+def set_member_verified(user_id: int, ts: float) -> None:
+    ensure_user_row(user_id)
+    with connect() as con:
+        con.execute("""UPDATE users SET member_verified_ts=CASE WHEN member_verified_ts>0
+                       THEN member_verified_ts ELSE ? END, member_checked_ts=? WHERE user_id=?""",
+                    (ts, ts, user_id))
+
+
+def clear_member(user_id: int) -> None:
+    ensure_user_row(user_id)
+    with connect() as con:
+        con.execute("UPDATE users SET member_verified_ts=0, member_checked_ts=0 WHERE user_id=?", (user_id,))
+
+
+# --------------------------------------------------------------- group sessions
+def _gs_row(row) -> Optional[dict]:
+    if not row:
+        return None
+    d = dict(row)
+    d["order"] = json.loads(d.get("order_json") or "[]")
+    return d
+
+
+def create_group_session(qid: str, chat_id: int, started_by: int, order: list[int], timer: int,
+                         shuffle_options: bool, started_ts: float) -> Optional[int]:
+    """New session for this group; None if the group already runs a quiz."""
+    with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        busy = con.execute("SELECT id FROM group_sessions WHERE chat_id=? AND status='active'",
+                           (chat_id,)).fetchone()
+        if busy:
+            return None
+        cur = con.execute("""
+            INSERT INTO group_sessions(quiz_id,chat_id,started_by,status,order_json,current_index,total,
+                                       timer,shuffle_options,started_ts)
+            VALUES(?,?,?,'active',?,0,?,?,?,?)
+        """, (qid, chat_id, started_by, json.dumps(order), len(order), int(timer),
+              int(bool(shuffle_options)), started_ts))
+        return cur.lastrowid
+
+
+def get_group_session(session_id: int) -> Optional[dict]:
+    with connect() as con:
+        return _gs_row(con.execute("SELECT * FROM group_sessions WHERE id=?", (session_id,)).fetchone())
+
+
+def get_active_group_session(chat_id: int) -> Optional[dict]:
+    with connect() as con:
+        return _gs_row(con.execute("SELECT * FROM group_sessions WHERE chat_id=? AND status='active' "
+                                   "ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone())
+
+
+def list_active_group_sessions() -> list[dict]:
+    with connect() as con:
+        return [_gs_row(r) for r in con.execute("SELECT * FROM group_sessions WHERE status='active'")]
+
+
+def set_group_current(session_id: int, poll_id: str, message_id: int, question_id: int, q_index: int,
+                      perm: list[int], correct_display: int, sent_ts: float, post_explanation: str) -> None:
+    with connect() as con:
+        con.execute("""UPDATE group_sessions SET cur_poll_id=?, cur_message_id=?, cur_question_id=?,
+                       cur_sent_ts=?, cur_post_explanation=?, asked=MAX(asked, ?) WHERE id=?""",
+                    (poll_id, message_id, question_id, sent_ts, post_explanation or "", q_index + 1, session_id))
+        con.execute("""INSERT OR REPLACE INTO group_polls(poll_id,session_id,question_id,q_index,perm_json,
+                       correct_display,message_id,sent_ts) VALUES(?,?,?,?,?,?,?,?)""",
+                    (poll_id, session_id, question_id, q_index, json.dumps(list(perm)), int(correct_display),
+                     message_id, sent_ts))
+
+
+def close_group_question(session_id: int, poll_id: Optional[str]) -> bool:
+    """Close the current question and advance.  Atomic: returns False if the
+    question was already closed (timer and /skip racing)."""
+    with connect() as con:
+        if poll_id is None:
+            cur = con.execute("""UPDATE group_sessions SET current_index=current_index+1
+                                 WHERE id=? AND status='active' AND cur_poll_id IS NULL""", (session_id,))
+        else:
+            cur = con.execute("""UPDATE group_sessions SET current_index=current_index+1, cur_poll_id=NULL,
+                                 cur_message_id=NULL, cur_question_id=NULL, cur_post_explanation=''
+                                 WHERE id=? AND status='active' AND cur_poll_id=?""", (session_id, poll_id))
+        return cur.rowcount > 0
+
+
+def get_group_poll(poll_id: str) -> Optional[dict]:
+    with connect() as con:
+        row = con.execute("""SELECT p.*, s.quiz_id, s.chat_id, s.status AS session_status, s.cur_poll_id
+                             FROM group_polls p JOIN group_sessions s ON s.id=p.session_id
+                             WHERE p.poll_id=?""", (poll_id,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["perm"] = json.loads(d["perm_json"])
+    return d
+
+
+def record_group_answer(session_id: int, quiz_id: str, chat_id: int, poll_id: str, question_id: int,
+                        q_index: int, user_id: int, chosen_display: int, chosen_index: int,
+                        is_correct: bool, elapsed: float, ts: float) -> bool:
+    """False if this participant already answered this question (never overwritten)."""
+    with connect() as con:
+        cur = con.execute("""
+            INSERT OR IGNORE INTO group_answers(session_id,quiz_id,chat_id,poll_id,question_id,q_index,user_id,
+                                                chosen_display,chosen_index,is_correct,score,elapsed,answered_ts)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (session_id, quiz_id, chat_id, poll_id, question_id, q_index, user_id, chosen_display,
+              chosen_index, int(bool(is_correct)), 1 if is_correct else 0, elapsed, ts))
+        return cur.rowcount > 0
+
+
+def finish_group_session(session_id: int, status: str, ts: float) -> Optional[dict]:
+    """Mark finished/stopped exactly once; returns the session or None if already done."""
+    with connect() as con:
+        cur = con.execute("""UPDATE group_sessions SET status=?, finished_ts=?, cur_poll_id=NULL
+                             WHERE id=? AND status='active'""", (status, ts, session_id))
+        if cur.rowcount == 0:
+            return None
+        return _gs_row(con.execute("SELECT * FROM group_sessions WHERE id=?", (session_id,)).fetchone())
+
+
+def group_leaderboard(session_id: int) -> list[dict]:
+    """Per-participant totals from the stored answers (best first)."""
+    with connect() as con:
+        rows = con.execute("""
+            SELECT a.user_id, u.username, u.first_name,
+                   SUM(a.is_correct) AS correct, SUM(1 - a.is_correct) AS wrong, SUM(a.score) AS score,
+                   COUNT(*) AS answered, COALESCE(SUM(a.elapsed), 0) AS elapsed
+            FROM group_answers a LEFT JOIN users u ON u.user_id=a.user_id
+            WHERE a.session_id=?
+            GROUP BY a.user_id
+            ORDER BY correct DESC, elapsed ASC, a.user_id ASC
+        """, (session_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_group_answers(session_id: int) -> list[dict]:
+    with connect() as con:
+        return [dict(r) for r in con.execute(
+            "SELECT * FROM group_answers WHERE session_id=? ORDER BY q_index, user_id", (session_id,))]
+
+
+def group_quiz_stats(qid: str) -> dict:
+    with connect() as con:
+        row = con.execute("""
+            SELECT COUNT(DISTINCT s.id) AS sessions, COUNT(DISTINCT s.chat_id) AS groups,
+                   COUNT(DISTINCT a.user_id) AS participants
+            FROM group_sessions s LEFT JOIN group_answers a ON a.session_id=s.id
+            WHERE s.quiz_id=? AND s.status IN ('finished','stopped')
+        """, (qid,)).fetchone()
+    return dict(row)

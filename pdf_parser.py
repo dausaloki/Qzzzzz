@@ -34,7 +34,7 @@ from typing import Callable, Optional
 try:  # keep the parser importable without Telegram installed
     from telegram.constants import PollLimit
     MAX_OPTIONS = int(PollLimit.MAX_OPTION_NUMBER)   # 12
-    MIN_OPTIONS = int(PollLimit.MIN_OPTION_NUMBER)   # 2
+    MIN_OPTIONS = max(2, int(PollLimit.MIN_OPTION_NUMBER))   # 2 (a quiz needs a choice)
 except Exception:  # pragma: no cover
     MAX_OPTIONS, MIN_OPTIONS = 12, 2
 

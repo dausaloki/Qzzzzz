@@ -117,8 +117,31 @@ def explanation_fits(expl: str) -> bool:
             and expl.count("\n") <= config.POLL_EXPLANATION_MAX_NEWLINES)
 
 
+# ----------------------------------------------------- question tag
+def split_tag(text: str) -> str:
+    """The question body without a leading QUESTION_TAG (if the source already has one)."""
+    tag = config.QUESTION_TAG
+    body = str(text or "").strip()
+    if tag and body.startswith(tag):
+        body = body[len(tag):].lstrip(" \t\r\n,।:-–—")
+    return body
+
+
+def tag_text(text: str) -> str:
+    """Prefix config.QUESTION_TAG exactly once ("<tag>\n\n<text>")."""
+    tag = config.QUESTION_TAG
+    body = split_tag(text)
+    return f"{tag}\n\n{body}" if tag else body
+
+
+def _tag_head() -> str:
+    return f"{config.QUESTION_TAG}\n\n" if config.QUESTION_TAG else ""
+
+
 def full_question_text(question_text: str, options: Sequence[str], index: int, total: int) -> str:
-    lines = [f"❓ प्रश्न {index + 1}/{total}", "", question_text.strip(), ""]
+    lines = [f"❓ प्रश्न {index + 1}/{total}", "", split_tag(question_text), ""]
+    if config.QUESTION_TAG:
+        lines = [config.QUESTION_TAG, ""] + lines
     for i, opt in enumerate(options):
         lines.append(f"({LABELS[i]}) {opt}")
     return "\n".join(lines)
@@ -139,7 +162,8 @@ def build_poll_payload(question: dict, perm: Sequence[int], index: int, total: i
         raise ValueError("invalid options/permutation")
     shown = [str(orig_opts[i]).strip() for i in perm]
     correct = display_correct(perm, int(question["correct_index"]))
-    qtext = str(question["question"]).strip()
+    qtext = split_tag(question["question"])       # the tag is added exactly once below
+    head = _tag_head()
 
     prefix = f"[{index + 1}/{total}] "
     # Poll options are single-line: an option with a line break is shown
@@ -148,11 +172,13 @@ def build_poll_payload(question: dict, perm: Sequence[int], index: int, total: i
     poll_opts = [" ".join(o.split()) for o in shown]
     long_opts = any(tg_len(o) > config.POLL_OPTION_MAX or not o for o in poll_opts)
     dup_opts = len(set(poll_opts)) != len(poll_opts)
-    long_q = tg_len(qtext) > config.POLL_QUESTION_MAX
+    # the tag counts toward the 300-unit poll question limit
+    long_q = tg_len(head + qtext) > config.POLL_QUESTION_MAX
 
     payload = PollPayload(question="", options=[], correct_option_id=correct, perm=perm)
     if not long_q and not long_opts and not dup_opts and not multiline:
-        payload.question = prefix + qtext if tg_len(prefix + qtext) <= config.POLL_QUESTION_MAX else qtext
+        full = head + prefix + qtext
+        payload.question = full if tg_len(full) <= config.POLL_QUESTION_MAX else head + qtext
         payload.options = shown
     else:
         payload.long_question = long_q
@@ -164,7 +190,7 @@ def build_poll_payload(question: dict, perm: Sequence[int], index: int, total: i
         else:
             payload.options = poll_opts
             prompt = "ऊपर दिए गए प्रश्न का सही उत्तर चुनें 👇"
-        full = prefix + prompt
+        full = head + prefix + prompt       # only our own prompt can be shortened, never the source
         payload.question = full[:_tg_prefix_len(full, config.POLL_QUESTION_MAX)]
 
     expl = str(question.get("explanation") or "").strip()
@@ -186,7 +212,7 @@ def compact_fallback(question: dict, perm: Sequence[int], index: int, total: int
     perm = list(perm)
     shown = [str(question["options"][i]).strip() for i in perm]
     p = PollPayload(
-        question=f"[{index + 1}/{total}] ऊपर दिए गए प्रश्न का सही विकल्प चुनें",
+        question=f"{_tag_head()}[{index + 1}/{total}] ऊपर दिए गए प्रश्न का सही विकल्प चुनें",
         options=[f"({LABELS[i]})" for i in range(len(shown))],
         correct_option_id=display_correct(perm, int(question["correct_index"])),
         perm=perm,
@@ -235,6 +261,156 @@ def detect_embedded_options(text: str) -> Optional[tuple[str, list[str]]]:
     return pdf_parser.split_question_and_options(text)
 
 
+_PAREN_OPTION_RE = re.compile(r"^\s*\(\s*[A-La-l]\s*\)\s*\S")
+
+
+class NoOptionsError(ValueError):
+    """The text has no (A)/(B)/… option block — it is not a complete question."""
+
+
+@dataclass
+class TypedQuestion:
+    question: str
+    options: list[str]
+    correct: Optional[int]          # None → the creator must pick it (never guessed)
+    explanation: str = ""
+
+
+def parse_typed_question(text: str) -> TypedQuestion:
+    """Parse ONE question typed/pasted by a creator in a single message.
+
+    Layout (answer and explanation lines are optional)::
+
+        question text (any number of lines, may contain its own A-D data)
+        (A) … (B) … [up to (L)]        ← the LAST complete option run
+        उत्तर: (C)  /  Answer: C
+        व्याख्या: …  /  Explanation: …
+
+    Answer/explanation lines are separated BEFORE option detection so they
+    are never glued onto the last option.  Every non-answer line after the
+    options is kept as explanation — nothing is dropped.
+
+    Raises ValueError (with a user-facing reason) if the text has no usable
+    option block, or if the stated answer does not exist among the options.
+    """
+    lines = (text or "").strip("\n").split("\n")
+    ans_idx = None
+    for i in range(len(lines) - 1, -1, -1):
+        if pdf_parser.ANSWER_LETTER_RE.match(lines[i]):
+            ans_idx = i
+            break
+    expl_idx = None
+    start = ans_idx + 1 if ans_idx is not None else 0
+    for i in range(start, len(lines)):
+        if pdf_parser.EXPL_RE.match(lines[i]):
+            expl_idx = i
+            break
+    if ans_idx is None and expl_idx is None:
+        # an explanation without an answer line: the last EXPL line after an option run
+        for i in range(len(lines) - 1, -1, -1):
+            if pdf_parser.EXPL_RE.match(lines[i]) and pdf_parser.split_question_and_options("\n".join(lines[:i])):
+                expl_idx = i
+                break
+    cut = min(x for x in (ans_idx, expl_idx, len(lines)) if x is not None)
+    split = pdf_parser.split_question_and_options("\n".join(lines[:cut]))
+    if not split:
+        labelled = [ln for ln in lines[:cut] if _PAREN_OPTION_RE.match(ln)]
+        if ans_idx is not None or labelled:
+            # it was clearly meant as a question → report instead of treating it as pre-question text
+            raise ValueError(f"पूरे options नहीं मिले — {config.MIN_OPTIONS}–{config.MAX_OPTIONS} options "
+                             "(A) (B) (C)… क्रम में, हर option नई line पर भेजें")
+        raise NoOptionsError("options नहीं मिले")
+    question, options = split
+    correct = None
+    tail: list[str] = []
+    for i in range(cut, len(lines)):
+        ln = lines[i]
+        if i == ans_idx:
+            m = pdf_parser.ANSWER_LETTER_RE.match(ln)
+            correct = pdf_parser.token_to_index(m.group("tok"))
+            if correct is None:
+                raise ValueError(f"उत्तर '{m.group('tok')}' समझ नहीं आया")
+            rest = m.group("rest").strip().lstrip(".,।:;-–— ").strip()
+            if rest:
+                tail.append(rest)
+            continue
+        if i == expl_idx:
+            rest = pdf_parser.EXPL_RE.match(ln).group("rest").strip()
+            if rest:
+                tail.append(rest)
+            continue
+        tail.append(ln)
+    if correct is not None and not 0 <= correct < len(options):
+        raise ValueError(f"उत्तर ({LABELS[correct] if correct < len(LABELS) else '?'}) दिया है, "
+                         f"पर केवल {len(options)} options हैं")
+    return TypedQuestion(question, options, correct, "\n".join(tail).strip())
+
+
+# -------------------------------------------------------- polls received from users
+def poll_correct_ids(poll) -> Optional[list[int]]:
+    """Correct option(s) of a received quiz poll, exactly as Telegram reports them.
+
+    Bot API 9.6 replaced ``correct_option_id`` by ``correct_option_ids``; both are
+    read.  ``None`` means Telegram did not reveal the answer (e.g. a forwarded
+    quiz that is still open) — the caller must ask, never guess."""
+    ids = getattr(poll, "correct_option_ids", None)
+    extra = getattr(poll, "api_kwargs", None) or {}
+    if not ids:
+        # PTB ≥ 22.8 turns an absent field into an empty tuple; older PTB keeps
+        # unknown fields in api_kwargs or only has the scalar correct_option_id
+        ids = extra.get("correct_option_ids")
+    if not ids:
+        one = extra.get("correct_option_id")
+        if one is None and not hasattr(poll, "correct_option_ids"):
+            one = getattr(poll, "correct_option_id", None)
+        ids = [one] if one is not None else None
+    return [int(i) for i in ids] if ids else None
+
+
+# -------------------------------------------------------- forwarded text
+def _strip_question_number(text: str) -> str:
+    lines = text.strip("\n").split("\n")
+    if lines:
+        m = pdf_parser.STRONG_Q_RE.match(lines[0]) or pdf_parser.WEAK_Q_RE.match(lines[0])
+        if m and m.group("rest").strip():
+            lines[0] = m.group("rest").strip()
+    return "\n".join(lines)
+
+
+def parse_forwarded_text(text: str) -> list[dict]:
+    """Questions contained in one forwarded/pasted text message, in source order.
+
+    * one or many numbered questions with answers (``प्रश्न 1.`` / ``1.`` / ``Q1``,
+      inline ``उत्तर:`` or an answer key) → parsed by the same parser as the
+      PDF/Text import (all formats: statements, matching, List-I/II, कूट,
+      assertion-reason, ordering; the LAST complete option block is used);
+    * a single question without an answer → returned with ``correct=None`` so
+      the creator is asked (never guessed).
+
+    Raises NoOptionsError if the text contains no question at all and
+    ValueError (listing question numbers) if a multi-question message has
+    problems — nothing from such a message is saved.
+    """
+    first = next((ln for ln in (text or "").split("\n") if ln.strip()), "")
+    if not (pdf_parser.STRONG_Q_RE.match(first) or pdf_parser.WEAK_Q_RE.match(first)):
+        # no leading question number (e.g. "निम्नलिखित कथन…\n1. …\n2. …"): exactly one
+        # question — numbered statements inside it must not be taken as questions
+        t = parse_typed_question(text)
+        return [{"question": t.question, "options": t.options, "correct": t.correct,
+                 "explanation": t.explanation, "qtype": detect_qtype(t.question)}]
+    res = pdf_parser.parse_source(text)
+    if res.questions and not res.errors:
+        return [{"question": q.question, "options": list(q.options), "correct": q.correct_index,
+                 "explanation": q.explanation, "qtype": q.qtype} for q in res.questions]
+    numbered = [e for e in res.errors if e.number is not None]
+    if len(res.questions) + len(numbered) >= 2:
+        raise ValueError("इस message के ये प्रश्न parse नहीं हुए (कुछ भी save नहीं किया गया):\n"
+                         + "\n".join(map(str, res.errors)))
+    t = parse_typed_question(_strip_question_number(text))
+    return [{"question": t.question, "options": t.options, "correct": t.correct,
+             "explanation": t.explanation, "qtype": detect_qtype(t.question)}]
+
+
 # -------------------------------------------------------- results
 @dataclass
 class Result:
@@ -269,6 +445,12 @@ def format_duration(seconds: float) -> str:
 
 def deep_link(bot_username: str, quiz_id: str) -> str:
     return f"https://t.me/{bot_username}?start=quiz_{quiz_id}"
+
+
+def group_link(bot_username: str, quiz_id: str) -> str:
+    """Telegram's ``startgroup`` deep link: the user picks a group, the bot is
+    added (if needed) and ``/start quiz_<id>`` is sent there."""
+    return f"https://t.me/{bot_username}?startgroup=quiz_{quiz_id}"
 
 
 def parse_start_payload(arg: str) -> Optional[str]:

@@ -20,7 +20,21 @@ def _pct(correct: int, total: int) -> str:
 
 
 def quiz_stats_text(qid: str, viewer_id: int) -> str:
+    """Owner: aggregate stats + leaderboard + own results.
+    Anyone else: only their own results and rank (other users' data is not shown)."""
     quiz = db.get_quiz(qid)
+    if quiz["owner_id"] != viewer_id:
+        lines = [f"📊 <b>{esc(quiz['title'])}</b>"]
+        rank, n = db.user_rank(qid, viewer_id)
+        if rank:
+            lines += ["", f"🏆 आपकी rank (best attempt): {rank} / {n}"]
+        mine = db.user_history(viewer_id, qid, limit=10)
+        if not mine:
+            lines += ["", "ℹ️ आपने अभी यह quiz पूरा नहीं किया है।"]
+        else:
+            lines += ["", "📜 <b>आपके results</b>"]
+            lines += [_history_line(a) for a in mine]
+        return "\n".join(lines)
     s, leaders = db.quiz_stats(qid)
     lines = [f"📊 <b>{esc(quiz['title'])}</b>", "",
              f"👥 Total attempts: {s['attempts']} ({s['users']} users)",
@@ -28,6 +42,10 @@ def quiz_stats_text(qid: str, viewer_id: int) -> str:
              f"❌ Wrong answers: {s['wrong']}",
              f"⏭ Skipped: {s['skipped']}",
              f"📈 Average score: {s['avg_pct']:.1f}%"]
+    g = db.group_quiz_stats(qid)
+    if g.get("sessions"):
+        lines += ["", f"👥 Group quizzes: {g['sessions']} sessions in {g['groups']} "
+                      f"{'group' if g['groups'] == 1 else 'groups'} · {g['participants']} participants"]
     if leaders:
         lines += ["", "🏆 <b>Top users</b>"]
         medals = ["🥇", "🥈", "🥉"]
@@ -38,12 +56,15 @@ def quiz_stats_text(qid: str, viewer_id: int) -> str:
     mine = db.user_history(viewer_id, qid, limit=5)
     if mine:
         lines += ["", "📜 <b>आपके पिछले results</b>"]
-        for a in mine:
-            flag = " (stopped)" if a["status"] == "stopped" else ""
-            lines.append(f"• {a['correct']}/{a['total']} ({_pct(a['correct'], a['total'])}) "
-                         f"✅{a['correct']} ❌{a['wrong']} ⏭{a['skipped']} • "
-                         f"{engine.format_duration(a['duration_sec'])} • {(a['finished_at'] or '')[:16]}{flag}")
+        lines += [_history_line(a) for a in mine]
     return "\n".join(lines)
+
+
+def _history_line(a: dict) -> str:
+    flag = " (stopped)" if a["status"] == "stopped" else ""
+    return (f"• {a['correct']}/{a['total']} ({_pct(a['correct'], a['total'])}) "
+            f"✅{a['correct']} ❌{a['wrong']} ⏭{a['skipped']} • "
+            f"{engine.format_duration(a['duration_sec'])} • {(a['finished_at'] or '')[:16]}{flag}")
 
 
 def quiz_stats_markup(qid: str) -> M:
