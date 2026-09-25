@@ -1,0 +1,1 @@
+worker: python telegram_current_affairs_quiz_bot.py
