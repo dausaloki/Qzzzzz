@@ -456,8 +456,18 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await creator.respond(update, "⏱ नए quizzes के लिए default timer:",
                                   kb.timer_menu("s:settimer", u["default_timer"], "m:set"))
             return
+        if parts[1] == "settimer" and len(parts) > 2 and parts[2] == "custom":
+            db.set_state(user.id, "st_timer", {})
+            await update.effective_chat.send_message(
+                f"⏱ नए quizzes का default custom timer भेजें (जैसे 45, 45 sec, 2 min, 1:30)। "
+                f"सीमा: {config.CUSTOM_TIMER_MIN} sec – {config.timer_label(config.CUSTOM_TIMER_MAX)}; "
+                "0 = No Timer।\n/cancel — रद्द")
+            return
         if parts[1] == "settimer":
-            v = int(parts[2])
+            try:
+                v = int(parts[2])
+            except (IndexError, ValueError):
+                v = -1
             if v in config.TIMER_CHOICES:
                 db.update_user_settings(user.id, default_timer=v)
         elif parts[1] == "sq":
@@ -565,6 +575,17 @@ async def private_message_router(update: Update, context: ContextTypes.DEFAULT_T
             return
         if state.startswith("imp_"):
             await creator.handle_import_text(update, context, state, data)
+            return
+        if state == "st_timer":
+            try:
+                v = config.parse_timer(msg.text or "")
+            except ValueError as exc:
+                await msg.reply_text(f"⚠️ {exc}")
+                return
+            db.update_user_settings(user.id, default_timer=v)
+            db.clear_state(user.id)
+            await msg.reply_text(f"✅ Default timer: {config.timer_label(v)}")
+            await show_settings(update, edit=False)
             return
         db.clear_state(user.id)
     if msg.document and creator.is_import_document(msg.document):

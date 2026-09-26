@@ -40,7 +40,9 @@ except Exception:  # pragma: no cover
 
 from pdf_extract import SourceError  # re-exported  # noqa: F401
 
-MAX_QUESTIONS = 100
+# There is NO question-count limit in the parser: a source with 3000+
+# questions is parsed completely; quiz_creator splits it into parts of
+# config.QUESTIONS_PER_PART.
 LETTERS = "ABCDEFGHIJKL"[:MAX_OPTIONS]
 _LOWER = LETTERS.lower()
 _HINDI_LETTERS = "कखगघङचछजझञटठ"[:MAX_OPTIONS]
@@ -57,12 +59,14 @@ class ParseError:
     number: Optional[int]
     message: str
     section: str = ""
+    page: Optional[int] = None
 
     def __str__(self) -> str:
+        pg = f" (पेज {self.page})" if self.page else ""
         if self.number is None:
-            return self.message
+            return self.message + pg
         sec = f"{self.section} – " if self.section else ""
-        return f"{sec}प्रश्न {self.number}: {self.message}"
+        return f"{sec}प्रश्न {self.number}{pg}: {self.message}"
 
 
 @dataclass
@@ -76,6 +80,8 @@ class ParsedQuestion:
     answer_source: str = ""
     section: int = 0
     section_label: str = ""
+    page: Optional[int] = None
+    verify: list = field(default_factory=list)   # words a human must check on the page
 
     @property
     def label(self) -> str:
@@ -93,6 +99,8 @@ class ParsedQuestion:
             "answer_source": self.answer_source,
             "section": self.section,
             "section_label": self.section_label,
+            "page": self.page,
+            "verify": list(self.verify),
         }
 
 
@@ -118,7 +126,7 @@ class ParseResult:
     def to_dict(self) -> dict:
         return {
             "questions": [q.to_dict() for q in self.questions],
-            "errors": [{"number": e.number, "message": e.message, "section": e.section}
+            "errors": [{"number": e.number, "message": e.message, "section": e.section, "page": e.page}
                        for e in self.errors],
             "warnings": list(self.warnings),
             "review": list(self.review),
@@ -131,10 +139,10 @@ _TOK = (r"(?:1[0-2]|[1-9]|[A-La-l]|[" + _H + r"]|[" + _CIRCLED_UP + _CIRCLED_LO 
 
 STRONG_Q_RE = re.compile(
     r"^\s*(?:प्रश्न|प्र\s*\.|Question|Ques\.?|Que\.?|Q)\s*(?:सं(?:ख्या)?\s*\.?|No\s*\.?)?"
-    r"\s*[\.\-:#]?\s*(?P<num>\d{1,3})\s*(?:[\.\):\-–—]+|(?=\s)|$)\s*(?P<rest>.*)$",
+    r"\s*[\.\-:#]?\s*(?P<num>\d{1,4})\s*(?:[\.\):\-–—]+|(?=\s)|$)\s*(?P<rest>.*)$",
     re.IGNORECASE,
 )
-WEAK_Q_RE = re.compile(r"^\s*(?P<num>\d{1,3})\s*(?:\.(?!\d)|\))\s*(?P<rest>.*)$")
+WEAK_Q_RE = re.compile(r"^\s*(?P<num>\d{1,4})\s*(?:\.(?!\d)|\))\s*(?P<rest>.*)$")
 
 # Option markers at the start of a line
 _OPT_RE = re.compile(
@@ -171,7 +179,7 @@ EXPL_RE = re.compile(
 )
 # Old-style global answer line: "12. उत्तर: B" / "प्रश्न 12 - Answer: (C)"
 NUMBERED_ANSWER_RE = re.compile(
-    r"^\s*(?:प्रश्न|Q\.?|Question)?\s*(?P<num>\d{1,3})\s*[\.\):" + _D + r"]?\s*" + _ANS_WORD +
+    r"^\s*(?:प्रश्न|Q\.?|Question)?\s*(?P<num>\d{1,4})\s*[\.\):" + _D + r"]?\s*" + _ANS_WORD +
     r"\s*[:" + _D + r"=]\s*[\(\[]?\s*(?P<tok>" + _TOK + r")\s*[\)\]]?\s*$",
     re.IGNORECASE,
 )
@@ -185,13 +193,13 @@ KEY_HEADER_RE = re.compile(
 _KTOK = r"(?:[A-La-l]|[" + _H + r"]|1[0-2]|[1-9])"
 # A (number, answer) pair inside answer-key text
 KEY_PAIR_RE = re.compile(
-    r"(?:प्रश्न|Q\.?)?\s*(?P<num>\d{1,3})\s*"
+    r"(?:प्रश्न|Q\.?)?\s*(?P<num>\d{1,4})\s*"
     r"(?:[\.\):" + _D + r"=]\s*[\(\[]?\s*(?P<a1>" + _KTOK + r")\s*[\)\]]?"
     r"|\s*[\(\[]\s*(?P<a2>" + _KTOK + r")\s*[\)\]]"
     r"|\s+(?P<a3>[A-La-l]|[" + _H + r"]))"
     r"(?![A-Za-z0-9\u0900-\u097F])"
 )
-_TOKEN_ONLY_RE = re.compile(r"^\s*(?:\d{1,3}\s*[\.\)]?|[\(\[]?\s*(?:[A-La-l]|[" + _H + r"])\s*[\)\]]?)\s*$")
+_TOKEN_ONLY_RE = re.compile(r"^\s*(?:\d{1,4}\s*[\.\)]?|[\(\[]?\s*(?:[A-La-l]|[" + _H + r"])\s*[\)\]]?)\s*$")
 PAGE_NOISE_RE = re.compile(
     r"^\s*(?:(?:Page|पृष्ठ)\s*[-:]?\s*\d+(?:\s*(?:of|/|का)\s*\d+)?|[-–—]\s*\d{1,4}\s*[-–—])\s*$",
     re.IGNORECASE,
@@ -275,7 +283,7 @@ def normalize_text(text: str) -> str:
 
 _CONS = "\u0915-\u0939\u0958-\u095f\u0978-\u097f"
 _REPAIR_I_RE = re.compile(
-    r"(?<![" + _CONS + r"\u093c\u094d\u200c\u200d])\u093f"
+    r"(?<![" + _CONS + r"\u093c\u094d\u200c\u200d\u0900-\u0903\u093a-\u094c])\u093f"
     r"(?P<cl>[" + _CONS + r"]\u093c?(?:\u094d[" + _CONS + r"]\u093c?)*)"
 )
 
@@ -625,9 +633,9 @@ def _extract_key_entries(lines: list[str], pos: Optional[list[int]] = None):
                         entries.append(last)
                 else:
                     m = re.match(
-                        r"^\s*(?:प्रश्न|Q\.?)?\s*(\d{1,3})\s*[\.\):\-–—=]?\s*[\(\[]\s*"
+                        r"^\s*(?:प्रश्न|Q\.?)?\s*(\d{1,4})\s*[\.\):\-–—=]?\s*[\(\[]\s*"
                         r"(" + _KTOK + r")\s*[\)\]]\s*(.*)$", ln) or re.match(
-                        r"^\s*(?:प्रश्न|Q\.?)?\s*(\d{1,3})\s*[\.\):\-–—=]\s*([A-La-l])[\.\)]?\s+(.*)$", ln)
+                        r"^\s*(?:प्रश्न|Q\.?)?\s*(\d{1,4})\s*[\.\):\-–—=]\s*([A-La-l])[\.\)]?\s+(.*)$", ln)
                     if m:
                         last = KeyEntry(int(m.group(1)), m.group(2), pos[j], g, m.group(3).strip())
                         entries.append(last)
@@ -1068,7 +1076,7 @@ def _parse_block(num: int, raw_lines: list[str], key_tok: Optional[str], key_exp
             f"inline उत्तर ({label(idx_inline)}) और answer key ({label(idx_key)}) अलग हैं")
     correct = idx_inline if idx_inline is not None else idx_key
     if correct is None:
-        raise _BlockError("सही उत्तर नहीं मिला (उत्तर: (A) / Answer: B या answer key जोड़ें)")
+        raise _BlockError("Answer Not Found — सही उत्तर नहीं मिला (उत्तर: (A) / Answer: B या answer key जोड़ें)")
     if not 0 <= correct < n_opt:
         tok_txt = inline_tokens[0] if idx_inline is not None and inline_tokens else (key_tok or "")
         if ocr and tok_txt in {"8", "3", "0", "6"}:
@@ -1197,9 +1205,19 @@ def _resolve_keys(entries: list[KeyEntry], blocks, block_pos_start: list[int],
     return tok, expl, err, used
 
 
-def parse_source(text: str, *, ocr: bool = False) -> ParseResult:
-    """Parse MCQs from raw text. Never raises for per-question problems."""
+def parse_source(text: str, *, ocr: bool = False, line_pages: Optional[list[int]] = None,
+                 uncertain: Optional[dict] = None) -> ParseResult:
+    """Parse MCQs from raw text. Never raises for per-question problems.
+
+    ``line_pages[i]`` is the PDF page of line i of ``text`` (used for error
+    messages); ``uncertain`` maps page → words the OCR passes disagreed on.
+    """
     result = ParseResult()
+
+    def page_of(p: int) -> Optional[int]:
+        if line_pages and 0 <= p < len(line_pages):
+            return line_pages[p]
+        return None
     if not text or not text.strip():
         result.errors.append(ParseError(None, "Text खाली है"))
         return result
@@ -1261,6 +1279,10 @@ def parse_source(text: str, *, ocr: bool = False) -> ParseResult:
     ev_src = [p for p, _ in headings] + sorted({e.pos for e in entries})
     evidence = sorted({bisect.bisect_left(pos, p) for p in ev_src})
     blocks, _ = split_blocks(lines, evidence)
+
+    def block_page(start: int) -> Optional[int]:
+        return page_of(pos[start]) if start < len(pos) else None
+
     if not blocks:
         result.errors.append(ParseError(
             None,
@@ -1314,16 +1336,25 @@ def parse_source(text: str, *, ocr: bool = False) -> ParseResult:
     for k, (num, start, end, sec) in enumerate(blocks):
         slabel = sec_label.get(sec, "")
         accounted += _cc(*lines[start:end])
+        bpage = block_page(start)
         if (sec, num) in seen:
-            result.errors.append(ParseError(num, "यह प्रश्न संख्या दोबारा आई है", slabel))
+            result.errors.append(ParseError(num, "यह प्रश्न संख्या दोबारा आई है", slabel, bpage))
             continue
         seen.add((sec, num))
         try:
             q = _parse_block(num, lines[start:end], ktok.get(k), kexpl.get(k, ""), kerr.get(k), ocr)
-            q.section, q.section_label = sec, slabel
+            q.section, q.section_label, q.page = sec, slabel, bpage
+            q.verify = _verification_words(q, lines[start:end],
+                                           {page_of(pos[i]) for i in range(start, end)}, uncertain)
+            if q.verify:
+                pg = f" (पेज {bpage})" if bpage else ""
+                result.review.append(
+                    f"Verification Required — {q.label}{pg}: इन शब्दों को PDF पेज से मिलाएँ "
+                    "(OCR/text layer पर भरोसा कम): " + ", ".join(q.verify[:8])
+                    + (f" … +{len(q.verify) - 8}" if len(q.verify) > 8 else ""))
             result.questions.append(q)
         except ValueError as exc:
-            result.errors.append(ParseError(num, str(exc), slabel))
+            result.errors.append(ParseError(num, str(exc), slabel, bpage))
         # gap detection (within a section): a missing number means something could not be read
         if k + 1 < len(blocks) and blocks[k + 1][3] == sec:
             nxt = blocks[k + 1][0]
@@ -1334,11 +1365,12 @@ def parse_source(text: str, *, ocr: bool = False) -> ParseResult:
                 msg = ("प्रश्न नहीं पढ़ा जा सका (numbering gap)" +
                        (f" — यह शायद प्रश्न {num} के साथ जुड़ गया है; दोनों को जांचें" if merged else
                         " — options/format जांचें"))
-                result.errors.append(ParseError(missing, msg, slabel))
+                result.errors.append(ParseError(missing, msg, slabel, block_page(end - 1)))
                 if merged and result.questions and result.questions[-1].number == num \
                         and result.questions[-1].section == sec:
                     result.questions.pop()
-                    result.errors.append(ParseError(num, f"प्रश्न {missing} इसमें merge हो गया लगता है", slabel))
+                    result.errors.append(ParseError(num, f"प्रश्न {missing} इसमें merge हो गया लगता है",
+                                                    slabel, bpage))
 
     unused = sorted({entries[i].num for i in range(len(entries)) if i not in used})
     if unused and seen:
@@ -1388,10 +1420,28 @@ def parse_source(text: str, *, ocr: bool = False) -> ParseResult:
                 " — कोई option छूटा तो नहीं, preview में जांचें")
 
     result.errors.sort(key=lambda e: (e.number is None, e.section, e.number or 0))
-    if len(result.questions) > MAX_QUESTIONS:
-        result.warnings.append(
-            f"{len(result.questions)} प्रश्न मिले; एक quiz में अधिकतम {MAX_QUESTIONS} होते हैं।")
     return result
+
+
+def _verification_words(q: ParsedQuestion, block_lines: list[str], pages: set,
+                        uncertain: Optional[dict]) -> list[str]:
+    """Words of a parsed question that a human must verify against the page:
+    Devanagari spelling-rule violations (typical OCR/text-layer damage such as
+    'रािस्थाि', 'निम्िलिखित') and words the two OCR readings disagreed on.
+    Nothing is corrected automatically."""
+    from hindi_check import invalid_words, words
+    text = "\n".join([q.question, *q.options, q.explanation])
+    found = invalid_words(text)
+    if uncertain:
+        unc: set = set()
+        for p in pages:
+            unc |= set(uncertain.get(p, ()))
+        if unc:
+            present = set(words(text))
+            for w in words("\n".join(block_lines)):
+                if w in unc and w in present and w not in found:
+                    found.append(w)
+    return found
 
 
 # ------------------------------------------------------------ file readers
@@ -1423,7 +1473,8 @@ def parse_pdf_result(source, *, ocr: str = "auto",
     and layout decisions become warnings/review items."""
     from pdf_extract import extract_pdf
     ext = extract_pdf(source, ocr=ocr, progress=progress)
-    res = parse_source(ext.text, ocr=bool(ext.ocr_pages))
+    res = parse_source(ext.text, ocr=bool(ext.ocr_pages), line_pages=ext.line_pages,
+                       uncertain=ext.uncertain)
     res.ocr_pages = ext.ocr_pages
     res.warnings = ext.warnings + res.warnings
     res.errors = [ParseError(None, e) for e in ext.errors] + res.errors
@@ -1441,8 +1492,6 @@ def parse_text(text: str) -> list[dict]:
     res = parse_source(text)
     if res.errors:
         raise ValueError("कुछ प्रश्न पूरी तरह parse नहीं हुए:\n" + "\n".join(map(str, res.errors)))
-    if len(res.questions) > MAX_QUESTIONS:
-        raise ValueError("एक quiz में अधिकतम 100 प्रश्न रखे जा सकते हैं।")
     return [q.to_dict() for q in res.questions]
 
 

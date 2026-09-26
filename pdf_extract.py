@@ -31,7 +31,12 @@ OCR_LANGUAGES = os.getenv("OCR_LANGUAGES", "eng+hin").strip() or "eng+hin"
 # labels, answer/key letters) which the Hindi model misreads ((B)→(8), A→2).
 OCR_VERIFY = os.getenv("OCR_VERIFY", "1").strip().lower() not in ("0", "false", "no")
 OCR_DPI = int(os.getenv("OCR_DPI", "300"))
-MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "60"))
+# Third, Hindi-only OCR pass at a higher resolution.  Devanagari words on which
+# the two readings disagree are NOT changed — they are reported per question as
+# "Verification Required" so a human checks them against the page.
+OCR_VERIFY_HINDI = os.getenv("OCR_VERIFY_HINDI", "1").strip().lower() not in ("0", "false", "no")
+OCR_VERIFY_DPI = int(os.getenv("OCR_VERIFY_DPI", str(OCR_DPI * 4 // 3)))
+MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "300"))
 
 LEGACY_FONT_RE = re.compile(
     r"kruti|k010|devlys|dev\s*lys|chanakya|shivaji|walkman|agra|kundli|akruti|surekh|"
@@ -56,6 +61,7 @@ class Line:
     y1: float
     text: str
     size: float = 10.0
+    page: int = 0               # 1-based page number (set after ordering)
 
     @property
     def cy(self) -> float:
@@ -83,6 +89,10 @@ class Extraction:
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)   # header/footer/page-number lines
+    # line_pages[i] = page number of line i of ``text`` (text.split("\n"))
+    line_pages: list[int] = field(default_factory=list)
+    # page → Devanagari words the two OCR passes read differently
+    uncertain: dict[int, set] = field(default_factory=dict)
 
     @property
     def ocr_pages(self) -> list[int]:
@@ -106,6 +116,11 @@ def text_quality(text: str) -> tuple[bool, str]:
         return True, "text layer में अपठनीय (private-use/टूटे) glyphs हैं"
     if dev and ext / max(dev, 1) > 0.02:
         return True, "हिंदी glyphs टूटे हुए निकल रहे हैं (broken ligatures)"
+    if dev >= 40:
+        from hindi_check import invalid_ratio
+        badw, allw = invalid_ratio(text)
+        if badw >= 2 and badw / max(allw, 1) > 0.02:
+            return True, "text layer में हिंदी मात्राएँ/अक्षर गलत क्रम में हैं (जैसे 'रािस्थाि')"
     return False, ""
 
 
@@ -242,7 +257,7 @@ def _rows(lines: list[Line]) -> list[Line]:
 
 
 _Q_START_RE = re.compile(
-    r"^\s*(?:(?:प्रश्न|प्र\s*\.|Question|Ques\.?|Que\.?|Q)\s*[\.\-:#]?\s*\d{1,3}|\d{1,3}\s*[\.\)])(?!\d)")
+    r"^\s*(?:(?:प्रश्न|प्र\s*\.|Question|Ques\.?|Que\.?|Q)\s*[\.\-:#]?\s*\d{1,4}|\d{1,4}\s*[\.\)])(?!\d)")
 
 
 _FIRST_OPT_RE = re.compile(r"^\s*(?:[\(\[]\s*(?:[Aa1क]|Ⓐ)\s*[\)\]]|[Aa][\)\.:](?=\s)|[Ⓐ①])")
@@ -357,7 +372,7 @@ def _open(source):
 _LABEL_AT_START = re.compile(r"^(\s*[\(\[]\s*)([^\s()\[\]]{1,3}?)(\s*[\)\]])")
 _ENG_LABEL = re.compile(r"^\s*[\(\[]\s*([A-L])\s*[\)\]]")
 _ANS_HINT = re.compile(r"उत्तर|Answer|Ans\b|सही", re.IGNORECASE)
-_KEY_ROW = re.compile(r"^\s*(?:प्रश्न\s*|Q\.?\s*)?\d{1,3}\s*[-–—.):=]\s*[\(\[]?\s*\S{1,2}\s*[\)\]]?\s*\.?\s*$")
+_KEY_ROW = re.compile(r"^\s*(?:प्रश्न\s*|Q\.?\s*)?\d{1,4}\s*[-–—.):=]\s*[\(\[]?\s*\S{1,2}\s*[\)\]]?\s*\.?\s*$")
 _TRAIL_TOKEN = re.compile(r"([-–—:=(\[\s])([\(\[]?\s*)([^\s()\[\]]{1,2}?)(\s*[\)\]]?\s*\.?\s*)$")
 _ENG_TRAIL = re.compile(r"[-–—:=(\[\s]\s*[\(\[]?\s*([A-L])\s*[\)\]]?\s*\.?\s*$")
 
@@ -402,13 +417,27 @@ def verify_tokens(main: list[Line], eng: list[Line], notes: list[str]) -> list[L
     return out
 
 
-def _ocr_page(page, tessdata: str, languages: str, notes: Optional[list[str]] = None) -> list[Line]:
+def uncertain_words(main_text: str, alt_text: str) -> set:
+    """Devanagari words of the main OCR reading that the second reading does
+    not contain anywhere on the page (never used to change text)."""
+    from hindi_check import words
+    alt = set(words(alt_text))
+    return {w for w in words(main_text) if _DEVANAGARI_RE.search(w) and w not in alt}
+
+
+def _ocr_page(page, tessdata: str, languages: str, notes: Optional[list[str]] = None,
+              uncertain: Optional[set] = None) -> list[Line]:
     tp = page.get_textpage_ocr(language=languages, dpi=OCR_DPI, full=True, tessdata=tessdata)
     lines = _lines_from_dict(tp.extractDICT(), ocr=True)
     if OCR_VERIFY and languages != "eng" and Path(tessdata, "eng.traineddata").is_file():
         tp2 = page.get_textpage_ocr(language="eng", dpi=OCR_DPI, full=True, tessdata=tessdata)
         eng = _lines_from_dict(tp2.extractDICT(), ocr=True)
         lines = verify_tokens(_rows(lines), _rows(eng), notes if notes is not None else [])
+    if (uncertain is not None and OCR_VERIFY_HINDI and "hin" in languages.split("+")
+            and Path(tessdata, "hin.traineddata").is_file()):
+        tp3 = page.get_textpage_ocr(language="hin", dpi=OCR_VERIFY_DPI, full=True, tessdata=tessdata)
+        alt = _lines_from_dict(tp3.extractDICT(), ocr=True)
+        uncertain |= uncertain_words("\n".join(l.text for l in lines), "\n".join(l.text for l in alt))
     return lines
 
 
@@ -471,7 +500,10 @@ def extract_pdf(source, *, ocr: str = "auto", languages: str = OCR_LANGUAGES,
                         progress(pno + 1, total, "ocr")
                     try:
                         notes: list[str] = []
-                        lines = _ocr_page(page, ocr_info, languages, notes)
+                        unc: set = set()
+                        lines = _ocr_page(page, ocr_info, languages, notes, unc)
+                        if unc:
+                            ext.uncertain[pno + 1] = unc
                         rep.method, rep.reason = "ocr", reason
                         ocr_used += 1
                         fixes = [n for n in notes if not n.startswith("CONFLICT:")]
@@ -494,6 +526,8 @@ def extract_pdf(source, *, ocr: str = "auto", languages: str = OCR_LANGUAGES,
             elif progress:
                 progress(pno + 1, total, "text")
             ordered, cols = order_lines(lines, page.rect.width)
+            for l in ordered:
+                l.page = pno + 1
             rep.columns = cols
             rep.chars = sum(len(l.text) for l in ordered)
             per_page.append((ordered, page.rect.height))
@@ -503,7 +537,15 @@ def extract_pdf(source, *, ocr: str = "auto", languages: str = OCR_LANGUAGES,
 
     cleaned, removed = remove_headers_footers(per_page)
     ext.removed = removed
-    ext.text = "\n".join("\n".join(l.text for l in lines) for lines in cleaned).strip()
+    # Build the text and a parallel page map (one entry per text line).
+    out_lines: list[str] = []
+    for lines in cleaned:
+        for l in lines:
+            for piece in l.text.split("\n"):
+                if piece.strip():
+                    out_lines.append(piece)
+                    ext.line_pages.append(l.page)
+    ext.text = "\n".join(out_lines)
     for rep in ext.pages:
         if rep.error:
             ext.errors.append(f"पेज {rep.number}: {rep.error}")

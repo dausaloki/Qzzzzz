@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+from typing import Optional
 from urllib.parse import quote
 
 from telegram import (InlineKeyboardButton as B, InlineKeyboardMarkup as M, KeyboardButton,
@@ -40,11 +41,15 @@ def creation_keyboard(has_questions: bool) -> ReplyKeyboardMarkup:
     (KeyboardButtonPollType quiz): question, 2–12 options, the correct answer
     and an optional explanation — the poll is then sent to the bot.
     """
-    rows = [[KeyboardButton(CREATE_QUESTION_BUTTON, request_poll=KeyboardButtonPollType(type=Poll.QUIZ))]]
+    rows = []
+    if config.NATIVE_POLL_BUTTON:
+        # Telegram's own poll editor limits the question to 300 characters
+        # (the "-57" counter) — so it is opt-in; typed text has no limit.
+        rows.append([KeyboardButton(CREATE_QUESTION_BUTTON, request_poll=KeyboardButtonPollType(type=Poll.QUIZ))])
     rows.append([KeyboardButton("/done"), KeyboardButton("/undo")] if has_questions
                 else [KeyboardButton("/cancel")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True,
-                               input_field_placeholder="प्रश्न poll या text भेजें")
+                               input_field_placeholder="प्रश्न + (A) (B)… options text में भेजें")
 
 
 def remove_keyboard() -> ReplyKeyboardRemove:
@@ -115,10 +120,11 @@ def question_menu(qid: str, question_id: int, pos: int, total: int) -> M:
     return M(rows)
 
 
-def timer_menu(prefix: str, current: int, back: str) -> M:
-    """prefix: callback prefix, e.g. 'e:settimer:<qid>' or 's:settimer'."""
-    labels = {10: "10s", 15: "15s", 30: "30s", 60: "60s", 90: "90s",
-              120: "2 min", 180: "3 min", 300: "5 min", 0: "No timer"}
+def timer_menu(prefix: str, current: int, back: Optional[str]) -> M:
+    """prefix: callback prefix, e.g. 'e:settimer:<qid>', 's:settimer' or 'c:timer'.
+    ``<prefix>:custom`` asks for any value (config.CUSTOM_TIMER_MIN..MAX)."""
+    labels = {10: "10 sec", 15: "15 sec", 30: "30 sec", 60: "60 sec", 90: "90 sec",
+              120: "2 min", 180: "3 min", 300: "5 min", 0: "No Timer"}
     rows, row = [], []
     for v in config.TIMER_CHOICES:
         mark = "✅ " if int(current or 0) == v else ""
@@ -128,7 +134,11 @@ def timer_menu(prefix: str, current: int, back: str) -> M:
             row = []
     if row:
         rows.append(row)
-    rows.append([B("⬅️ Back", callback_data=back)])
+    cur = int(current or 0)
+    custom = f"✅ Custom: {config.timer_label(cur)}" if cur not in config.TIMER_CHOICES else "✏️ Custom Time"
+    rows.append([B(custom, callback_data=f"{prefix}:custom")])
+    if back:
+        rows.append([B("⬅️ Back", callback_data=back)])
     return M(rows)
 
 
@@ -206,11 +216,15 @@ def forward_pick_menu(quizzes: list[dict]) -> M:
     return M(rows)
 
 
-def result_markup(qid: str) -> M:
-    return M([
+def result_markup(qid: str, next_part: Optional[dict] = None) -> M:
+    rows = []
+    if next_part:
+        rows.append([B(f"➡️ Start Part {next_part['part_no']}", callback_data=f"q:run:{next_part['id']}")])
+    rows += [
         [B("🔁 Try Again", callback_data=f"r:go:{qid}"), B("📤 Share Quiz", callback_data=f"q:share:{qid}")],
         [B("📊 Statistics", callback_data=f"q:stats:{qid}"), *home_button()],
-    ])
+    ]
+    return M(rows)
 
 
 def running_markup() -> M:
@@ -247,9 +261,11 @@ HELP_TEXT = (
     "/stop — चल रहा quiz रोकें (partial result save)\n"
     "/cancel — creation/import रद्द करें\n\n"
     "<b>Quiz बनाना</b>\n"
-    "/newquiz → नाम → description (/skip) → प्रश्न भेजते जाएँ → /done. अधिकतम 100 प्रश्न।\n"
-    "हर प्रश्न: “📝 प्रश्न बनाएँ” button से Telegram quiz poll (2–12 options, 1 सही उत्तर, "
-    "optional explanation), या एक text message में प्रश्न + (A) (B)… options (+ optional "
+    "/newquiz → नाम → description (/skip) → प्रश्न भेजते जाएँ → /done. प्रश्नों की कोई "
+    "कुल सीमा नहीं — हर part में अधिकतम " + str(config.QUESTIONS_PER_PART) + " प्रश्न, भरते ही अगला "
+    "part अपने-आप बनता है।\n"
+    "हर प्रश्न: एक text message में प्रश्न + (A) (B)… options (प्रश्न की लंबाई की कोई सीमा नहीं; "
+    "4096 से लंबा हो तो .txt file /import करें), या कोई quiz poll भेजें/forward करें (+ optional "
     "'उत्तर: B', 'व्याख्या: …')। सही उत्तर न हो तो bot पूछेगा — कभी अनुमान नहीं लगाता।\n"
     "प्रश्न से पहले कोई text/photo/video भेजें तो वह अगले प्रश्न से पहले दिखाया जाएगा।\n\n"
     "Question में statement, matching, List-I/List-II, assertion-reason, ordering — "

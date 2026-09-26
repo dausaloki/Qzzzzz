@@ -40,7 +40,7 @@ def quiz_stats_text(qid: str, viewer_id: int) -> str:
              f"👥 Total attempts: {s['attempts']} ({s['users']} users)",
              f"✅ Correct answers: {s['correct']}",
              f"❌ Wrong answers: {s['wrong']}",
-             f"⏭ Skipped: {s['skipped']}",
+             f"⏭ Skipped: {s['skipped']} (⏰ Timeout: {s.get('timeouts') or 0})",
              f"📈 Average score: {s['avg_pct']:.1f}%"]
     g = db.group_quiz_stats(qid)
     if g.get("sessions"):
@@ -63,7 +63,7 @@ def quiz_stats_text(qid: str, viewer_id: int) -> str:
 def _history_line(a: dict) -> str:
     flag = " (stopped)" if a["status"] == "stopped" else ""
     return (f"• {a['correct']}/{a['total']} ({_pct(a['correct'], a['total'])}) "
-            f"✅{a['correct']} ❌{a['wrong']} ⏭{a['skipped']} • "
+            f"✅{a['correct']} ❌{a['wrong']} ⏭{a['skipped']} ⏰{a.get('timeouts') or 0} • "
             f"{engine.format_duration(a['duration_sec'])} • {(a['finished_at'] or '')[:16]}{flag}")
 
 
@@ -77,7 +77,7 @@ def user_overview(user_id: int) -> tuple[str, M]:
     hist = db.user_history(user_id, limit=10)
     lines = ["📊 <b>Quiz Stats</b>", "",
              f"🎮 आपके attempts: {t['attempts']}",
-             f"✅ Correct: {t['correct']}   ❌ Wrong: {t['wrong']}   ⏭ Skipped: {t['skipped']}",
+             f"✅ Correct: {t['correct']}   ❌ Wrong: {t['wrong']}   ⏭ Skipped: {t['skipped']}   ⏰ Timeout: {t.get('timeouts') or 0}",
              f"📈 Overall: {_pct(t['correct'], t['total'])}"]
     if hist:
         lines += ["", "📜 <b>Result history</b>"]

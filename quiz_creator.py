@@ -12,13 +12,14 @@ States
 from __future__ import annotations
 
 import asyncio
+import re
 import logging
 import time
 from collections import Counter
 from pathlib import Path
 from typing import Optional
 
-from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as M, Update
+from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as M, InputFile, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
@@ -73,6 +74,9 @@ def quiz_summary(quiz: dict, link: str = "") -> str:
     lines = [f"📚 <b>{esc(quiz['title'])}</b>"]
     if quiz.get("description"):
         lines.append(esc(quiz["description"]))
+    if quiz.get("series_id") and quiz.get("part_no"):
+        total_parts = len(db.series_parts(quiz["series_id"]))
+        lines.append(f"📦 Part {quiz['part_no']}/{total_parts}")
     lines += ["", f"📝 Questions: {n}",
               f"⏱ {config.timer_label(quiz.get('timer', 0))} · 🔀 {shuffle_label(quiz)}"]
     if link:
@@ -235,18 +239,39 @@ async def begin_forward_import(update: Update, item: dict) -> None:
         reply_markup=kb.forward_target_menu())
 
 
+CUSTOM_TIMER_PROMPT = ("⏱ Custom timer भेजें — सेकंड या मिनट में (जैसे <code>45</code>, <code>45 sec</code>, "
+                       "<code>2 min</code>, <code>1:30</code>; <code>0</code> = No Timer)।")
+
+
+def _set_creation_timer(data: dict, val: int) -> None:
+    """Timer chosen during creation applies to the quiz and all its parts."""
+    for p in set((data.get("parts") or []) + [data["quiz_id"]]):
+        db.update_quiz(p, timer=val)
+
+
+async def _send_timer_choice(update: Update, qid: str) -> None:
+    quiz = db.get_quiz(qid)
+    await update.effective_chat.send_message(
+        f"⏱ <b>Timer</b> (हर प्रश्न का समय): <b>{config.timer_label(quiz['timer'])}</b>\n"
+        "बदलना हो तो नीचे चुनें — बाद में ⚙️ Settings से भी बदल सकते हैं। समय खत्म = Timeout → Skipped → "
+        "अगला प्रश्न।", parse_mode=ParseMode.HTML, reply_markup=kb.timer_menu("c:timer", quiz["timer"], None))
+
+
 async def _ask_question(update: Update, data: dict, first: bool) -> None:
     n = db.count_questions(data["quiz_id"])
+    if first and data.get("mode") == "new":
+        await _send_timer_choice(update, data["quiz_id"])
     if first:
         head = "बढ़िया। अब अपना <b>पहला प्रश्न</b> भेजें।" if data.get("mode") == "new" else \
             f"प्रश्न {n + 1} भेजें।"
+        poll_hint = ("📝 नीचे <b>“प्रश्न बनाएँ”</b> button से Telegram का quiz poll भी बना सकते हैं "
+                     "(उसमें Telegram की 300-character सीमा है)।\n\n" if config.NATIVE_POLL_BUTTON else "")
         text = (head + "\n\n"
-                "📝 नीचे <b>“प्रश्न बनाएँ”</b> button दबाएँ और Telegram का quiz poll बनाइए — "
-                "प्रश्न, 2–12 options, सही उत्तर और (optional) explanation। "
-                "किसी दूसरे chat/channel से quiz poll या प्रश्न <b>forward</b> भी कर सकते हैं।\n\n"
-                "✍️ या पूरा प्रश्न <b>एक message में text</b> में भेजें — (A) (B) (C)… options के साथ, "
+                "✍️ पूरा प्रश्न <b>एक message में text</b> में भेजें — (A) (B) (C)… options के साथ, "
                 "चाहें तो <code>उत्तर: B</code> और <code>व्याख्या: …</code> भी। लंबे प्रश्न/options "
                 "(poll की सीमा से बड़े) ऐसे ही भेजें — पूरा text सुरक्षित रहेगा।\n\n"
+                "📨 किसी दूसरे chat/channel से quiz poll या प्रश्न <b>forward</b> भी कर सकते हैं।\n\n"
+                + poll_hint +
                 "🖼 प्रश्न से पहले कुछ दिखाना है? पहले वह text या photo/video भेजें।")
     else:
         text = f"प्रश्न {n + 1} भेजें, या quiz पूरा करने के लिए /done भेजें।"
@@ -279,6 +304,44 @@ async def _stage_question(update: Update, user_id: int, data: dict, question: st
     await _save_staged(update, user_id, data)
 
 
+_PART_SUFFIX_RE = re.compile(r"\s*—\s*Part\s+\d+\s*$")
+
+
+def part_title(title: str, part_no: int) -> str:
+    base = _PART_SUFFIX_RE.sub("", title or "").strip() or "Quiz"
+    suffix = f" — Part {part_no}"
+    return base[:max(1, TITLE_MAX - len(suffix))] + suffix
+
+
+def _roll_part(data: dict) -> Optional[str]:
+    """When the current quiz part holds QUESTIONS_PER_PART questions, open the
+    next part (same title + " — Part N", same settings, linked by series_id)
+    and continue there.  Returns a notice for the user, or None."""
+    qid = data["quiz_id"]
+    per = config.QUESTIONS_PER_PART
+    if db.count_questions(qid) < per:
+        return None
+    quiz = db.get_quiz(qid)
+    series = quiz.get("series_id") or qid
+    part = int(quiz.get("part_no") or 1)
+    if not quiz.get("series_id"):
+        db.set_part(qid, series, 1)
+        db.update_quiz(qid, title=part_title(quiz["title"], 1))
+    new_title = part_title(quiz["title"], part + 1)
+    new = db.new_quiz(quiz["owner_id"], new_title, quiz.get("description") or "",
+                      status=quiz.get("status") or "draft", source=quiz.get("source") or "manual",
+                      timer=quiz.get("timer"), shuffle_questions=quiz.get("shuffle_questions"),
+                      shuffle_options=quiz.get("shuffle_options"))
+    db.set_part(new, series, part + 1)
+    parts = data.setdefault("parts", [])
+    if qid not in parts:
+        parts.append(qid)
+    parts.append(new)
+    data["quiz_id"] = new
+    return (f"📦 Part {part} पूरा ({per} प्रश्न)। आगे के प्रश्न अपने-आप “{new_title}” में जुड़ेंगे "
+            "(हर part अलग quiz है, अपनी link के साथ)।")
+
+
 def _save_one(qid: str, cur: dict, q: dict) -> int:
     return db.add_question(
         qid, q["question"], q["options"], int(q["correct"]), q.get("explanation", ""),
@@ -306,8 +369,11 @@ async def _confirm_saved(update: Update, data: dict, fwd: bool, added: int, n_op
 
 async def _save_staged(update: Update, user_id: int, data: dict) -> None:
     cur = data.get("cur") or {}
-    qid = data["quiz_id"]
     chat = update.effective_chat
+    roll = _roll_part(data)
+    if roll:
+        await chat.send_message(roll)
+    qid = data["quiz_id"]
     try:
         new_id = _save_one(qid, cur, {**cur, "correct": cur["correct"]})
     except (ValueError, KeyError, TypeError) as exc:
@@ -321,10 +387,6 @@ async def _save_staged(update: Update, user_id: int, data: dict) -> None:
     n = db.count_questions(qid)
     data["n_saved"] = n
     db.set_state(user_id, "c_q", data)
-    if n >= config.MAX_QUESTIONS:
-        await chat.send_message(f"✅ प्रश्न {n} जुड़ गया। {config.MAX_QUESTIONS} प्रश्नों की सीमा पूरी हो गई।")
-        await finalize(update, context=None)
-        return
     await _confirm_saved(update, data, bool(cur.get("fwd")), 1, len(cur["options"]))
 
 
@@ -375,8 +437,8 @@ async def _process_text(update: Update, user_id: int, data: dict, text: str, *, 
         n = db.count_questions(data["quiz_id"]) + 1
         await chat.send_message(
             ("🔁 पिछला pre-question content बदल दिया गया।\n" if replaced else "") +
-            f"👍 यह प्रश्न {n} से पहले दिखाया जाएगा। अब प्रश्न भेजें — 📝 button से poll, या text में "
-            "(A) (B)… options के साथ।\n(अगर यही प्रश्न था, तो options के साथ एक ही message में भेजें।)",
+            f"👍 यह प्रश्न {n} से पहले दिखाया जाएगा। अब प्रश्न भेजें — text में "
+            "(A) (B)… options के साथ (या quiz poll)।\n(अगर यही प्रश्न था, तो options के साथ एक ही message में भेजें।)",
             reply_markup=kb.creation_keyboard(n > 1))
         return
     if len(found) == 1:
@@ -386,21 +448,16 @@ async def _process_text(update: Update, user_id: int, data: dict, text: str, *, 
                               qtype=q["qtype"], fwd=fwd, src=src)
         return
     # several complete questions in one message (all have answers) → saved in source order
-    qid = data["quiz_id"]
-    free = config.MAX_QUESTIONS - db.count_questions(qid)
-    if len(found) > free:
-        await chat.send_message(f"⚠️ इस message में {len(found)} प्रश्न हैं, पर quiz में केवल {free} की जगह बची है "
-                                f"(अधिकतम {config.MAX_QUESTIONS})। कुछ भी save नहीं किया गया।")
-        return
     for i, q in enumerate(found):
         q["src"] = src
-        data.setdefault("added", []).append(_save_one(qid, cur if i == 0 else {}, q))
+        roll = _roll_part(data)
+        if roll:
+            await chat.send_message(roll)
+        data.setdefault("added", []).append(_save_one(data["quiz_id"], cur if i == 0 else {}, q))
     data["cur"] = {}
-    data["n_saved"] = db.count_questions(qid)
+    data["n_saved"] = db.count_questions(data["quiz_id"])
     db.set_state(user_id, "c_q", data)
     await _confirm_saved(update, data, fwd, len(found), 4)
-    if data["n_saved"] >= config.MAX_QUESTIONS:
-        await finalize(update, context=None)
 
 
 async def _process_item(update: Update, user_id: int, data: dict, item: dict) -> None:
@@ -448,10 +505,16 @@ async def finalize(update: Update, context) -> None:
         db.clear_state(user.id)
         await chat.send_message("❌ Quiz बनाना रद्द हुआ (नाम नहीं मिला)।", reply_markup=kb.remove_keyboard())
         return
+    parts = [p for p in (data.get("parts") or []) if p != qid] + [qid]
     n = db.count_questions(qid)
-    if n == 0:
+    if n == 0 and len(parts) == 1:
         await chat.send_message("⚠️ Quiz में कम से कम 1 प्रश्न चाहिए। प्रश्न भेजें या /cancel करें।")
         return
+    if n == 0:                              # an empty last part is never left behind
+        db.delete_quiz(qid, user.id)
+        parts.pop()
+        qid = parts[-1]
+        n = db.count_questions(qid)
     cur = data.get("cur") or {}
     notes = []
     if cur.get("question"):
@@ -462,7 +525,11 @@ async def finalize(update: Update, context) -> None:
         notes.append(f"⚠️ {len(data['queue'])} forwarded item(s) अभी process नहीं हुए थे — वे save नहीं हुए।")
     db.clear_state(user.id)
     if data.get("mode") == "new":
-        db.update_quiz(qid, status="ready")
+        for p in parts:
+            db.update_quiz(p, status="ready")
+    if len(parts) > 1:
+        notes.append(f"📦 {len(parts)} parts बने (हर part में अधिकतम {config.QUESTIONS_PER_PART} प्रश्न): " +
+                     ", ".join(f"“{db.get_quiz(p)['title']}” ({db.count_questions(p)})" for p in parts))
     note = "\n".join(notes)
     if data.get("mode") == "add" and not data.get("via_forward"):
         await chat.send_message(f"✅ प्रश्न जोड़ दिए गए। अब कुल {n} प्रश्न।" + (f"\n{note}" if note else ""),
@@ -493,7 +560,9 @@ async def undo(update: Update, context) -> None:
     added = data.get("added") or []
     while added:
         last = added.pop()
-        if db.delete_question(last, data["quiz_id"]):
+        owner = next((p for p in [data["quiz_id"]] + list(reversed(data.get("parts") or []))
+                      if db.get_question(p, last)), None)
+        if owner and db.delete_question(last, owner):
             n = db.count_questions(data["quiz_id"])
             data["n_saved"] = n
             db.set_state(user.id, "c_q", data)
@@ -530,7 +599,8 @@ async def cancel(update: Update, context) -> None:
     db.clear_state(user.id)
     msg = "❌ रद्द किया गया।"
     if state.startswith("c_") and data.get("mode") == "new" and data.get("quiz_id"):
-        db.delete_quiz(data["quiz_id"], user.id)
+        for p in set((data.get("parts") or []) + [data["quiz_id"]]):
+            db.delete_quiz(p, user.id)
         msg = "❌ Quiz बनाना रद्द — draft delete कर दिया गया।"
     elif state.startswith("c_") and data.get("mode") == "add":
         msg = "❌ प्रश्न जोड़ना रद्द। पहले से saved प्रश्न quiz में रहेंगे।"
@@ -583,10 +653,9 @@ async def handle_forward_callback(update: Update, context) -> None:
         db.set_state(user.id, "fw_title", data)
         await respond(update, "📝 नए Quiz का <b>नाम</b> भेजें।")
     elif action == "exist":
-        quizzes = [x for x in db.get_owner_quizzes(user.id)
-                   if x["question_count"] < config.MAX_QUESTIONS][:30]
+        quizzes = db.get_owner_quizzes(user.id)[:30]
         if not quizzes:
-            await respond(update, "ℹ️ आपका कोई quiz नहीं है (या सब में 100 प्रश्न हैं)। नया quiz बनाएँ:",
+            await respond(update, "ℹ️ आपका कोई quiz नहीं है। नया quiz बनाएँ:",
                           kb.forward_target_menu(existing=False))
             return
         await respond(update, "📚 किस quiz में जोड़ें?", kb.forward_pick_menu(quizzes))
@@ -609,6 +678,22 @@ async def handle_creator_message(update: Update, context, state: str, data: dict
     text = msg.text or ""
     stripped = text.strip()
     item = item_from_message(msg)
+
+    if data.get("await_timer") and msg.text is not None and state in ("c_q", "c_desc"):
+        try:
+            val = config.parse_timer(stripped)
+        except ValueError as exc:
+            if len(stripped) <= 20:              # clearly meant as a timer → explain
+                await msg.reply_text(f"⚠️ {exc}")
+                return
+            val = None                           # a question/description → handled normally
+        data.pop("await_timer", None)
+        db.set_state(user.id, state, data)
+        if val is not None:
+            _set_creation_timer(data, val)
+            await msg.reply_text(f"✅ Timer: {config.timer_label(val)} (हर प्रश्न पर लागू)। अब प्रश्न भेजें।",
+                                 reply_markup=kb.creation_keyboard(db.count_questions(data["quiz_id"]) > 0))
+            return
 
     if state == "c_title":
         if not stripped or msg.text is None:
@@ -660,7 +745,7 @@ async def handle_creator_message(update: Update, context, state: str, data: dict
             n = db.count_questions(data["quiz_id"]) + 1
             await msg.reply_text(
                 ("🔁 पिछला pre-question content बदल दिया गया।\n" if replaced else "") +
-                f"👍 यह प्रश्न {n} से पहले दिखाया जाएगा। अब प्रश्न भेजें — 📝 button से poll, या text में "
+                f"👍 यह प्रश्न {n} से पहले दिखाया जाएगा। अब प्रश्न भेजें — text में "
                 "(A) (B)… options के साथ।", reply_markup=kb.creation_keyboard(n > 1))
         await _drain_queue(update, user.id)
         return
@@ -724,6 +809,28 @@ async def handle_creator_callback(update: Update, context) -> None:
     if action == "done":
         await q.answer()
         await finalize(update, context)
+        return
+    if action.startswith("timer:") and state.startswith("c_") and data.get("quiz_id"):
+        val_s = action.split(":", 1)[1]
+        if val_s == "custom":
+            data["await_timer"] = True
+            db.set_state(user.id, state, data)
+            await q.answer()
+            await update.effective_chat.send_message(CUSTOM_TIMER_PROMPT, parse_mode=ParseMode.HTML)
+            return
+        try:
+            val = int(val_s)
+        except ValueError:
+            val = -1
+        if val not in config.TIMER_CHOICES:
+            await q.answer("⌛ यह button अब valid नहीं है।")
+            return
+        _set_creation_timer(data, val)
+        data.pop("await_timer", None)
+        db.set_state(user.id, state, data)
+        await q.answer(f"⏱ {config.timer_label(val)}")
+        await respond(update, f"⏱ <b>Timer</b>: <b>{config.timer_label(val)}</b> ✅ (हर प्रश्न पर लागू)",
+                      kb.timer_menu("c:timer", val, None))
         return
     await q.answer("⌛ यह button अब valid नहीं है।")
 
@@ -805,9 +912,6 @@ async def handle_edit_callback(update: Update, context) -> None:
         await update.effective_chat.send_message("📄 नई description भेजें (हटाने के लिए '-' भेजें)\n/cancel — रद्द")
     elif action == "addq":
         n = db.count_questions(qid)
-        if n >= config.MAX_QUESTIONS:
-            await update.effective_chat.send_message(f"⚠️ {config.MAX_QUESTIONS} प्रश्नों की सीमा पूरी है।")
-            return
         data = {"mode": "add", "quiz_id": qid, "n_saved": n, "cur": {}, "added": []}
         db.set_state(user.id, "c_q", data)
         await _ask_question(update, data, first=True)
@@ -884,6 +988,14 @@ async def handle_edit_callback(update: Update, context) -> None:
         await respond(update, "⏱ प्रति प्रश्न timer चुनें:",
                       kb.timer_menu(f"e:settimer:{qid}", quiz["timer"], f"q:set:{qid}"))
     elif action == "settimer":
+        if len(parts) > 3 and parts[3] == "custom":
+            db.set_state(user.id, "e_timer", {"quiz_id": qid})
+            await update.effective_chat.send_message(
+                f"⏱ Custom timer भेजें — सेकंड या मिनट में (जैसे <code>45</code>, <code>45 sec</code>, "
+                f"<code>2 min</code>, <code>1:30</code>)। सीमा: {config.CUSTOM_TIMER_MIN} sec – "
+                f"{config.timer_label(config.CUSTOM_TIMER_MAX)}; <code>0</code> = No Timer।\n/cancel — रद्द",
+                parse_mode=ParseMode.HTML)
+            return
         val = _qid_arg(parts, 3)
         if val not in config.TIMER_CHOICES:
             return
@@ -917,6 +1029,17 @@ async def handle_edit_message(update: Update, context, state: str, data: dict) -
     if state in ("e_expl", "e_qtext", "e_opts") and not db.get_question(qid, question_id):
         db.clear_state(user.id)
         await msg.reply_text("प्रश्न नहीं मिला (शायद delete हो चुका है)।")
+        return
+    if state == "e_timer":
+        try:
+            val = config.parse_timer(text)
+        except ValueError as exc:
+            await msg.reply_text(f"⚠️ {exc}")
+            return
+        db.update_quiz(qid, timer=val)
+        db.clear_state(user.id)
+        await msg.reply_text(f"✅ Timer: {config.timer_label(val)} (हर प्रश्न पर लागू)")
+        await show_quiz_settings(update, qid, edit=False)
         return
     if state == "e_title":
         if len(text) > TITLE_MAX:
@@ -1080,9 +1203,60 @@ _REMOVED_NAMES = {"answer-key": "answer-key lines", "section-heading": "भा�
                   "header/footer": "header/footer lines"}
 
 
+def plan_parts(questions: list) -> list[list]:
+    """Split questions (source order) into parts of QUESTIONS_PER_PART.
+    456 → [456]; 500 → [500]; 501 → [500, 1]; 2378 → [500×4, 378]."""
+    per = max(1, int(config.QUESTIONS_PER_PART))
+    return [questions[i:i + per] for i in range(0, len(questions), per)] or []
+
+
+def _qref(q: dict) -> str:
+    sec = q.get("section_label")
+    return f"{sec} – Q{q['number']}" if sec else f"Q{q['number']}"
+
+
+def part_ranges(chunks: list[list]) -> list[str]:
+    return [f"📝 Part {k}: {_qref(c[0])}–{_qref(c[-1])} ({len(c)} प्रश्न)" if len(c) > 1
+            else f"📝 Part {k}: {_qref(c[0])} (1 प्रश्न)" for k, c in enumerate(chunks, 1)]
+
+
+def full_preview_text(questions: list, errors: list, review: list, title: str = "") -> str:
+    """Complete, untruncated preview of every parsed question (sent as a .txt)."""
+    out = [f"FULL PREVIEW — {title}".rstrip(" —"), f"Total Questions: {len(questions)}", ""]
+    chunks = plan_parts(questions)
+    if len(chunks) > 1:
+        out += [f"Total Parts: {len(chunks)}"] + [r[2:].strip() for r in part_ranges(chunks)] + [""]
+    if errors:
+        out += ["=== PARSING ERRORS (import नहीं होंगे) ==="] + [f"• {e}" for e in errors] + [""]
+    if review:
+        out += ["=== जांचें / Verification Required ==="] + [f"• {r}" for r in review] + [""]
+    for k, chunk in enumerate(chunks, 1):
+        if len(chunks) > 1:
+            out += [f"################ Part {k} ################", ""]
+        for q in chunk:
+            sec = f"{q['section_label']} – " if q.get("section_label") else ""
+            pg = f"  (पेज {q['page']})" if q.get("page") else ""
+            out.append(f"{sec}प्रश्न {q['number']}{pg}")
+            if q.get("verify"):
+                out.append("⚠️ Verification Required — जांचें: " + ", ".join(q["verify"]))
+            out.append(q["question"])
+            for i, o in enumerate(q["options"]):
+                out.append(f"({config.OPTION_LABELS[i]}) {o}")
+            ci = q["correct_index"]
+            out.append(f"Correct Answer: ({config.OPTION_LABELS[ci]}) {q['options'][ci]}")
+            if q.get("explanation"):
+                out.append("व्याख्या: " + q["explanation"])
+            out.append("")
+    return "\n".join(out)
+
+
 def _preview_lines(q: dict) -> list[str]:
     head = q.get("section_label") and f"{q['section_label']} – " or ""
-    out = [f"👁 <b>{esc(head)}प्रश्न {q['number']}</b> ({len(q['options'])} options):", esc(q["question"][:700]) +
+    pg = f" · पेज {q['page']}" if q.get("page") else ""
+    out = [f"👁 <b>{esc(head)}प्रश्न {q['number']}</b> ({len(q['options'])} options{pg}):"]
+    if q.get("verify"):
+        out.append("⚠️ <b>Verification Required</b> — " + esc(", ".join(q["verify"][:8])))
+    out += [esc(q["question"][:700]) +
            ("…" if len(q["question"]) > 700 else "")]
     for i, o in enumerate(q["options"]):
         mark = " ✅" if i == q["correct_index"] else ""
@@ -1110,6 +1284,11 @@ async def _parse_and_review(update: Update, user_id: int, text: str, default_tit
     if parts:
         head.append(f"📩 Text parts received: {parts} ({len(text)} characters)")
     head += [f"✅ सही parse हुए प्रश्न: <b>{n}</b>", f"❌ समस्या वाले प्रश्न/हिस्से: <b>{ne}</b>"]
+    chunks = plan_parts(questions)
+    if len(chunks) > 1:
+        head.append(f"📦 {len(chunks)} parts बनेंगे (हर part में अधिकतम {config.QUESTIONS_PER_PART} प्रश्न, "
+                    "मूल क्रमांक वही रहेंगे):")
+        head += part_ranges(chunks)
     if types:
         head.append("📚 " + ", ".join(f"{k}: {v}" for k, v in types.items()))
     opt_counts = Counter(len(q["options"]) for q in questions)
@@ -1132,6 +1311,7 @@ async def _parse_and_review(update: Update, user_id: int, text: str, default_tit
             previews += [q for q in questions if len(q["options"]) != major][:4]
             if res.ocr_pages:
                 previews += questions[1:3]
+            previews += [q for q in questions if q.get("verify")][:4]
         seen_ids = set()
         uniq = []
         for q in previews:
@@ -1144,21 +1324,16 @@ async def _parse_and_review(update: Update, user_id: int, text: str, default_tit
 
     rows = []
     review = bool(res.review)
+    kparts = f" · {len(chunks)} parts" if len(chunks) > 1 else ""
     if n and not ne:
-        if n <= config.MAX_QUESTIONS:
-            label = (f"✅ Preview जांच लिया — Quiz बनाएँ ({n})" if review else f"✅ Quiz बनाएँ ({n} प्रश्न)")
-            rows.append([B(label, callback_data="i:reviewed" if review else "i:create")])
-        else:
-            k = -(-n // config.MAX_QUESTIONS)
-            label = (f"✅ Preview जांचा — {k} quizzes में बाँटें" if review
-                     else f"✂️ {k} quizzes में बाँटें (≤{config.MAX_QUESTIONS} each)")
-            rows.append([B(label, callback_data="i:reviewedsplit" if review else "i:split")])
+        label = (f"✅ Preview जांच लिया — Quiz बनाएँ ({n}{kparts})" if review
+                 else f"✅ Quiz बनाएँ ({n} प्रश्न{kparts})")
+        rows.append([B(label, callback_data="i:reviewed" if review else "i:create")])
     elif n and ne:
         head += ["", f"⚠️ {ne} समस्याएँ हैं (ऊपर list)। Partial quiz तभी बनेगा जब आप नीचे confirm करें।"]
-        if n <= config.MAX_QUESTIONS:
-            rows.append([B(f"⚠️ Confirm: सिर्फ {n} सही प्रश्नों से quiz बनाएँ", callback_data="i:partial")])
-        else:
-            rows.append([B(f"⚠️ Confirm: {n} सही प्रश्न, quizzes में बाँटें", callback_data="i:partialsplit")])
+        rows.append([B(f"⚠️ Confirm: सिर्फ {n} सही प्रश्नों से quiz बनाएँ{kparts}", callback_data="i:partial")])
+    if n:
+        head += ["", "📄 सभी प्रश्नों का पूरा preview (प्रश्न, सभी options, Correct Answer) .txt file में भेजा गया है।"]
     head += ["", "ℹ️ Text कटा हुआ है तो बाकी हिस्सा भेजें — जोड़ कर दोबारा parse होगा। "
              "या सुधरी हुई file/text दोबारा भेजें।"]
     rows.append([B("❌ Cancel", callback_data="i:cancel")])
@@ -1175,10 +1350,17 @@ async def _parse_and_review(update: Update, user_id: int, text: str, default_tit
         err_text = "❌ <b>Parsing errors</b>\n" + "\n".join(_format_errors(res))
         for chunk in engine.split_message(err_text, 3800):
             await chat.send_message(chunk, parse_mode=ParseMode.HTML)
-    chunks = engine.split_message(summary, 3800)
-    for i, chunk in enumerate(chunks):
+    if n:
+        preview = full_preview_text(questions, data["errors"], data["review"], default_title)
+        try:
+            await chat.send_document(InputFile(preview.encode("utf-8"), filename="full_preview.txt"),
+                                     caption=f"📄 Full Preview — {n} प्रश्न")
+        except TelegramError as exc:
+            log.warning("full preview upload failed: %s", exc)
+    msgs = engine.split_message(summary, 3800)
+    for i, chunk in enumerate(msgs):
         await chat.send_message(chunk, parse_mode=ParseMode.HTML,
-                                reply_markup=M(rows) if i == len(chunks) - 1 else None)
+                                reply_markup=M(rows) if i == len(msgs) - 1 else None)
 
 
 async def handle_import_callback(update: Update, context) -> None:
@@ -1225,27 +1407,31 @@ async def _create_imported(update: Update, user_id: int, data: dict, title: str)
     if data.get("review") and not data.get("reviewed"):
         await update.effective_chat.send_message("🔎 पहले preview जांच कर confirm button दबाएँ।")
         return
-    chunks = [questions[i:i + config.MAX_QUESTIONS] for i in range(0, len(questions), config.MAX_QUESTIONS)]
-    if len(chunks) > 1 and not data.get("split"):
-        await update.effective_chat.send_message("⚠️ 100 से अधिक प्रश्न — split option चुनें।")
-        return
-    created = []
+    chunks = plan_parts(questions)
+    created: list[str] = []
     try:
         for part, chunk in enumerate(chunks, 1):
-            t = title if len(chunks) == 1 else f"{title} (Part {part})"
-            qid = db.new_quiz(user_id, t[:TITLE_MAX + 20], "Imported from PDF/Text", status="ready", source="import")
-            db.add_questions_bulk(qid, chunk)
+            t = title if len(chunks) == 1 else part_title(title, part)
+            qid = db.new_quiz(user_id, t, "Imported from PDF/Text", status="ready", source="import")
             created.append(qid)
+            if len(chunks) > 1:
+                db.set_part(qid, created[0], part)
+            db.add_questions_bulk(qid, chunk)
     except (db.DatabaseError, ValueError) as exc:
-        for qid in created:
+        for qid in created:                  # all or nothing
             db.delete_quiz(qid, user_id)
         await update.effective_chat.send_message(f"❌ Quiz save नहीं हुआ: {exc}")
         return
     db.clear_state(user_id)
     me = await update.get_bot().get_me()
+    chat = update.effective_chat
+    report = ["✅ <b>Import Complete</b>", "", f"📚 Total Questions: {len(questions)}",
+              f"📦 Total Parts: {len(chunks)}", ""] + [esc(r) for r in part_ranges(chunks)]
+    for chunk in engine.split_message("\n".join(report), 3800):
+        await chat.send_message(chunk, parse_mode=ParseMode.HTML)
     for qid in created:
         quiz = db.get_quiz(qid)
         link = engine.deep_link(me.username, qid)
-        await update.effective_chat.send_message(
+        await chat.send_message(
             f"✅ <b>Import successful!</b>\n\n{quiz_summary(quiz, link)}",
             parse_mode=ParseMode.HTML, reply_markup=kb.quiz_card(qid, True), disable_web_page_preview=True)

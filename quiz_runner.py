@@ -309,10 +309,10 @@ async def _timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         att = db.get_attempt(data["attempt_id"])
         if not att or att["status"] != "active" or att.get("cur_poll_id") != data["poll_id"]:
             return
-        await _skip_current_locked(app, att, reason="⏰ समय समाप्त! प्रश्न skipped।")
+        await _skip_current_locked(app, att, reason="⏰ समय समाप्त! प्रश्न skipped।", status="timeout")
 
 
-async def _skip_current_locked(app: Application, att: dict, reason: str) -> None:
+async def _skip_current_locked(app: Application, att: dict, reason: str, status: str = "skipped") -> None:
     bot = app.bot
     _cancel_jobs(app, att["id"], ("timeout",))
     if att.get("cur_message_id"):
@@ -322,7 +322,7 @@ async def _skip_current_locked(app: Application, att: dict, reason: str) -> None
             pass  # already closed by open_period
     elapsed = time.time() - (att.get("cur_sent_ts") or time.time())
     post_expl = att.get("cur_post_explanation") or ""
-    db.record_answer(att["id"], att["cur_question_id"], att["current_index"], None, False, "skipped", elapsed)
+    db.record_answer(att["id"], att["cur_question_id"], att["current_index"], None, False, status, elapsed)
     text = reason
     if post_expl:
         text += "\n💡 Explanation:\n" + post_expl
@@ -353,14 +353,15 @@ async def skip_current(app: Application, user_id: int, message_id: Optional[int]
 # ------------------------------------------------------------ finishing
 def result_text(att: dict, quiz_title: str, stopped: bool) -> str:
     r = engine.compute_result(att["total"], att["correct"], att["wrong"], att["skipped"],
-                              att.get("duration_sec") or 0)
+                              att.get("duration_sec") or 0, att.get("timeouts") or 0)
     head = "⏹ <b>Quiz stopped</b> — partial result saved" if stopped else "🏁 <b>The quiz has finished!</b>"
     lines = [head, "", "📊 <b>Result</b>",
              f"Quiz: {esc(quiz_title)}",
              f"Total: {r.total}",
              f"Correct: {r.correct} ✅",
              f"Wrong: {r.wrong} ❌",
-             f"Skipped: {r.skipped} ⌛"]
+             f"Skipped: {r.skipped} ⌛",
+             f"Timeout: {r.timeouts} ⏰" + (" (Skipped में शामिल)" if r.timeouts else "")]
     if r.unanswered:
         lines.append(f"Not attempted: {r.unanswered}")
     lines += [f"Score: {r.score}/{r.total}",
@@ -383,7 +384,7 @@ async def _finish_locked(app: Application, att: dict, status: str) -> Optional[d
     title = quiz["title"] if quiz else "Quiz"
     try:
         await app.bot.send_message(done["chat_id"], result_text(done, title, status == "stopped"),
-                                   parse_mode=ParseMode.HTML, reply_markup=kb.result_markup(done["quiz_id"]))
+                                   parse_mode=ParseMode.HTML, reply_markup=kb.result_markup(done["quiz_id"], db.next_part(done["quiz_id"])))
     except TelegramError as exc:
         log.warning("could not send result: %s", exc)
     return done

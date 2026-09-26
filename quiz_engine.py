@@ -138,8 +138,19 @@ def _tag_head() -> str:
     return f"{config.QUESTION_TAG}\n\n" if config.QUESTION_TAG else ""
 
 
-def full_question_text(question_text: str, options: Sequence[str], index: int, total: int) -> str:
-    lines = [f"❓ प्रश्न {index + 1}/{total}", "", split_tag(question_text), ""]
+def source_no(question: dict, index: int) -> Optional[int]:
+    """Original (PDF) question number when it differs from the play position."""
+    try:
+        src = int(question.get("source_number") or 0)
+    except (TypeError, ValueError):
+        return None
+    return src if src > 0 and src != index + 1 else None
+
+
+def full_question_text(question_text: str, options: Sequence[str], index: int, total: int,
+                       src: Optional[int] = None) -> str:
+    head = f"❓ प्रश्न {src} ({index + 1}/{total})" if src else f"❓ प्रश्न {index + 1}/{total}"
+    lines = [head, "", split_tag(question_text), ""]
     if config.QUESTION_TAG:
         lines = [config.QUESTION_TAG, ""] + lines
     for i, opt in enumerate(options):
@@ -165,7 +176,8 @@ def build_poll_payload(question: dict, perm: Sequence[int], index: int, total: i
     qtext = split_tag(question["question"])       # the tag is added exactly once below
     head = _tag_head()
 
-    prefix = f"[{index + 1}/{total}] "
+    src = source_no(question, index)
+    prefix = f"[Q{src} · {index + 1}/{total}] " if src else f"[{index + 1}/{total}] "
     # Poll options are single-line: an option with a line break is shown
     # flattened in the poll AND verbatim in the full-text message.
     multiline = any("\n" in o for o in shown)
@@ -182,7 +194,7 @@ def build_poll_payload(question: dict, perm: Sequence[int], index: int, total: i
         payload.options = shown
     else:
         payload.long_question = long_q
-        payload.full_text_chunks = split_message(full_question_text(qtext, shown, index, total))
+        payload.full_text_chunks = split_message(full_question_text(qtext, shown, index, total, src))
         if long_opts or dup_opts:
             payload.compact = True
             payload.options = [f"({LABELS[i]})" for i in range(len(shown))]
@@ -216,7 +228,8 @@ def compact_fallback(question: dict, perm: Sequence[int], index: int, total: int
         options=[f"({LABELS[i]})" for i in range(len(shown))],
         correct_option_id=display_correct(perm, int(question["correct_index"])),
         perm=perm,
-        full_text_chunks=split_message(full_question_text(str(question["question"]), shown, index, total)),
+        full_text_chunks=split_message(full_question_text(str(question["question"]), shown, index, total,
+                                                         source_no(question, index))),
         compact=True,
     )
     expl = str(question.get("explanation") or "").strip()
@@ -422,14 +435,16 @@ class Result:
     score: int
     percentage: float
     duration_sec: float
+    timeouts: int = 0           # subset of ``skipped``: the timer ran out
 
 
 def compute_result(total: int, correct: int, wrong: int, skipped: int,
-                   duration_sec: float) -> Result:
+                   duration_sec: float, timeouts: int = 0) -> Result:
     answered_or_skipped = correct + wrong + skipped
     unanswered = max(0, total - answered_or_skipped)
     pct = (100.0 * correct / total) if total else 0.0
-    return Result(total, correct, wrong, skipped, unanswered, correct, round(pct, 2), duration_sec)
+    return Result(total, correct, wrong, skipped, unanswered, correct, round(pct, 2), duration_sec,
+                  min(int(timeouts or 0), skipped))
 
 
 def format_duration(seconds: float) -> str:

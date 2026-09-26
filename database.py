@@ -242,6 +242,8 @@ _MIGRATION_COLUMNS = {
         "status": "TEXT DEFAULT 'ready'",
         "source": "TEXT DEFAULT 'manual'",
         "updated_at": "TEXT",
+        "series_id": "TEXT",
+        "part_no": "INTEGER",
     },
     "questions": {
         "qtype": "TEXT DEFAULT 'mcq'",
@@ -253,6 +255,7 @@ _MIGRATION_COLUMNS = {
         "created_at": "TEXT",
     },
     "attempts": {
+        "timeouts": "INTEGER DEFAULT 0",
         "status": "TEXT DEFAULT 'active'",
         "order_json": "TEXT DEFAULT '[]'",
         "current_index": "INTEGER DEFAULT 0",
@@ -479,19 +482,12 @@ def add_question(qid: str, question: str, options: list[str], correct_index: int
                  explanation: str = "", *, qtype: str = "mcq", pre_text: str = "",
                  pre_media_type: str = "", pre_media_id: str = "",
                  source_number: Optional[int] = None, source_ref: str = "") -> int:
-    if not isinstance(options, (list, tuple)) or not (
-            config.MIN_OPTIONS <= len(options) <= config.MAX_OPTIONS):
-        raise ValueError(f"{config.MIN_OPTIONS}-{config.MAX_OPTIONS} options are required")
-    if not question or not question.strip():
-        raise ValueError("Question text is empty")
-    if any(not str(o).strip() for o in options):
-        raise ValueError("An option is empty")
-    if not 0 <= int(correct_index) < len(options):
-        raise ValueError(f"correct_index must be 0..{len(options) - 1}")
+    _check_question(question, options, correct_index)
     with connect() as con:
         n = con.execute("SELECT COUNT(*) FROM questions WHERE quiz_id=?", (qid,)).fetchone()[0]
-        if n >= config.MAX_QUESTIONS:
-            raise ValueError(f"A quiz can have at most {config.MAX_QUESTIONS} questions")
+        if n >= config.QUESTIONS_PER_PART:
+            raise ValueError(f"A quiz part can have at most {config.QUESTIONS_PER_PART} questions "
+                             "(the next questions go into the next Part)")
         pos = con.execute("SELECT COALESCE(MAX(position),0)+1 FROM questions WHERE quiz_id=?",
                           (qid,)).fetchone()[0]
         cur = con.execute("""
@@ -506,14 +502,71 @@ def add_question(qid: str, question: str, options: list[str], correct_index: int
         return cur.lastrowid
 
 
+def _check_question(question: str, options, correct_index) -> None:
+    if not isinstance(options, (list, tuple)) or not (
+            config.MIN_OPTIONS <= len(options) <= config.MAX_OPTIONS):
+        raise ValueError(f"{config.MIN_OPTIONS}-{config.MAX_OPTIONS} options are required")
+    if not question or not str(question).strip():
+        raise ValueError("Question text is empty")
+    if any(not str(o).strip() for o in options):
+        raise ValueError("An option is empty")
+    if not 0 <= int(correct_index) < len(options):
+        raise ValueError(f"correct_index must be 0..{len(options) - 1}")
+
+
 def add_questions_bulk(qid: str, questions: Iterable[dict], source: str = "import") -> int:
-    count = 0
+    """Insert many questions in ONE transaction (all or nothing), in order.
+
+    The question text is stored exactly as given (no length limit; SQLite TEXT
+    is Unicode-safe); ``number`` is the original source numbering."""
+    rows = []
     for q in questions:
-        add_question(qid, q["question"], q["options"], q["correct_index"],
-                     q.get("explanation", ""), qtype=q.get("qtype", "mcq"),
-                     source_number=q.get("number"))
-        count += 1
-    return count
+        _check_question(q["question"], q["options"], q["correct_index"])
+        rows.append(q)
+    with connect() as con:
+        n = con.execute("SELECT COUNT(*) FROM questions WHERE quiz_id=?", (qid,)).fetchone()[0]
+        if n + len(rows) > config.QUESTIONS_PER_PART:
+            raise ValueError(f"A quiz part can have at most {config.QUESTIONS_PER_PART} questions")
+        pos = con.execute("SELECT COALESCE(MAX(position),0) FROM questions WHERE quiz_id=?", (qid,)).fetchone()[0]
+        con.executemany("""
+            INSERT INTO questions(quiz_id,position,question,options_json,correct_index,explanation,qtype,
+                                  pre_text,pre_media_type,pre_media_id,source_number,source_ref)
+            VALUES(?,?,?,?,?,?,?,'','','',?,?)
+        """, [(qid, pos + i + 1, q["question"], json.dumps(list(q["options"]), ensure_ascii=False),
+               int(q["correct_index"]), q.get("explanation", "") or "", q.get("qtype", "mcq") or "mcq",
+               q.get("number"), q.get("source_ref", "") or "") for i, q in enumerate(rows)])
+        con.execute("UPDATE quizzes SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (qid,))
+    return len(rows)
+
+
+# -------------------------------------------------------------- series / parts
+def set_part(qid: str, series_id: str, part_no: int) -> None:
+    with connect() as con:
+        con.execute("UPDATE quizzes SET series_id=?, part_no=? WHERE id=?", (series_id, int(part_no), qid))
+
+
+def series_parts(series_id: Optional[str]) -> list[dict]:
+    """All parts of an import series, Part 1 first."""
+    if not series_id:
+        return []
+    with connect() as con:
+        rows = con.execute("""
+            SELECT q.*, (SELECT COUNT(*) FROM questions WHERE quiz_id=q.id) AS question_count,
+                   (SELECT MIN(source_number) FROM questions WHERE quiz_id=q.id) AS first_number,
+                   (SELECT MAX(source_number) FROM questions WHERE quiz_id=q.id) AS last_number
+            FROM quizzes q WHERE series_id=? ORDER BY part_no, created_at
+        """, (series_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def next_part(qid: str) -> Optional[dict]:
+    quiz = get_quiz(qid)
+    if not quiz or not quiz.get("series_id"):
+        return None
+    with connect() as con:
+        row = con.execute("""SELECT id FROM quizzes WHERE series_id=? AND part_no>? AND status='ready'
+                             ORDER BY part_no LIMIT 1""", (quiz["series_id"], quiz["part_no"] or 0)).fetchone()
+    return get_quiz(row["id"]) if row else None
 
 
 def get_questions(qid: str) -> list[dict]:
@@ -681,10 +734,14 @@ def set_current_poll(attempt_id: int, poll_id: str, message_id: int, question_id
 def record_answer(attempt_id: int, question_id: int, position: int,
                   chosen_index: Optional[int], is_correct: bool, status: str,
                   elapsed: float) -> None:
-    """Save one answer and advance the attempt atomically."""
-    if status not in {"correct", "wrong", "skipped"}:
+    """Save one answer and advance the attempt atomically.
+
+    ``timeout`` (timer ran out) counts as skipped AND is counted separately in
+    ``attempts.timeouts``."""
+    if status not in {"correct", "wrong", "skipped", "timeout"}:
         raise ValueError("bad status")
-    col = {"correct": "correct", "wrong": "wrong", "skipped": "skipped"}[status]
+    sets = {"correct": "correct=correct+1", "wrong": "wrong=wrong+1", "skipped": "skipped=skipped+1",
+            "timeout": "skipped=skipped+1, timeouts=timeouts+1"}[status]
     with connect() as con:
         con.execute("""
             INSERT INTO answers(attempt_id,question_id,position,chosen_index,correct,status,elapsed)
@@ -692,7 +749,7 @@ def record_answer(attempt_id: int, question_id: int, position: int,
         """, (attempt_id, question_id, position, chosen_index, int(bool(is_correct)), status,
               float(elapsed)))
         con.execute(f"""
-            UPDATE attempts SET {col}={col}+1, score=correct+?, current_index=current_index+1,
+            UPDATE attempts SET {sets}, score=correct+?, current_index=current_index+1,
                    cur_poll_id=NULL, cur_message_id=NULL, cur_question_id=NULL,
                    cur_perm_json=NULL, cur_correct=NULL, cur_sent_ts=NULL,
                    cur_post_explanation=''
@@ -727,7 +784,7 @@ def quiz_stats(qid: str) -> tuple[dict, list[dict]]:
                    COUNT(DISTINCT user_id) AS users,
                    COALESCE(SUM(correct),0) AS correct,
                    COALESCE(SUM(wrong),0) AS wrong,
-                   COALESCE(SUM(skipped),0) AS skipped,
+                   COALESCE(SUM(skipped),0) AS skipped, COALESCE(SUM(timeouts),0) AS timeouts,
                    COALESCE(SUM(total),0) AS total_questions,
                    COALESCE(AVG(CASE WHEN total>0 THEN 100.0*correct/total END),0) AS avg_pct
             FROM attempts WHERE quiz_id=? AND status IN ('finished','stopped')
@@ -769,6 +826,7 @@ def user_totals(user_id: int) -> dict:
         row = con.execute("""
             SELECT COUNT(*) AS attempts, COALESCE(SUM(correct),0) AS correct,
                    COALESCE(SUM(wrong),0) AS wrong, COALESCE(SUM(skipped),0) AS skipped,
+                   COALESCE(SUM(timeouts),0) AS timeouts,
                    COALESCE(SUM(total),0) AS total
             FROM attempts WHERE user_id=? AND status IN ('finished','stopped')
         """, (user_id,)).fetchone()
