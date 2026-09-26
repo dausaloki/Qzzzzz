@@ -531,10 +531,10 @@ def add_questions_bulk(qid: str, questions: Iterable[dict], source: str = "impor
         con.executemany("""
             INSERT INTO questions(quiz_id,position,question,options_json,correct_index,explanation,qtype,
                                   pre_text,pre_media_type,pre_media_id,source_number,source_ref)
-            VALUES(?,?,?,?,?,?,?,'','','',?,?)
+            VALUES(?,?,?,?,?,?,?,?,'','',?,?)
         """, [(qid, pos + i + 1, q["question"], json.dumps(list(q["options"]), ensure_ascii=False),
                int(q["correct_index"]), q.get("explanation", "") or "", q.get("qtype", "mcq") or "mcq",
-               q.get("number"), q.get("source_ref", "") or "") for i, q in enumerate(rows)])
+               q.get("pre_text", "") or "", q.get("number"), q.get("source_ref", "") or "") for i, q in enumerate(rows)])
         con.execute("UPDATE quizzes SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (qid,))
     return len(rows)
 

@@ -36,6 +36,8 @@ OCR_DPI = int(os.getenv("OCR_DPI", "300"))
 # "Verification Required" so a human checks them against the page.
 OCR_VERIFY_HINDI = os.getenv("OCR_VERIFY_HINDI", "1").strip().lower() not in ("0", "false", "no")
 OCR_VERIFY_DPI = int(os.getenv("OCR_VERIFY_DPI", str(OCR_DPI * 4 // 3)))
+# Two OCR words closer than this fraction of the font size are one word.
+OCR_JOIN_GAP = float(os.getenv("OCR_JOIN_GAP", "0.08"))
 MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "300"))
 
 LEGACY_FONT_RE = re.compile(
@@ -93,6 +95,10 @@ class Extraction:
     line_pages: list[int] = field(default_factory=list)
     # page → Devanagari words the two OCR passes read differently
     uncertain: dict[int, set] = field(default_factory=dict)
+    # text-layer pages that contain pictures (figure/map based questions are flagged)
+    image_pages: list[int] = field(default_factory=list)
+    # OCR word-spacing repairs: (page, before, after)
+    space_fixes: list[tuple[int, str, str]] = field(default_factory=list)
 
     @property
     def ocr_pages(self) -> list[int]:
@@ -203,6 +209,10 @@ def _lines_from_dict(d: dict, ocr: bool = False) -> list[Line]:
                     gap = bsp["bbox"][0] - a["bbox"][2]
                     size = max(a.get("size", 10), 1)
                     need = (ocr and gap > -0.5) or gap > 0.15 * size
+                    if (ocr and need and gap < OCR_JOIN_GAP * size and _DEVANAGARI_RE.match(bsp["text"][:1])
+                            and _DEVANAGARI_RE.match(parts[-1][-1:])):
+                        # Tesseract split ONE word ("रा जस्था न"): no visible gap on the page
+                        need = False
                     if need and not parts[-1][-1:].isspace() and not bsp["text"][:1].isspace():
                         parts.append(" ")
                     parts.append(bsp["text"])
@@ -273,6 +283,33 @@ def _column_has_question(col: list[Line]) -> bool:
     return False
 
 
+# letters: "(C)", "C.", "c)"; digits ONLY in brackets "(3)" — "3." is also a
+# question number / List-II item, which must never prove a column
+_OPT_LABEL_RE = re.compile(r"^\s*(?:[(\[]\s*([A-Ha-h1-8]|[क-ङ])\s*[)\]]|([A-Ha-h]|[क-ङ])\s*[).])")
+_ANS_LINE_RE = re.compile(r"^\s*(?:उत्तर|Ans(?:wer)?|सही\s*उत्तर)\b\s*[:.\-–)]", re.IGNORECASE)
+_LABEL_SEQ = "ABCDEFGH", "abcdefgh", "12345678", "कखगघङ"
+
+
+def _column_is_self_contained(col: list[Line]) -> bool:
+    """Evidence that a side is a real text column even when it has no question
+    start (it continues from the previous column/page): two CONSECUTIVE option
+    labels one below the other ((C) then (D)) or an answer line.  A 2×2 option
+    grid has (A),(C) | (B),(D) — never consecutive in one side."""
+    rows = sorted(col, key=lambda l: l.y0)
+    labs = []
+    for l in rows:
+        if _ANS_LINE_RE.match(l.text):
+            return True
+        m = _OPT_LABEL_RE.match(l.text)
+        labs.append((m.group(1) or m.group(2)) if m else None)
+    for a, b in zip(labs, labs[1:]):
+        if a and b:
+            for seq in _LABEL_SEQ:
+                if a in seq and b in seq and seq.index(b) == seq.index(a) + 1:
+                    return True
+    return False
+
+
 def _find_gutter(lines: list[Line], width: float) -> tuple[Optional[float], int]:
     best, best_cross = None, None
     lo, hi = int(width * 0.30), int(width * 0.70)
@@ -305,7 +342,9 @@ def order_lines(lines: list[Line], width: float) -> tuple[list[Line], bool]:
     # the SAME column) by a first option "(A)"/"A."/"(1)"/"(क)".  A 2×2 option
     # grid or a List-I/List-II table has no such structure on its right side
     # → read row by row instead.
-    if not (_column_has_question(right) and _column_has_question(left)):
+    def real(col):
+        return _column_has_question(col) or _column_is_self_contained(col)
+    if not (real(right) and real(left)):
         return _rows(lines), False
     out: list[Line] = []
     span_sorted = sorted(span, key=lambda l: l.y0)
@@ -415,6 +454,52 @@ def verify_tokens(main: list[Line], eng: list[Line], notes: list[str]) -> list[L
                 txt = txt[:t.start(3)] + new_tok + txt[t.end(3):]
         out.append(Line(l.x0, l.y0, l.x1, l.y1, txt, l.size))
     return out
+
+
+_COMBINING_START = re.compile("^[\u0900-\u0903\u093a-\u094f\u0955-\u0957\u0962\u0963\u093c]")
+_PURE_DEV = re.compile("^[\u0900-\u097f]+$")
+
+
+def normalize_ocr_spacing(text: str, lexicon: Counter) -> tuple[str, list[tuple[str, str]]]:
+    """Remove OCR-inserted spaces INSIDE a Hindi word ("रा जस्था न" → "राजस्थान").
+
+    Only provable cases are joined (never any other change):
+    * a fragment that starts with a vowel sign/virama/nukta/anusvara — no Hindi
+      word can start like that, so it belongs to the previous fragment;
+    * 2–4 consecutive short fragments whose concatenation occurs as a normal
+      word elsewhere in the same document (≥2 times), while at least one
+      fragment is NOT a word of its own there.
+    Returns the new text and the list of (before, after) repairs."""
+    fixes: list[tuple[str, str]] = []
+    out_lines = []
+    for line in text.split("\n"):
+        toks = line.split(" ")
+        res: list[str] = []
+        i = 0
+        while i < len(toks):
+            tok = toks[i]
+            if res and tok and _COMBINING_START.match(tok) and _PURE_DEV.match(res[-1] or "x"):
+                fixes.append((res[-1] + " " + tok, res[-1] + tok))
+                res[-1] += tok
+                i += 1
+                continue
+            done = False
+            for k in (4, 3, 2):
+                win = toks[i:i + k]
+                if len(win) < k or not all(_PURE_DEV.match(w or "x") and len(w) <= 6 for w in win):
+                    continue
+                joined = "".join(win)
+                if lexicon.get(joined, 0) >= 2 and any(lexicon.get(w, 0) < 2 for w in win):
+                    fixes.append((" ".join(win), joined))
+                    res.append(joined)
+                    i += k
+                    done = True
+                    break
+            if not done:
+                res.append(tok)
+                i += 1
+        out_lines.append(" ".join(res))
+    return "\n".join(out_lines), fixes
 
 
 def uncertain_words(main_text: str, alt_text: str) -> set:
@@ -528,6 +613,14 @@ def extract_pdf(source, *, ocr: str = "auto", languages: str = OCR_LANGUAGES,
             ordered, cols = order_lines(lines, page.rect.width)
             for l in ordered:
                 l.page = pno + 1
+            if rep.method == "text" and lines:
+                try:
+                    area = page.rect.width * page.rect.height
+                    if any(r.width * r.height > 0.01 * area
+                           for img in page.get_images(full=True) for r in page.get_image_rects(img[0])):
+                        ext.image_pages.append(pno + 1)
+                except Exception:  # noqa: BLE001 - image table problems must not abort
+                    pass
             rep.columns = cols
             rep.chars = sum(len(l.text) for l in ordered)
             per_page.append((ordered, page.rect.height))
@@ -537,6 +630,21 @@ def extract_pdf(source, *, ocr: str = "auto", languages: str = OCR_LANGUAGES,
 
     cleaned, removed = remove_headers_footers(per_page)
     ext.removed = removed
+    # OCR spacing inside Hindi words, checked against the document's own vocabulary
+    ocr_set = {r.number for r in ext.pages if r.method == "ocr"}
+    if ocr_set:
+        from hindi_check import words as _words
+        lexicon: Counter = Counter()
+        for lines in cleaned:
+            for l in lines:
+                lexicon.update(w for w in _words(l.text) if _PURE_DEV.match(w))
+        for lines in cleaned:
+            for l in lines:
+                if l.page in ocr_set:
+                    new, fx = normalize_ocr_spacing(l.text, lexicon)
+                    if fx:
+                        l.text = new
+                        ext.space_fixes += [(l.page, a, b) for a, b in fx]
     # Build the text and a parallel page map (one entry per text line).
     out_lines: list[str] = []
     for lines in cleaned:
@@ -556,6 +664,11 @@ def extract_pdf(source, *, ocr: str = "auto", languages: str = OCR_LANGUAGES,
     if ext.column_pages:
         ext.warnings.append("दो-column layout पहचाना गया (पेज " +
                             ", ".join(map(str, ext.column_pages)) + ") — column-wise पढ़ा गया।")
+    if ext.space_fixes:
+        ext.warnings.append(
+            f"OCR ने {len(ext.space_fixes)} हिंदी शब्दों के बीच गलत space डाले थे — जोड़े गए: " +
+            ", ".join(f"'{a}'→'{b}' (पेज {p})" for p, a, b in ext.space_fixes[:5]) +
+            ("…" if len(ext.space_fixes) > 5 else ""))
     if removed:
         ext.warnings.append(f"Header/footer/page-number की {len(removed)} lines हटाई गईं: " +
                             " | ".join(sorted(set(removed)))[:300])

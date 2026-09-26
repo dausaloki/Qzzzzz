@@ -167,8 +167,29 @@ I. कोलू  II. गोगामेड़ी  III. रामदेवरा 
 * The answer can be inline or in an answer-key section (per section or at the end). If an inline answer
   and the key disagree, or a question has no answer, it is reported as an error instead of being guessed.
 * 2–12 options: `(A)…(L)`. A 5th option such as `(E) अनुत्तरित प्रश्न` is **kept** as a real option.
-* Supported: MCQ, statements, matching, List-I/List-II, assertion-reason, ordering, "which are correct"
-  (single answer), numerical options `(1)–(4)`, Hindi `(क)–(घ)` options.
+* Supported: MCQ, statements, matching, List-I/List-II/Column-I/II, assertion-reason, ordering/chronology,
+  true/false (सत्य/असत्य), EXCEPT/NOT/Incorrect, "which are correct" (single answer or कूट/code),
+  all/none of the above, numerical options `(1)–(4)`, Hindi `(क)–(घ)` options, 5–12 options.
+* **Passage / table / directions** (`निम्नलिखित गद्यांश को पढ़कर प्रश्न 1-3 के उत्तर दीजिए:`, `Directions (Q.4-6)`,
+  `तालिका का अध्ययन कीजिए`) are kept word for word and shown before each of their questions (stored as the
+  question's pre-text, also in `full_preview.txt`). A passage whose range contains an unreadable question is reported.
+* **Sections / shifts**: headings like `भाग-अ`, `Section B`, `शिफ्ट-2`, `Shift 1`, `पाली`, `सत्र`, `Set`, `Paper`
+  start a new part when numbering restarts. An answer key with the same sub-headings
+  (`उत्तर कुंजी / शिफ्ट-2 / 1. D 2. C / शिफ्ट-1 / …`) is mapped by **heading + number**, never by number alone.
+  An ambiguous key is an error.
+* **Promotion lines** (`Join Telegram @xyz`, `t.me/…`, WhatsApp/YouTube links, a line with only a link) are removed
+  and listed in the report. A URL inside a question sentence is kept.
+* **Layout**: 1- and 2-column pages (column order kept even when a column continues from the previous column/page),
+  repeated headers/footers and page numbers removed. A page break is never a question boundary.
+* **Figures**: a question that refers to a map/figure/graph on a page with a picture is marked
+  *Verification Required* (the picture itself is not attached to the poll).
+* **OCR spacing**: on scanned pages, spaces that OCR put *inside* a Hindi word (`रा जस्था न`) are removed only
+  when provable: no visible gap on the page, a fragment starting with a vowel sign, or the joined word occurs
+  elsewhere in the same document. Every join is listed for verification.
+* **Import report**: Total detected, Parsed, Verification Required, Failed, Answer mapped (answer key vs inline),
+  Parts created, plus page · question · reason for every problem.
+* Multiple correct answers (`उत्तर: A, C`) are reported, not imported. This bot stores exactly one correct
+  answer per question and never picks one itself.
 
 ---
 
@@ -208,7 +229,7 @@ answer-key letter was lost in the scanned-PDF test.
 * Group quizzes need the bot in the group; Telegram delivers `poll_answer` only for non-anonymous polls, so group polls are always non-anonymous (voters are visible). A question waits for the full timer, like @QuizBot.
 * **Native poll creation button** (`KeyboardButtonPollType`) works only in private chats, so quizzes are created in the bot's private chat.
   A quiz poll *forwarded* from elsewhere may arrive without its correct answer/explanation (Telegram hides them) — the bot then asks for the answer.
-  Multiple-answer polls cannot become quiz questions (a Telegram quiz has exactly one correct answer).
+  Multiple-answer polls cannot become quiz questions: this bot stores exactly one correct answer per question.
 * Telegram polls cannot contain media; pre-question photos/videos are sent as separate messages right before the poll.
 * Webhook mode is not used: the bot uses long polling (one instance). If a webhook was set for the token earlier,
   PTB's `run_polling` deletes it at startup.

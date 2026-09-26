@@ -1220,9 +1220,28 @@ def part_ranges(chunks: list[list]) -> list[str]:
             else f"📝 Part {k}: {_qref(c[0])} (1 प्रश्न)" for k, c in enumerate(chunks, 1)]
 
 
-def full_preview_text(questions: list, errors: list, review: list, title: str = "") -> str:
+def report_lines(rep: dict, parts: int) -> list[str]:
+    """Import report (plain text; the caller escapes for HTML)."""
+    out = ["📊 Import Report",
+           f"• Total detected: {rep['total_detected']}",
+           f"• Parsed: {rep['parsed']}",
+           f"• Verification Required: {rep['verification_required']}",
+           f"• Failed: {rep['failed']}" + (f" (+{rep['other_errors']} अन्य समस्याएँ)" if rep.get("other_errors") else ""),
+           f"• Answer mapped: {rep['answer_key'] + rep['answer_inline']} "
+           f"(answer key से {rep['answer_key']}, प्रश्न के साथ लिखे {rep['answer_inline']})",
+           f"• Parts created: {parts}"]
+    if rep.get("problems"):
+        out.append("समस्याएँ (पेज · प्रश्न · कारण):")
+        out += [f"  - पेज {pg or '?'} · {ref} · {why}" for pg, ref, why in rep["problems"]]
+    return out
+
+
+def full_preview_text(questions: list, errors: list, review: list, title: str = "",
+                      report: Optional[dict] = None) -> str:
     """Complete, untruncated preview of every parsed question (sent as a .txt)."""
     out = [f"FULL PREVIEW — {title}".rstrip(" —"), f"Total Questions: {len(questions)}", ""]
+    if report:
+        out += report_lines(report, len(plan_parts(questions))) + [""]
     chunks = plan_parts(questions)
     if len(chunks) > 1:
         out += [f"Total Parts: {len(chunks)}"] + [r[2:].strip() for r in part_ranges(chunks)] + [""]
@@ -1233,12 +1252,18 @@ def full_preview_text(questions: list, errors: list, review: list, title: str = 
     for k, chunk in enumerate(chunks, 1):
         if len(chunks) > 1:
             out += [f"################ Part {k} ################", ""]
+        last_pre = None
         for q in chunk:
             sec = f"{q['section_label']} – " if q.get("section_label") else ""
             pg = f"  (पेज {q['page']})" if q.get("page") else ""
+            if q.get("pre_text") and q["pre_text"] != last_pre:
+                out += ["----- गद्यांश / तालिका / निर्देश -----", q["pre_text"], "-------------------------------------"]
+            last_pre = q.get("pre_text") or None
             out.append(f"{sec}प्रश्न {q['number']}{pg}")
             if q.get("verify"):
                 out.append("⚠️ Verification Required — जांचें: " + ", ".join(q["verify"]))
+            for f in q.get("flags") or []:
+                out.append("⚠️ Verification Required — " + f)
             out.append(q["question"])
             for i, o in enumerate(q["options"]):
                 out.append(f"({config.OPTION_LABELS[i]}) {o}")
@@ -1256,6 +1281,10 @@ def _preview_lines(q: dict) -> list[str]:
     out = [f"👁 <b>{esc(head)}प्रश्न {q['number']}</b> ({len(q['options'])} options{pg}):"]
     if q.get("verify"):
         out.append("⚠️ <b>Verification Required</b> — " + esc(", ".join(q["verify"][:8])))
+    for f in q.get("flags") or []:
+        out.append("⚠️ <b>Verification Required</b> — " + esc(f))
+    if q.get("pre_text"):
+        out.append("📖 <i>" + esc(q["pre_text"][:300]) + ("…" if len(q["pre_text"]) > 300 else "") + "</i>")
     out += [esc(q["question"][:700]) +
            ("…" if len(q["question"]) > 700 else "")]
     for i, o in enumerate(q["options"]):
@@ -1273,9 +1302,10 @@ async def _parse_and_review(update: Update, user_id: int, text: str, default_tit
             log.exception("parser crashed")
             res = pdf_parser.ParseResult(errors=[pdf_parser.ParseError(None, f"Parser error: {exc}")])
     questions = [q.to_dict() for q in res.questions]
+    report = pdf_parser.import_report(res)
     data = {"buffer": text if parts else "", "parts": parts, "default_title": default_title,
             "questions": questions, "errors": [str(e) for e in res.errors],
-            "review": list(res.review)}
+            "review": list(res.review), "report": report}
     db.set_state(user_id, "imp_review", data)
 
     n, ne = len(questions), len(res.errors)
@@ -1289,6 +1319,10 @@ async def _parse_and_review(update: Update, user_id: int, text: str, default_tit
         head.append(f"📦 {len(chunks)} parts बनेंगे (हर part में अधिकतम {config.QUESTIONS_PER_PART} प्रश्न, "
                     "मूल क्रमांक वही रहेंगे):")
         head += part_ranges(chunks)
+    head += [""] + [esc(x) for x in report_lines({**report, "problems": report["problems"][:15]}, len(chunks))]
+    if len(report["problems"]) > 15:
+        head.append(f"  … कुल {len(report['problems'])} समस्याएँ — पूरी list full_preview.txt में")
+    head.append("")
     if types:
         head.append("📚 " + ", ".join(f"{k}: {v}" for k, v in types.items()))
     opt_counts = Counter(len(q["options"]) for q in questions)
@@ -1311,7 +1345,8 @@ async def _parse_and_review(update: Update, user_id: int, text: str, default_tit
             previews += [q for q in questions if len(q["options"]) != major][:4]
             if res.ocr_pages:
                 previews += questions[1:3]
-            previews += [q for q in questions if q.get("verify")][:4]
+            previews += [q for q in questions if q.get("verify") or q.get("flags")][:4]
+        previews += [q for q in questions if q.get("pre_text")][:1]
         seen_ids = set()
         uniq = []
         for q in previews:
@@ -1351,7 +1386,7 @@ async def _parse_and_review(update: Update, user_id: int, text: str, default_tit
         for chunk in engine.split_message(err_text, 3800):
             await chat.send_message(chunk, parse_mode=ParseMode.HTML)
     if n:
-        preview = full_preview_text(questions, data["errors"], data["review"], default_title)
+        preview = full_preview_text(questions, data["errors"], data["review"], default_title, report)
         try:
             await chat.send_document(InputFile(preview.encode("utf-8"), filename="full_preview.txt"),
                                      caption=f"📄 Full Preview — {n} प्रश्न")
@@ -1427,6 +1462,9 @@ async def _create_imported(update: Update, user_id: int, data: dict, title: str)
     chat = update.effective_chat
     report = ["✅ <b>Import Complete</b>", "", f"📚 Total Questions: {len(questions)}",
               f"📦 Total Parts: {len(chunks)}", ""] + [esc(r) for r in part_ranges(chunks)]
+    if data.get("report"):
+        rep = data["report"]
+        report += [""] + [esc(x) for x in report_lines({**rep, "problems": rep["problems"][:15]}, len(chunks))]
     for chunk in engine.split_message("\n".join(report), 3800):
         await chat.send_message(chunk, parse_mode=ParseMode.HTML)
     for qid in created:

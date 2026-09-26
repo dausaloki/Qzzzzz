@@ -82,6 +82,8 @@ class ParsedQuestion:
     section_label: str = ""
     page: Optional[int] = None
     verify: list = field(default_factory=list)   # words a human must check on the page
+    pre_text: str = ""        # passage/table/directions shared by several questions (exact source)
+    flags: list = field(default_factory=list)    # other verification reasons (figure/image, …)
 
     @property
     def label(self) -> str:
@@ -101,6 +103,8 @@ class ParsedQuestion:
             "section_label": self.section_label,
             "page": self.page,
             "verify": list(self.verify),
+            "pre_text": self.pre_text,
+            "flags": list(self.flags),
         }
 
 
@@ -205,7 +209,8 @@ PAGE_NOISE_RE = re.compile(
     re.IGNORECASE,
 )
 SECTION_RE = re.compile(
-    r"^\s*(?:भाग|खण्ड|खंड|अनुभाग|Section|Part)\s*[-–—:.]?\s*"
+    r"^\s*(?:भाग|खण्ड|खंड|अनुभाग|Section|Part|शिफ्ट|Shift|पाली|सत्र|Session|Set|सेट|Paper|पेपर|"
+    r"प्रश्न\s*-?\s*पत्र)\s*[-–—:.]?\s*"
     r"(?P<id>[A-Ea-e]|[IVX]{1,4}|\d{1,2}|[अबसदकखगघ]|प्रथम|द्वितीय|तृतीय|चतुर्थ|एक|दो|तीन|"
     r"first|second|third|one|two|three)"
     r"(?![A-Za-z0-9\u0900-\u097f])\s*(?:[-–—:.(\[].{0,50})?$",
@@ -213,16 +218,64 @@ SECTION_RE = re.compile(
 )
 _PUA_RE = re.compile("[\ue000-\uf8ff\ufffd\x00]")
 
+# Promotion lines that PDF sellers/channels insert between questions.  Only a
+# WHOLE line is removed (and reported) — a question that merely mentions
+# Telegram/YouTube is never touched.
+PROMO_RE = re.compile(
+    r"(?:t\.me/|telegram\.me/|wa\.me/|chat\.whatsapp\.com|youtu\.be/|youtube\.com/|instagram\.com/|"
+    r"facebook\.com/)"
+    r"|^\s*(?:[\w\u0900-\u097f]+\s*[:：-]\s*)?(?:https?://|www\.)\S+\s*$"
+    r"|^\s*@[A-Za-z][A-Za-z0-9_]{3,}\s*$"
+    r"|^\s*(?:join|follow|subscribe|download|visit|contact|जुड़ें|जुड़े|जुड़िए|ज्वाइन|जॉइन|फॉलो|सब्सक्राइब|"
+    r"डाउनलोड|संपर्क)\b.{0,80}(?:telegram|टेलीग्राम|whatsapp|व्हाट्सएप|व्हाट्सऐप|youtube|यूट्यूब|channel|"
+    r"चैनल|group|ग्रुप|app\b|ऐप|@)",
+    re.IGNORECASE,
+)
+# Directions / passage / table / data headers shared by several questions.
+PASSAGE_RE = re.compile(
+    r"(?:गद्यांश|अनुच्छेद|परिच्छेद|अवतरण|पद्यांश|काव्यांश|तालिका|सारणी|आरेख|ग्राफ|चार्ट|आंकड़|आँकड़|"
+    r"केस\s*स्टडी|मानचित्र)[^\n]{0,120}(?:पढ़|पढ|अध्ययन|देख|आधार|ध्यान|उत्तर)"
+    r"|^\s*निर्देश"
+    r"|^\s*(?:Directions?|Passage|Comprehension|Case\s*Study)\b"
+    r"|\b(?:Read|Study|Refer\s+to|Consider|Examine|Go\s+through)\b[^\n]{0,50}\b(?:passage|paragraph|"
+    r"table|chart|graph|data|figure|map|case|information|extract)",
+    re.IGNORECASE,
+)
+PASSAGE_RANGE_RE = re.compile(
+    r"(?:प्रश्न|Q\.?|Questions?|Qs?\.?|Nos?\.?)\s*(?:सं(?:ख्या)?\.?|No\.?)?\s*[\(\[]?\s*(\d{1,4})\s*"
+    r"(?:से|to|-|–|—|तक|and|व|एवं)\s*(\d{1,4})", re.IGNORECASE)
+_FIGURE_RE = re.compile(r"चित्र|आकृति|मानचित्र|नक्शा|नक़्शा|ग्राफ|आरेख|figure|diagram|image|picture|\bmap\b|graph",
+                        re.IGNORECASE)
+
+
+@dataclass
+class _Passage:
+    pos: int
+    lo: Optional[int]
+    hi: Optional[int]
+    lines: list
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
 _QTYPE_PATTERNS = [
     ("assertion_reason", re.compile(r"कथन\s*\(\s*A\s*\)|कारण\s*\(\s*R\s*\)|Assertion|Reason\s*\(\s*R\s*\)", re.I)),
-    ("list_matching", re.compile(r"सूची\s*[-–]?\s*(?:I|1|एक|प्रथम)|List\s*[-–]?\s*(?:I|1)\b", re.I)),
+    ("list_matching", re.compile(r"सूची\s*[-–]?\s*(?:I|1|एक|प्रथम)|List\s*[-–]?\s*(?:I|1)\b|"
+                                 r"(?:Column|कॉलम|स्तंभ|स्तम्भ)\s*[-–]?\s*(?:I|1|A|एक|प्रथम)\b", re.I)),
     ("matching", re.compile(r"सुमेलित|सुमेल|मिलान|Match\s+the|Match\s+List|Match\s+the\s+following", re.I)),
     ("ordering", re.compile(r"क्रम|अवरोही|आरोही|व्यवस्थित|Arrange|ascending|descending|chronological|sequence|order", re.I)),
     ("statement", re.compile(r"कथन|कथनों|Statement|statements", re.I)),
+    ("negative", re.compile(r"(?:नहीं|असत्य|गलत|असंगत)\s*(?:है|हैं|था|थे|थी|होगा)?\s*[?।]|सही\s+नहीं|"
+                            r"\bEXCEPT\b|\bNOT\b|\bincorrect\b|\bfalse\b|\bwrong\b", re.I)),
 ]
+_TF_SETS = [{"सत्य", "असत्य"}, {"सही", "गलत"}, {"true", "false"}, {"हाँ", "नहीं"}, {"yes", "no"}]
 
 
-def detect_qtype(question: str) -> str:
+def detect_qtype(question: str, options: Optional[list] = None) -> str:
+    """Classification for display/reporting only (never changes the text)."""
+    if options and len(options) == 2 and {str(o).strip().strip("।.").lower() for o in options} in _TF_SETS:
+        return "true_false"
     for name, pat in _QTYPE_PATTERNS:
         if pat.search(question):
             return name
@@ -236,6 +289,8 @@ QTYPE_LABELS = {
     "list_matching": "List-I/List-II matching",
     "assertion_reason": "Assertion-Reason",
     "ordering": "Ordering/Ranking",
+    "true_false": "True/False",
+    "negative": "EXCEPT/NOT/Incorrect",
 }
 
 
@@ -554,6 +609,11 @@ class KeyEntry:
     pos: int            # source position (original line index)
     group: int
     expl: str = ""
+    label: str = ""     # section sub-heading inside the key ("शिफ्ट-1"), if any
+
+
+def _norm_label(t: str) -> str:
+    return re.sub(r"[\s\-–—:.()\[\]]+", "", (t or "").lower())
 
 
 def _is_key_like(line: str) -> bool:
@@ -585,6 +645,7 @@ def _extract_key_entries(lines: list[str], pos: Optional[list[int]] = None):
     removed: list[str] = []
     keep = [True] * len(lines)
     gid = [0]
+    label_of: dict[int, str] = {}
 
     def new_group() -> int:
         gid[0] += 1
@@ -615,6 +676,14 @@ def _extract_key_entries(lines: list[str], pos: Optional[list[int]] = None):
                     j += 1
                     continue
                 flush()
+                if SECTION_RE.match(ln) and not KEY_HEADER_RE.match(ln):
+                    nxt = next((lines[t] for t in range(j + 1, min(j + 3, len(lines))) if lines[t].strip()), "")
+                    if nxt and (_is_key_like(nxt) or NUMBERED_ANSWER_RE.match(nxt) or _TOKEN_ONLY_RE.match(nxt)):
+                        g = new_group()                      # "शिफ्ट-1" inside the key: a labelled part
+                        label_of[g] = ln.strip()
+                        keep[j] = False
+                        j += 1
+                        continue
                 if KEY_HEADER_RE.match(ln) or SECTION_RE.match(ln):
                     break
                 if STRONG_Q_RE.match(ln) and not _is_key_like(ln) and not NUMBERED_ANSWER_RE.match(ln):
@@ -690,6 +759,8 @@ def _extract_key_entries(lines: list[str], pos: Optional[list[int]] = None):
                 entries.append(KeyEntry(n, t, pos[idx], g))
             keep[idx] = False
             removed.append(lines[idx])
+    for e in entries:
+        e.label = label_of.get(e.group, "")
     return keep, entries, warnings, removed
 
 
@@ -976,8 +1047,9 @@ def _parse_block(num: int, raw_lines: list[str], key_tok: Optional[str], key_exp
             mm = _MULTI_ANS_RE.match(am.group("rest"))
             if mm:
                 raise _BlockError(
-                    f"एक से अधिक सही उत्तर लिखे हैं ('{ln.strip()}') — Telegram quiz में केवल "
-                    "एक सही उत्तर हो सकता है")
+                    f"Multiple-correct: एक से अधिक सही उत्तर लिखे हैं ('{ln.strip()}') — यह bot हर "
+                    "प्रश्न का ठीक एक सही उत्तर रखता है, इसलिए अनुमान लगाकर एक नहीं चुना गया; प्रश्न import "
+                    "नहीं हुआ (कूट/code वाले रूप में हो तो वह चलेगा)")
             inline_tokens.append(am.group("tok"))
             rest = am.group("rest").strip(" .:-–—")
             kept = ""
@@ -1111,7 +1183,7 @@ def _parse_block(num: int, raw_lines: list[str], key_tok: Optional[str], key_exp
     explanation = inline_expl or (key_expl or "").strip()
     return ParsedQuestion(
         number=num, question=question, options=texts, correct_index=correct,
-        explanation=explanation, qtype=detect_qtype(question),
+        explanation=explanation, qtype=detect_qtype(question, texts),
         answer_source="inline" if idx_inline is not None else "answer_key",
     )
 
@@ -1121,7 +1193,7 @@ def _has_inline_answer(lines: list[str]) -> bool:
 
 
 def _resolve_keys(entries: list[KeyEntry], blocks, block_pos_start: list[int],
-                  block_inline: list[bool]) -> tuple[dict, dict, dict, set]:
+                  block_inline: list[bool], sec_label: Optional[dict] = None) -> tuple[dict, dict, dict, set]:
     """Map key entries to blocks.
 
     Returns (tok_by_block, expl_by_block, err_by_block, used_entry_ids).
@@ -1151,9 +1223,28 @@ def _resolve_keys(entries: list[KeyEntry], blocks, block_pos_start: list[int],
         if e.expl:
             expl[bi] = e.expl
 
+    # key parts labelled with a section heading ("शिफ्ट-2") map by LABEL + number —
+    # with repeated numbering the number alone is never trusted
+    if sec_label and len(sections) > 1:
+        by_label: dict[str, list[int]] = {}
+        for sidx, lab in sec_label.items():
+            by_label.setdefault(_norm_label(lab), []).append(sidx)
+        for eid, e in enumerate(entries):
+            if not e.label:
+                continue
+            secs = by_label.get(_norm_label(e.label), [])
+            if len(secs) == 1:
+                bi = by_sec_num.get((secs[0], e.num))
+                if bi is not None:
+                    assign(bi, e, eid)
+        # labelled entries are settled (an unmatched one stays unused → reported later)
+        entries = [KeyEntry(-1, e.tok, e.pos, -1) if (e.label and len(by_label.get(_norm_label(e.label), [])) == 1)
+                   else e for e in entries]
+
     groups: dict[int, list[int]] = {}
     for eid, e in enumerate(entries):
-        groups.setdefault(e.group, []).append(eid)
+        if e.num >= 0:
+            groups.setdefault(e.group, []).append(eid)
     if len(sections) == 1:
         for eid, e in enumerate(entries):
             bi = by_sec_num.get((sections[0], e.num))
@@ -1205,8 +1296,80 @@ def _resolve_keys(entries: list[KeyEntry], blocks, block_pos_start: list[int],
     return tok, expl, err, used
 
 
+def _extract_passages(lines: list[str], pos: list[int]) -> tuple[list[str], list[int], list[_Passage]]:
+    """Cut out passage/directions/table blocks ("निम्नलिखित गद्यांश को पढ़कर प्रश्न 5 से 8 …",
+    "Directions (Q. 11–15): …") that stand BETWEEN questions.  Their exact text
+    becomes the pre-question content of the questions they refer to, instead of
+    being glued onto the previous question's explanation/option."""
+    out_l: list[str] = []
+    out_p: list[int] = []
+    found: list[_Passage] = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        rng = PASSAGE_RANGE_RE.search(ln)
+        header = (len(ln) <= 400 and PASSAGE_RE.search(ln) is not None and not parse_marker(ln)
+                  and (not _is_candidate_line(ln) or (rng is not None and rng.start() < 12)))
+        if header:
+            lo, hi = (int(rng.group(1)), int(rng.group(2))) if rng else (None, None)
+            if lo is not None and not (lo <= hi and hi - lo <= 60):
+                lo = hi = None
+            j = i + 1
+            while j < len(lines):
+                t = lines[j]
+                m = STRONG_Q_RE.match(t) or WEAK_Q_RE.match(t)
+                if m and (lo is None or int(m.group("num")) == lo):
+                    break
+                if SECTION_RE.match(t) or KEY_HEADER_RE.match(t):
+                    j = len(lines)
+                    break
+                j += 1
+            body = lines[i:j]
+            # a real passage: a question follows, it has no option run of its own
+            # (then it belongs to the question), and it has content or a range
+            if (j < len(lines) and not complete_runs(_expand_lines(body))
+                    and (len(body) >= 2 or lo is not None)):
+                found.append(_Passage(pos[i], lo, hi, body))
+                i = j
+                continue
+        out_l.append(ln)
+        out_p.append(pos[i])
+        i += 1
+    return out_l, out_p, found
+
+
+def _attach_passages(result: "ParseResult", passages: list[_Passage], q_pos: dict,
+                     heading_pos: list[int], page_of) -> None:
+    for k, pz in enumerate(passages):
+        nxt = [p.pos for p in passages[k + 1:]] + [h for h in heading_pos if h > pz.pos]
+        bound = min(nxt) if nxt else 10 ** 12
+        targets = [q for q in result.questions if pz.pos < q_pos.get(id(q), -1) < bound
+                   and (pz.lo is None or pz.lo <= q.number <= pz.hi)]
+        pg = page_of(pz.pos)
+        where = f" (पेज {pg})" if pg else ""
+        if not targets:
+            result.errors.append(ParseError(
+                None, f"गद्यांश/निर्देश{where} '{pz.lines[0][:60]}' किसी पढ़े गए प्रश्न से नहीं जुड़ सका — "
+                      "उसके प्रश्न जांचें", page=pg))
+            continue
+        for q in targets:
+            q.pre_text = pz.text
+        nums = ", ".join(str(q.number) for q in targets)
+        if pz.lo is None:
+            result.review.append(f"गद्यांश/निर्देश{where} में प्रश्न-range नहीं लिखी — इसे प्रश्न {nums} से "
+                                 "जोड़ा गया; preview में जांचें")
+        else:
+            missing = sorted(set(range(pz.lo, pz.hi + 1)) - {q.number for q in targets})
+            if missing:
+                result.errors.append(ParseError(
+                    None, f"गद्यांश/निर्देश{where} प्रश्न {pz.lo}–{pz.hi} के लिए है, पर प्रश्न "
+                          f"{', '.join(map(str, missing))} नहीं पढ़े जा सके", page=pg))
+        result.warnings.append(f"गद्यांश/तालिका/निर्देश{where} प्रश्न {nums} से पहले दिखाया जाएगा "
+                               f"({len(pz.lines)} lines, text जैसा का तैसा)।")
+
+
 def parse_source(text: str, *, ocr: bool = False, line_pages: Optional[list[int]] = None,
-                 uncertain: Optional[dict] = None) -> ParseResult:
+                 uncertain: Optional[dict] = None, image_pages: Optional[set] = None) -> ParseResult:
     """Parse MCQs from raw text. Never raises for per-question problems.
 
     ``line_pages[i]`` is the PDF page of line i of ``text`` (used for error
@@ -1249,6 +1412,16 @@ def parse_source(text: str, *, ocr: bool = False, line_pages: Optional[list[int]
             kept.append((p, ln))
     if noise:
         result.warnings.append(f"{noise} page-number lines हटाई गईं।")
+    promo = [(p, ln) for p, ln in kept if PROMO_RE.search(ln) and not _is_candidate_line(ln)
+             and not parse_marker(ln) and not ANSWER_LETTER_RE.match(ln)]
+    if promo:
+        drop = {p for p, _ in promo}
+        kept = [(p, ln) for p, ln in kept if p not in drop]
+        for _, ln in promo:
+            result.removed.append(("promotion", ln))
+            accounted += _cc(ln)
+        result.warnings.append(f"{len(promo)} promotion/link lines (Telegram/WhatsApp/YouTube आदि) प्रश्नों से "
+                               "अलग की गईं: " + " | ".join(ln for _, ln in promo[:3])[:200])
 
     # answer-key material (a section heading ends a key section, so this runs first)
     lines = [ln for _, ln in kept]
@@ -1273,6 +1446,9 @@ def parse_source(text: str, *, ocr: bool = False, line_pages: Optional[list[int]
             rest_lines.append(ln)
             rest_pos.append(p)
     lines, pos = rest_lines, rest_pos
+    lines, pos, passages = _extract_passages(lines, pos)
+    for pz in passages:
+        accounted += _cc(*pz.lines)
     lines, pos = _expand_with_pos(lines, pos)
 
     # evidence points (expanded coordinates) for numbering restarts
@@ -1329,9 +1505,10 @@ def parse_source(text: str, *, ocr: bool = False, line_pages: Optional[list[int]
 
     block_pos = [pos[b[1]] for b in blocks]
     block_inline = [_has_inline_answer(lines[b[1]:b[2]]) for b in blocks]
-    ktok, kexpl, kerr, used = _resolve_keys(entries, blocks, block_pos, block_inline)
+    ktok, kexpl, kerr, used = _resolve_keys(entries, blocks, block_pos, block_inline, sec_label)
 
     result.detected_numbers = [b[0] for b in blocks]
+    q_pos: dict[int, int] = {}
     seen: set[tuple[int, int]] = set()
     for k, (num, start, end, sec) in enumerate(blocks):
         slabel = sec_label.get(sec, "")
@@ -1352,6 +1529,7 @@ def parse_source(text: str, *, ocr: bool = False, line_pages: Optional[list[int]
                     f"Verification Required — {q.label}{pg}: इन शब्दों को PDF पेज से मिलाएँ "
                     "(OCR/text layer पर भरोसा कम): " + ", ".join(q.verify[:8])
                     + (f" … +{len(q.verify) - 8}" if len(q.verify) > 8 else ""))
+            q_pos[id(q)] = pos[start]
             result.questions.append(q)
         except ValueError as exc:
             result.errors.append(ParseError(num, str(exc), slabel, bpage))
@@ -1371,6 +1549,14 @@ def parse_source(text: str, *, ocr: bool = False, line_pages: Optional[list[int]
                     result.questions.pop()
                     result.errors.append(ParseError(num, f"प्रश्न {missing} इसमें merge हो गया लगता है",
                                                     slabel, bpage))
+
+    _attach_passages(result, passages, q_pos, sorted(p for p, _ in headings), page_of)
+    if image_pages:
+        for q in result.questions:
+            if q.page in image_pages and _FIGURE_RE.search(q.question + "\n" + q.pre_text):
+                q.flags.append("चित्र/मानचित्र/ग्राफ आधारित प्रश्न — PDF का चित्र quiz में नहीं जाता")
+                result.review.append(f"Verification Required — {q.label} (पेज {q.page}): प्रश्न किसी चित्र/"
+                                     "मानचित्र/ग्राफ पर आधारित है; चित्र quiz में नहीं जाएगा — PDF से मिलाएँ")
 
     unused = sorted({entries[i].num for i in range(len(entries)) if i not in used})
     if unused and seen:
@@ -1474,16 +1660,60 @@ def parse_pdf_result(source, *, ocr: str = "auto",
     from pdf_extract import extract_pdf
     ext = extract_pdf(source, ocr=ocr, progress=progress)
     res = parse_source(ext.text, ocr=bool(ext.ocr_pages), line_pages=ext.line_pages,
-                       uncertain=ext.uncertain)
+                       uncertain=ext.uncertain, image_pages=set(ext.image_pages))
     res.ocr_pages = ext.ocr_pages
     res.warnings = ext.warnings + res.warnings
     res.errors = [ParseError(None, e) for e in ext.errors] + res.errors
     for t in ext.removed:
         res.removed.append(("header/footer", t))
+    if ext.space_fixes:
+        fixed = {(p, b) for p, _a, b in ext.space_fixes}
+        for q in res.questions:
+            blob = "\n".join([q.question, *q.options, q.explanation, q.pre_text])
+            hits = sorted({b for p, b in fixed if p == q.page and b in blob})
+            if hits:
+                q.flags.append("OCR spacing जोड़ा गया: " + ", ".join(hits[:6]))
+        res.review.append(
+            f"OCR के टूटे शब्द जोड़े गए ({len(ext.space_fixes)}): " +
+            ", ".join(f"'{a}'→'{b}' (पेज {p})" for p, a, b in ext.space_fixes[:8]) +
+            (" …" if len(ext.space_fixes) > 8 else "") + " — preview में मिलाएँ")
     if ext.ocr_pages:
         res.review.insert(0, "पेज " + ", ".join(map(str, ext.ocr_pages)) +
                           " OCR से पढ़े गए — प्रश्न, options और उत्तर preview में ज़रूर मिलाएँ")
     return res
+
+
+def import_report(res: "ParseResult") -> dict:
+    """Numbers + per-problem list for the import summary (nothing is estimated:
+    every count comes from parsed questions / reported errors)."""
+    parsed = res.questions
+    ocr = set(res.ocr_pages or [])
+    parsed_keys = {(q.section_label, q.number) for q in parsed}
+    failed_keys = {(e.section, e.number) for e in res.errors if e.number is not None} - parsed_keys
+    other_errors = [e for e in res.errors if e.number is None]
+    verify = [q for q in parsed if q.verify or q.flags or (q.page in ocr)]
+    problems: list[tuple[Optional[int], str, str]] = []
+    for e in res.errors:
+        ref = (f"{e.section} – प्रश्न {e.number}" if e.section else f"प्रश्न {e.number}") if e.number is not None else "—"
+        problems.append((e.page, ref, e.message))
+    for q in verify:
+        why = []
+        if q.verify:
+            why.append("OCR शब्द जांचें: " + ", ".join(q.verify[:6]))
+        why += q.flags
+        if not why:
+            why.append("OCR पेज")
+        problems.append((q.page, q.label, "Verification Required — " + "; ".join(why)))
+    return {
+        "total_detected": len(parsed) + len(failed_keys),
+        "parsed": len(parsed),
+        "verification_required": len(verify),
+        "failed": len(failed_keys),
+        "other_errors": len(other_errors),
+        "answer_key": sum(1 for q in parsed if q.answer_source == "answer_key"),
+        "answer_inline": sum(1 for q in parsed if q.answer_source != "answer_key"),
+        "problems": problems,
+    }
 
 
 # --------------------------------------------------- backward compatibility
