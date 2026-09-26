@@ -140,9 +140,10 @@ def test_manual_wizard_all_formats_then_full_run_restart_stop_stats():
             assert "/skip" in h.all_text(111).split("\n")[-1] or "/skip" in h.api.texts(111)[-1]
             await h.text(u, "अभ्यास quiz")                                     # description
             assert "Step" not in h.all_text(111)
-            # the question prompt comes with the native quiz-poll creation button (private chat only)
+            # MASTER FIX: Telegram's native poll editor (300-char "-57" counter) is opt-in
+            # (NATIVE_POLL_BUTTON); by default the reply keyboard has no request_poll button
             kbd = [m for m in h.api.sent("sendMessage", 111) if "keyboard" in (m.get("reply_markup") or {})][-1]
-            assert kbd["reply_markup"]["keyboard"][0][0]["request_poll"] == {"type": "quiz"}
+            assert "request_poll" not in str(kbd["reply_markup"])
             # Q1: statement question typed with options, answer and explanation in ONE message
             stmt_q = ("निम्नलिखित कथनों पर विचार कीजिए—\n1. कथन एक\n2. कथन दो\n3. कथन तीन\n"
                       "उपर्युक्त में से कौन-से कथन सही हैं?")
@@ -302,7 +303,8 @@ def test_timer_expiry_skips_and_continues():
             res = h.all_text(222)
             assert "Skipped: 2" in res and "Correct: 0" in res
             ans = db.get_answers(db.user_history(222)[0]["id"])
-            assert [a["status"] for a in ans] == ["skipped", "skipped"]
+            assert [a["status"] for a in ans] == ["timeout", "timeout"]      # timer ran out
+            assert "Timeout: 2 ⏰" in res
             # a real timer value is passed to Telegram as open_period
             db.update_quiz(qid, timer=90)
             await h.start(u, qid)
@@ -489,7 +491,7 @@ def test_import_with_errors_requires_explicit_confirmation():
                    "4. Q4?\n(A) a\n(B) b\n(C) c\n(D) d\nउत्तर: D\n")
             await h.text(u, txt)
             out = h.all_text(888)
-            assert "प्रश्न 2: सही उत्तर नहीं मिला" in out
+            assert "प्रश्न 2: Answer Not Found — सही उत्तर नहीं मिला" in out
             assert "प्रश्न 3: सही उत्तर (D) है, पर केवल 3 options" in out
             last = h.api.sent("sendMessage", 888)[-1]
             assert "i:partial" in str(last["reply_markup"]) and "i:create\"" not in str(last["reply_markup"])
@@ -527,19 +529,19 @@ def test_import_text_in_multiple_parts_and_txt_file():
     run(t())
 
 
-def test_import_more_than_100_offers_split():
+def test_import_more_than_100_is_one_quiz():
+    # MASTER FIX: no 100-question limit; up to QUESTIONS_PER_PART (500) is ONE quiz
     async def t():
         async with Harness() as h:
             u = h.f.user(1001)
             body = "".join(f"{i}. Q{i}?\n(A) a\n(B) b\n(C) c\n(D) d\nAnswer: B\n" for i in range(1, 131))
             await h.cb(u, "m:imp")
             await h.text(u, body)
-            assert "i:split" in str(h.api.sent("sendMessage", 1001)[-1]["reply_markup"])
-            await h.cb(u, "i:split")
+            assert "i:create" in str(h.api.sent("sendMessage", 1001)[-1]["reply_markup"])
+            await h.cb(u, "i:create")
             await h.text(u, "Big")
-            qz = sorted(db.get_owner_quizzes(1001), key=lambda q: q["title"])
-            assert [q["title"] for q in qz] == ["Big (Part 1)", "Big (Part 2)"]
-            assert [q["question_count"] for q in qz] == [100, 30]
+            qz = db.get_owner_quizzes(1001)
+            assert [q["title"] for q in qz] == ["Big"] and qz[0]["question_count"] == 130
     run(t())
 
 

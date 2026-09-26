@@ -362,11 +362,12 @@ def test_long_question_and_long_options_preserved_exactly():
     assert len(res.questions[0].options[0]) > 100
 
 
-def test_more_than_100_questions_warns():
+def test_more_than_100_questions_no_limit():
+    # MASTER FIX: the old 100-question limit is gone (parts are made by quiz_creator)
     body = "".join(f"{i}. Q{i}?\n(A) a\n(B) b\n(C) c\n(D) d\nAnswer: A\n" for i in range(1, 106))
     res = parse(body)
     assert res.errors == [] and len(res.questions) == 105
-    assert any("अधिकतम" in w for w in res.warnings)
+    assert not any("अधिकतम" in w for w in res.warnings)
 
 
 def test_backward_compatible_parse_text_api():

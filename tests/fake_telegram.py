@@ -51,6 +51,7 @@ def _u16(s: str) -> int:
 class FakeTelegram(BaseRequest):
     def __init__(self):
         self.calls: list[tuple[str, dict]] = []
+        self.uploads: list[tuple[str, dict, dict]] = []   # (api, params, {field: (filename, bytes)})
         self._msg_ids = itertools.count(1000)
         self._poll_ids = _GLOBAL_POLL_IDS
         self.polls: dict[str, dict] = {}          # poll_id -> poll info (+chat, message_id)
@@ -88,6 +89,12 @@ class FakeTelegram(BaseRequest):
         if request_data is not None:
             params = dict(request_data.parameters)
         self.calls.append((api, params))
+        if request_data is not None and getattr(request_data, "contains_files", False):
+            files = {}
+            for name, val in (request_data.multipart_data or {}).items():
+                if isinstance(val, tuple) and len(val) >= 2:
+                    files[name] = (val[0], val[1])
+            self.uploads.append((api, params, files))
         if api in self.fail_next:
             desc = self.fail_next.pop(api)
             return 400, json.dumps({"ok": False, "error_code": 400, "description": desc}).encode()

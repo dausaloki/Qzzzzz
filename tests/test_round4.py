@@ -220,7 +220,10 @@ def test_creation_17_questions_stays_17_and_done_warns_unsaved():
     run(t())
 
 
-def test_creation_stops_at_100_questions():
+def test_creation_rolls_over_to_next_part_at_part_size(monkeypatch):
+    # MASTER FIX: a full part never stops creation — the next part is opened automatically
+    monkeypatch.setattr(config, "QUESTIONS_PER_PART", 100)
+
     async def t():
         async with Harness() as h:
             u = h.f.user(4004)
@@ -231,13 +234,17 @@ def test_creation_stops_at_100_questions():
             for i in range(99):                               # fast path: 99 saved directly
                 db.add_question(qid, f"Q{i}", ["a", "b"], 0)
             await h.send(h.f.user_poll(u, "Q100?", ["a", "b"], correct=1))
-            assert db.count_questions(qid) == 100
-            assert db.get_state(4004)[0] is None and db.get_quiz(qid)["status"] == "ready"
-            assert "सीमा पूरी" in h.all_text(4004)
-            with pytest.raises(ValueError):
-                db.add_question(qid, "Q101", ["a", "b"], 0)
-            await h.cb(u, f"e:addq:{qid}")
-            assert "सीमा पूरी है" in h.all_text(4004) and db.get_state(4004)[0] is None
+            assert db.count_questions(qid) == 100 and db.get_state(4004)[0] == "c_q"
+            await h.send(h.f.user_poll(u, "Q101?", ["a", "b"], correct=0))
+            assert "Part 1 पूरा" in h.all_text(4004)
+            quizzes = sorted(db.get_owner_quizzes(4004), key=lambda q: q["title"])
+            assert [q["title"] for q in quizzes] == ["सौ — Part 1", "सौ — Part 2"]
+            assert [q["question_count"] for q in quizzes] == [100, 1]
+            await h.text(u, "/done")
+            assert all(db.get_quiz(q["id"])["status"] == "ready" for q in quizzes)
+            p2 = db.get_quiz(quizzes[1]["id"])
+            assert p2["series_id"] == qid and p2["part_no"] == 2
+            assert db.next_part(qid)["id"] == p2["id"]
     run(t())
 
 

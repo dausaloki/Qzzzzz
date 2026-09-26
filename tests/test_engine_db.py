@@ -144,10 +144,15 @@ def test_database_tables_and_crud(fresh_db):
         db.add_question(qid, "Q", ["a"], 0)
     with pytest.raises(ValueError):
         db.add_question(qid, "Q", ["a", "b", "c", "d"], 4)
-    for i in range(99):
-        db.add_question(qid, f"Q{i}", ["a", "b", "c", "d"], 0)
-    with pytest.raises(ValueError, match="100"):
-        db.add_question(qid, "Q101", ["a", "b", "c", "d"], 0)
+    old = config.QUESTIONS_PER_PART
+    config.QUESTIONS_PER_PART = 100          # per-PART guard (default 500), never a total limit
+    try:
+        for i in range(99):
+            db.add_question(qid, f"Q{i}", ["a", "b", "c", "d"], 0)
+        with pytest.raises(ValueError, match="100"):
+            db.add_question(qid, "Q101", ["a", "b", "c", "d"], 0)
+    finally:
+        config.QUESTIONS_PER_PART = old
     db.update_quiz(qid, title="New", timer=0, shuffle_questions=1)
     q2 = db.get_quiz(qid)
     assert (q2["title"], q2["timer"], q2["shuffle_questions"]) == ("New", 0, 1)
