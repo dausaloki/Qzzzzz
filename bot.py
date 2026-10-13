@@ -7,6 +7,7 @@ still running) is logged and retried by PTB instead of crashing the bot.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -24,6 +25,7 @@ from telegram.ext import (
     TypeHandler, filters,
 )
 
+import backup
 import config
 import database as db
 import group_runner
@@ -285,6 +287,130 @@ async def settings_cmd(update: Update, context) -> None:
     if not is_private(update):
         return
     await show_settings(update, edit=False)
+
+
+# ------------------------------------------------------------ backup (admin)
+BACKUP_HELP = (
+    "🗄️ <b>Backup</b> (केवल administrator)\n"
+    "/backup — status (file, records, integrity, pending changes)\n"
+    "/backup now — अभी backup बनाओ\n"
+    "/backup verify — file + database मिलाकर जाँच\n"
+    "/backup sync — GitHub पर अभी भेजो (token हो तो)\n"
+    "/backup download — quiz_backup.json file यहीं भेजो\n"
+    "/backup restore — restore का dry-run (कुछ नहीं लिखा जाता)\n\n"
+    "असली restore: <code>python scripts/backup_tool.py restore --apply</code>"
+)
+
+
+def _backup_report(res: dict) -> str:
+    ok = bool(res.get("ok")) and not res.get("skipped")
+    lines = ["✅ Backup पूरा" if ok else ("ℹ️ बदलाव नहीं — file वैसी ही है" if res.get("skipped") else
+                                       "❌ Backup असफल")]
+    if res.get("path"):
+        lines.append(f"File: <code>{res['path']}</code>")
+    if res.get("bytes"):
+        lines.append(f"Size: {res['bytes']:,} bytes")
+    counts = res.get("counts") or {}
+    if counts:
+        lines.append("Records: " + ", ".join(f"{k}={counts.get(k, 0)}" for k in
+                                            ("quizzes", "questions", "attempts", "answers", "users")))
+    if res.get("commit"):
+        lines.append(f"GitHub commit: <code>{res['commit']}</code>")
+    if res.get("attempts") and res["attempts"] > 1:
+        lines.append(f"कोशिशें: {res['attempts']}")
+    if res.get("errors"):
+        lines.append("Error: " + "; ".join(str(e) for e in res["errors"][:3]))
+    return "\n".join(lines)
+
+
+async def backup_cmd(update: Update, context) -> None:
+    """/backup [now|verify|sync|restore] — restricted to BACKUP_ADMIN_IDS."""
+    chat = update.effective_chat
+    if not is_private(update):
+        await chat.send_message("🔒 /backup केवल private chat में (bot से personal chat) चलता है।")
+        return
+    uid = update.effective_user.id if update.effective_user else 0
+    if not config.BACKUP_ADMIN_IDS:
+        await chat.send_message(
+            "🔒 Backup commands locked: Railway → Variables में <code>BACKUP_ADMIN_IDS</code> "
+            f"सेट करें (आपका Telegram user id: <code>{uid}</code>).", parse_mode=ParseMode.HTML)
+        return
+    if uid not in config.BACKUP_ADMIN_IDS:
+        log.warning("Unauthorized /backup attempt by user %s", uid)
+        await chat.send_message("⛔ यह command केवल administrator के लिए है।")
+        return
+
+    action = (context.args[0].lower() if context.args else "status")
+    if action in ("help", "h"):
+        await chat.send_message(BACKUP_HELP, parse_mode=ParseMode.HTML)
+        return
+    if action in ("status", "s"):
+        await chat.send_message(backup.status_text(), parse_mode=ParseMode.HTML)
+        return
+    if action == "now":
+        await chat.send_message("⏳ Backup बन रहा है…")
+        res = await asyncio.to_thread(backup.export_now, "admin", True)
+        await chat.send_message(_backup_report(res), parse_mode=ParseMode.HTML)
+        return
+    if action == "verify":
+        ok, problems, info = await asyncio.to_thread(backup.verify_file, None, True)
+        text = [f"🔎 <b>Verify</b> — {'✅ ठीक' if ok else '❌ समस्या'}",
+                f"File: <code>{info.get('path')}</code> ({info.get('bytes', 0):,} bytes)",
+                f"Generated: {info.get('generated_at') or '—'}"]
+        if info.get("quizzes") is not None:
+            text.append(f"Quizzes: {info['quizzes']}")
+        if problems:
+            text.append("Problems: " + "; ".join(problems[:5]))
+        if info.get("stale"):
+            text.append("⚠️ File database से पुरानी है: " + "; ".join(info["stale"][:3]))
+        await chat.send_message("\n".join(text), parse_mode=ParseMode.HTML)
+        return
+    if action == "sync":
+        if not config.github_enabled():
+            await chat.send_message("❌ GitHub sync सेट नहीं है (GITHUB_TOKEN + GITHUB_REPO).")
+            return
+        await chat.send_message("⏳ GitHub पर भेजा जा रहा है…")
+        res = await asyncio.to_thread(backup.sync_github, True)
+        await chat.send_message(_backup_report(res), parse_mode=ParseMode.HTML)
+        return
+    if action in ("download", "file", "get"):
+        path = backup.backup_path()
+        if not path.exists() or backup.pending():
+            res = await asyncio.to_thread(backup.export_now, "admin-download", True)
+            if not res.get("ok"):
+                await chat.send_message("❌ " + "; ".join(str(e) for e in (res.get("errors") or []))[:300])
+                return
+        ok, problems, info = await asyncio.to_thread(backup.verify_file, path, True)
+        size = path.stat().st_size
+        if size > 45 * 1024 * 1024:                    # bot upload limit is 50 MB
+            await chat.send_message(f"⚠️ Backup {size:,} bytes — Telegram की limit से बड़ा है। "
+                                    "Railway volume से file copy करें।")
+            return
+        counts = info.get("counts") or {}
+        caption = (f"🗄️ quiz_backup.json · {size:,} bytes\n"
+                   f"📚 {counts.get('quizzes', 0)} quizzes · 📝 {counts.get('questions', 0)} questions · "
+                   f"👤 {counts.get('users', 0)} users\n"
+                   + ("✅ verified" if ok else "⚠️ " + "; ".join(problems[:2])))
+        try:
+            with open(path, "rb") as fh:
+                await chat.send_document(fh, filename="quiz_backup.json", caption=caption,
+                                         parse_mode=ParseMode.HTML)
+        except TelegramError as exc:
+            await chat.send_message(f"❌ file भेजना fail हुआ: {exc}")
+        return
+    if action == "restore":
+        plan = await asyncio.to_thread(backup.restore_from_file, backup.backup_path(), None, False)
+        if not plan.get("ok"):
+            await chat.send_message("❌ " + "; ".join(plan.get("problems", ["अज्ञात समस्या"])[:3]))
+            return
+        ins = sum(plan.get("inserted", {}).values())
+        upd = sum(plan.get("updated", {}).values())
+        await chat.send_message(
+            f"🧪 <b>Restore dry-run</b> (कुछ नहीं लिखा गया)\nBackup में: {ins} नए + {upd} मौजूदा records\n"
+            "<i>असली restore केवल सर्वर पर:</i> <code>python scripts/backup_tool.py restore --apply</code>",
+            parse_mode=ParseMode.HTML)
+        return
+    await chat.send_message(BACKUP_HELP, parse_mode=ParseMode.HTML)
 
 
 async def quiz_cmd(update: Update, context) -> None:
@@ -643,7 +769,17 @@ BOT_COMMANDS = [
     BotCommand("undo", "आख़िरी प्रश्न हटाएँ (creation)"),
     BotCommand("skip", "Skip (प्रश्न / optional step)"), BotCommand("stop", "Quiz रोकें"),
     BotCommand("cancel", "रद्द करें"), BotCommand("help", "Help"),
+    BotCommand("backup", "Backup status (admin)"),
 ]
+
+
+async def post_shutdown(app: Application) -> None:
+    """SIGTERM / Railway redeploy: write and upload whatever is still pending."""
+    try:
+        res = await asyncio.to_thread(backup.shutdown_export)
+        log.info("Shutdown backup: %s", {k: res.get(k) for k in ("ok", "bytes", "skipped", "errors")})
+    except Exception as exc:  # noqa: BLE001 — shutdown must never fail
+        log.error("Shutdown backup failed: %s", exc)
 
 
 async def post_init(app: Application) -> None:
@@ -676,7 +812,7 @@ async def post_init(app: Application) -> None:
 
 def build_application(token: str, request=None, get_updates_request=None, rate_limit: bool = True) -> Application:
     db.init_db()
-    builder: ApplicationBuilder = Application.builder().token(token).post_init(post_init)
+    builder: ApplicationBuilder = Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown)
     if rate_limit:
         builder = builder.rate_limiter(AIORateLimiter(max_retries=3))
     if config.TELEGRAM_API_BASE:
@@ -705,6 +841,7 @@ def build_application(token: str, request=None, get_updates_request=None, rate_l
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("skip", skip_cmd))
     app.add_handler(CommandHandler("quiz", quiz_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(PollAnswerHandler(runner.handle_poll_answer))
     app.add_handler(ChatMemberHandler(membership.on_chat_member, ChatMemberHandler.CHAT_MEMBER))
@@ -752,9 +889,33 @@ def main() -> None:
     log.info("Database: %s", db.get_db_path())
     on_railway = any(os.getenv(k) for k in ("RAILWAY_ENVIRONMENT", "RAILWAY_ENVIRONMENT_NAME", "RAILWAY_PROJECT_ID"))
     if on_railway and not os.getenv("RAILWAY_VOLUME_MOUNT_PATH"):
-        log.warning("NO RAILWAY VOLUME ATTACHED — %s is on ephemeral disk and will be WIPED on every "
-                    "redeploy. Add a Volume mounted at /data (service → Settings → Volumes).",
-                    db.get_db_path())
+        log.warning("NO RAILWAY VOLUME ATTACHED — %s and %s are on ephemeral disk and will be WIPED on "
+                    "every redeploy. Add a Volume mounted at /data (service → Settings → Volumes).",
+                    db.get_db_path(), config.BACKUP_PATH)
+    elif on_railway:
+        volume = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "")
+        if volume and not str(config.BACKUP_PATH).startswith(volume):
+            log.warning("Backup file %s is OUTSIDE the Railway volume %s — it will be lost on redeploy.",
+                        config.BACKUP_PATH, volume)
+    # ---- automatic backup: export + verify on every start, then keep syncing
+    try:
+        info = backup.install()
+        st = info.get("startup") or {}
+        if st.get("ok"):
+            log.info("Backup file: %s (%s bytes, %s quizzes, %s questions, %s attempts)",
+                     st.get("path"), f"{st.get('bytes', 0):,}", (st.get("counts") or {}).get("quizzes", 0),
+                     (st.get("counts") or {}).get("questions", 0), (st.get("counts") or {}).get("attempts", 0))
+        else:
+            log.error("Startup backup FAILED: %s", st.get("errors"))
+        ok, problems, vinfo = backup.verify_file()
+        if ok:
+            log.info("Backup verified: %s (%s, %s)", vinfo.get("path"), vinfo.get("generated_at"),
+                     vinfo.get("counts"))
+        else:
+            log.error("Backup verification FAILED: %s", "; ".join(problems[:5]))
+        backup.start_background()
+    except Exception as exc:  # noqa: BLE001 — the bot must start even if backups cannot
+        log.error("Backup system could not start: %s", exc)
     log.info("Starting polling (single instance)…")
     drop = os.getenv("DROP_PENDING_UPDATES", "false").lower() in ("1", "true", "yes")
     # run_polling owns the event loop; it is called exactly once.

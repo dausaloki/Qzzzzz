@@ -9,3 +9,8 @@ data/
 bot.lock
 .env
 .pytest_cache/
+# automatic backup files (data/ already covers the defaults)
+quiz_backup.json
+quiz_backup.json.prev
+quiz_backup.json.lock
+quiz_backup.json.tmp

@@ -129,6 +129,51 @@ def parse_timer(text: str) -> int:
     return val
 
 
+# ---------------------------------------------------------------- backup
+# Automatic JSON backup of every quiz + every quiz-related record.  The SQLite
+# database is the source of truth; quiz_backup.json is a derived export that is
+# rewritten (never appended to) after every committed change.
+BACKUP_ENABLED = os.getenv("BACKUP_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+# Default: next to the database, i.e. on the persistent Railway volume.
+BACKUP_PATH = Path(os.getenv("BACKUP_PATH", "").strip() or DATA_DIR / "quiz_backup.json")
+# Seconds of quiet time after a database change before the file is rewritten
+# (a burst of writes → one backup), the minimum time between two writes, and the
+# hard deadline after which a backup is written even during non-stop activity.
+# ``<file>.prev`` keeps the previous good copy, ``<file>.lock`` is the
+# cross-process write guard.
+BACKUP_DEBOUNCE = float(os.getenv("BACKUP_DEBOUNCE", "5"))
+BACKUP_MIN_INTERVAL = float(os.getenv("BACKUP_MIN_INTERVAL", "30"))
+BACKUP_MAX_DELAY = float(os.getenv("BACKUP_MAX_DELAY", "120"))
+# Safety net: even when nothing in this process is dirty, re-check this often
+# whether the database file changed behind our back (an external writer, e.g.
+# scripts/backup_tool.py or a manual sqlite edit) and re-export if it did.
+BACKUP_SAFETY_INTERVAL = float(os.getenv("BACKUP_SAFETY_INTERVAL", "300"))
+BACKUP_RETRIES = max(1, int(os.getenv("BACKUP_RETRIES", "5")))
+BACKUP_RETRY_DELAY = float(os.getenv("BACKUP_RETRY_DELAY", "3"))
+# /backup is restricted to these Telegram user ids (comma separated).
+BACKUP_ADMIN_IDS = tuple(
+    int(x) for x in re.split(r"[,\s]+", os.getenv("BACKUP_ADMIN_IDS", "").strip()) if x.lstrip("-").isdigit()
+)
+
+# ------------------------------------------------- GitHub synchronization
+# Optional: push the (redacted) backup to a private GitHub repository through
+# the contents API.  Without a token nothing is uploaded and everything stays
+# on the persistent volume.  The token is read from the environment only.
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+GITHUB_REPO = os.getenv("GITHUB_REPO", "").strip()            # "owner/repo"
+GITHUB_BACKUP_PATH = os.getenv("GITHUB_BACKUP_PATH", "").strip() or "quiz_backup.json"
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "").strip()        # empty = default branch
+# Minimum seconds between two GitHub commits (the supervisor syncs at most this
+# often; /backup sync forces an immediate upload).
+GITHUB_SYNC_INTERVAL = float(os.getenv("GITHUB_SYNC_INTERVAL", "300"))
+GITHUB_API = os.getenv("GITHUB_API", "https://api.github.com").strip().rstrip("/")
+GITHUB_TIMEOUT = float(os.getenv("GITHUB_TIMEOUT", "20"))
+
+
+def github_enabled() -> bool:
+    return bool(GITHUB_TOKEN and GITHUB_REPO and "/" in GITHUB_REPO)
+
+
 def get_token() -> str:
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:

@@ -45,6 +45,7 @@ create quizzes step by step, import them from **PDF / text**, and play them
 
 ### Commands
 `/start` `/newquiz` `/myquizzes` `/import` `/stats` `/settings` `/done` `/undo` `/skip` `/stop` `/cancel` `/help` `/quiz <id>`
+`/backup [now|verify|sync|restore]` — backup status (admins only, see **🗄️ Automatic backup**)
 
 `/skip` skips the optional step while creating (description / explanation) and skips the current question while playing.
 
@@ -59,7 +60,9 @@ The bot reads `supports_inline_queries` from `getMe` at startup and shows the in
 
 ```
 bot.py            entry point: one Application, one polling loop, handlers, menus, error handling
-config.py         env vars, Telegram limits, timer choices, data directory
+backup.py         automatic quiz_backup.json export (full DB snapshot, atomic write, validation,
+                  retries, GitHub sync, restore helpers) — the DB stays the source of truth
+config.py         env vars, Telegram limits, timer choices, data directory, backup settings
 database.py       SQLite schema, in-place migration from the old schema, all queries
 pdf_extract.py    PDF → text: text layer, column order, garbled/legacy-font detection, OCR (dual-pass verify)
 pdf_parser.py     MCQ parser: formats, sections/restarts, answer keys, per-question errors
@@ -72,8 +75,10 @@ keyboards.py      inline keyboards and help text
 stats.py          statistics formatting
 Dockerfile        python:3.11-slim + pinned Hindi/English OCR models (sha256-checked) — used by Railway
 scripts/          fetch_tessdata.py: downloads the exact OCR models (image build + local tests)
+                  backup_tool.py: export / verify / restore quiz_backup.json (admin tool)
 requirements.txt  Procfile  railway.json  .python-version  .dockerignore
-tests/            234 automated tests (parser, OCR, engine, DB, end-to-end bot flows, real startup)
+tests/            383 automated tests (parser, OCR, engine, DB, backup, end-to-end bot flows,
+                  real startup incl. a live backup run and a restart)
 ```
 
 ---
@@ -83,9 +88,9 @@ tests/            234 automated tests (parser, OCR, engine, DB, end-to-end bot f
 1. Push this repository to GitHub.
 2. In Railway: **New Project → Deploy from GitHub repo →** pick this repo.
 3. **Variables:** add `BOT_TOKEN` = the token from @BotFather.
-4. **Add a Volume** (strongly recommended): service → *Settings → Volumes → New Volume*, mount path `/data`.
-   Railway then sets `RAILWAY_VOLUME_MOUNT_PATH`, and the bot automatically stores `quiz.db` there.
-   *Without a volume, the database is wiped on every redeploy.*
+4. **Add a Volume** (required for real use): service → *Settings → Volumes → New Volume*, mount path `/data`.
+   Railway then sets `RAILWAY_VOLUME_MOUNT_PATH`, and the bot automatically stores `quiz.db` **and**
+   `quiz_backup.json` there. *Without a volume, both the database and the backup are wiped on every redeploy.*
 5. Deploy. Railway builds the `Dockerfile`. It downloads the pinned tessdata 4.1.0 Hindi + English models and fails the build if OCR would not work. The logs should show:
    ```
    Logged in as @YourBot (inline mode: off)
@@ -93,6 +98,9 @@ tests/            234 automated tests (parser, OCR, engine, DB, end-to-end bot f
    Group session recovery: {...}
    Join gate: users must be members of @kalam_kranti (the bot must be a member/admin there)
    OCR ready (eng+hin) — tessdata: /usr/share/tesseract-ocr/5/tessdata
+   Backup file: quiz_backup.json (12,345 bytes, 3 quizzes, 42 questions, 7 attempts)
+   Backup verified: /data/quiz_backup.json (2026-…Z, {...})
+   Backup supervisor started (file=/data/quiz_backup.json, debounce=5.0s, min interval=30.0s)
    Starting polling (single instance)…
    ```
 6. **Add the bot to @kalam_kranti** (as admin is best) — otherwise `getChatMember` fails and nobody can be verified.
@@ -129,6 +137,18 @@ The `Procfile` (`worker: python bot.py`) is kept for other hosts. If you deploy 
 | `QUESTION_TAG` | no | `जय श्री श्याम` | Tag at the top of every question sent; empty = no tag |
 | `GROUP_DEFAULT_TIMER` | no | `30` | Seconds per question in groups when the quiz has no timer |
 | `GROUP_NEXT_DELAY` | no | `2.0` | Pause between group questions |
+| `BACKUP_ENABLED` | no | `1` | `0` turns the automatic JSON backup off |
+| `BACKUP_PATH` | no | `$DATA_DIR/quiz_backup.json` | Backup file (keep it on the volume) |
+| `BACKUP_DEBOUNCE` | no | `5` | Seconds of quiet time after a change before the file is rewritten |
+| `BACKUP_MIN_INTERVAL` | no | `30` | Minimum seconds between two writes while the bot is busy |
+| `BACKUP_MAX_DELAY` | no | `120` | A backup is written at least this often even during non-stop activity |
+| `BACKUP_SAFETY_INTERVAL` | no | `300` | How often the database file is checked for changes made outside this process |
+| `BACKUP_RETRIES` / `BACKUP_RETRY_DELAY` | no | `5` / `3` | Retries (and delay) when an export or upload fails |
+| `BACKUP_ADMIN_IDS` | no | – | Comma-separated Telegram user ids allowed to use `/backup` (empty = command locked) |
+| `GITHUB_TOKEN` | no | – | GitHub token with **contents:write** — enables the optional GitHub copy |
+| `GITHUB_REPO` | no | – | `owner/repo` of a **private** repository for the backup copy |
+| `GITHUB_BACKUP_PATH` / `GITHUB_BRANCH` | no | `quiz_backup.json` / default branch | Where the file is committed |
+| `GITHUB_SYNC_INTERVAL` | no | `300` | Minimum seconds between two backup commits |
 
 ### "Conflict: terminated by other getUpdates request"
 The code creates exactly **one** `Application` and calls `run_polling()` exactly
@@ -190,6 +210,123 @@ I. कोलू  II. गोगामेड़ी  III. रामदेवरा 
   Parts created, plus page · question · reason for every problem.
 * Multiple correct answers (`उत्तर: A, C`) are reported, not imported. This bot stores exactly one correct
   answer per question and never picks one itself.
+
+
+---
+
+## 🗄️ Automatic backup (quiz_backup.json)
+
+The SQLite database stays the **only source of truth**; `quiz_backup.json` is a
+full, derived export of it that is **rewritten from scratch** (never appended to,
+never merged) whenever anything changes. The backup code never writes to the
+database — restoring is a separate, explicit admin tool.
+
+**What is inside** (`format: qzzzzz-quiz-backup`, `version: 1`):
+
+| Key | Contents |
+|---|---|
+| `quizzes[]` | id (quiz code), owner, title, description, pre-text, status, source, timestamps, `settings` (timer, shuffle questions/options) and `questions[]` (position/order, exact question text, `options_json`, `correct_index`, explanation, qtype, pre-text, media type/id, `source_number`, `source_ref`) |
+| `attempts[]` | every private play: user, chat, status, question order, progress, correct/wrong/skipped/timeouts, score, timer, shuffle, start/finish, duration and `answers[]` (question, chosen option, correct, status, elapsed, timestamp) |
+| `group_sessions[]` | every group run: quiz, chat, starter, status, order, progress, timer, and `polls[]` + `answers[]` (leaderboard: one row per participant per question with chosen option, correctness, score, elapsed, timestamp) |
+| `users[]` | user id, timers/shuffle defaults, membership timestamps (no passwords — there are none) |
+| `pending_states[]` | wizard / import-review state, i.e. **pending review questions** |
+| `counts`, `db`, `generated_at`, `generated_ts` | record counts, source database file, backup timestamp |
+
+**When is it written?** After **every committed database transaction**
+(`database.connect()` notifies `backup.py`): a new quiz, an added/edited/deleted
+question, changed settings, a changed answer or explanation, publish/unpublish
+(`/done`), a recorded answer/attempt/result, a new leaderboard row, an import,
+a delete, a restore. A short debounce (5 s) and a rate limit (30 s) keep write
+storms to one file write, with a 120 s hard deadline; a fresh export is also made
+**when the bot starts** and **when it stops** (Railway redeploy/SIGTERM). A
+safety net re-checks the database file every `BACKUP_SAFETY_INTERVAL` so changes
+made by another process (e.g. the CLI) are picked up too.
+
+**Safe by construction:** the JSON is built from the database inside one read
+transaction, validated (JSON syntax, quiz ids, per-quiz question counts, unique
+positions, option counts, `correct_index` inside range, answer↔attempt↔quiz and
+group-answer↔session references, counts vs content, secret scan for
+`BOT_TOKEN`/`GITHUB_TOKEN`/password fields) and only then written to a temporary
+file in the same directory, `fsync`ed and `os.replace()`d over the old file — a
+failed or invalid export never overwrites the last good file. The previous good
+file is kept as `quiz_backup.json.prev`; a cross-process file lock plus retries
+(`BACKUP_RETRIES`) handle concurrent writers and transient errors. Errors are
+logged and retried; **no database record is ever changed by the backup code**.
+
+**Admin commands** (private chat only, restricted to `BACKUP_ADMIN_IDS`):
+
+```
+/backup            status: file, size, record counts, integrity, pending changes, last error, GitHub state
+/backup now        write the backup immediately
+/backup verify     re-validate the file and compare its counts with the database
+/backup sync       upload the (redacted) copy to GitHub now
+/backup download   send quiz_backup.json to you as a Telegram document (a copy off the server)
+/backup restore    dry-run of a restore (nothing is written)
+```
+
+`/backup download` is the easiest way to keep a copy outside Railway when you have
+no shell access: the bot first writes a fresh, verified backup and then sends the
+file into your own chat (`BACKUP_ADMIN_IDS` only).
+
+**Export / verify / restore from a shell** (Railway → service → *Shell*, or locally):
+
+```bash
+python scripts/backup_tool.py status                     # same as /backup
+python scripts/backup_tool.py export --out /data/quiz_backup.json
+python scripts/backup_tool.py verify --file /data/quiz_backup.json --db /data/quiz.db
+python scripts/backup_tool.py restore --file /data/quiz_backup.json --db /data/quiz.db          # DRY RUN
+python scripts/backup_tool.py restore --file /data/quiz_backup.json --db /data/quiz.db --apply  # writes
+```
+
+`restore --apply` first copies the current database to
+`quiz.db.before-restore-<timestamp>` (with its `-wal`/`-shm`), then upserts every
+table on its natural key (`users.user_id`, `quizzes.id`, `questions.id`,
+`attempts.id`, `answers.id`, `group_sessions.id`, `group_polls.poll_id`,
+`group_answers.id`, `user_states.user_id`). Existing rows are updated in place,
+missing rows are inserted, nothing is ever duplicated and rows created after the
+backup (`id` not in the file) are left alone. Restoring the same file twice is a
+no-op the second time. A missing/empty database gets the full schema first.
+Delete a quiz by mistake → run `restore --apply` and it comes back.
+
+### Railway: where the files must live
+
+* `quiz.db` **and** `quiz_backup.json` are written to `DATA_DIR`, which Railway
+  sets to `RAILWAY_VOLUME_MOUNT_PATH` when a volume is attached — so both live on
+  the persistent volume. At startup the bot logs the volume warning if it cannot
+  find one (and also warns if `BACKUP_PATH` points outside the volume).
+* **Add the volume** (service → *Settings → Volumes → New Volume*, mount `/data`).
+  Without it, both files are on the container filesystem and both are lost on a
+  redeploy. Railway keeps **1 replica** (`railway.json`).
+* On every start the bot exports a fresh backup, validates it and logs
+  `Backup file: … ` + `Backup verified: …`; the file is never deleted or
+  replaced at startup, and the database is never reset.
+
+### Optional: GitHub copy
+
+Set `GITHUB_TOKEN` (fine-grained PAT, *Contents: Read and write*) + `GITHUB_REPO`
+(`owner/private-repo`) and the backup is committed through the GitHub contents
+API — the file is **updated in place** (existing `sha`, so unrelated files and
+history are untouched), skipped when the content hash is unchanged (no pointless
+commits), retried on conflicts/rate limits (409/422/429/5xx) and reported with a
+clear error on 401/403. This copy is **redacted**: user ids, chat ids, owner ids
+and names are removed, so nothing personal is published. Point `GITHUB_REPO` at a
+**private** repository — a public repository would publish the quiz content.
+
+This sandbox has no GitHub credentials, so the upload path is verified against a
+local fake GitHub API (create, in-place update, conflict retry, rate limit,
+auth error, unchanged-skip, redaction) — the real push can only be verified in
+your deployment. If `GITHUB_TOKEN` is not set, everything still works and the
+backup simply stays on the Railway volume.
+
+### What the backup protects against — and what it does not
+
+* ✅ A corrupted/quarantined database, a wrong `DELETE` (accidental quiz delete),
+  a bad import, a failed migration — the JSON is a complete second copy and can
+  rebuild the database.
+* ✅ A redeploy/restart losing the container filesystem (files on the volume).
+* ⚠️ It does **not** protect against losing the whole volume (both files live
+  there). For that, enable the GitHub copy or download
+  `quiz_backup.json` regularly. Keep a copy off the server.
 
 ---
 

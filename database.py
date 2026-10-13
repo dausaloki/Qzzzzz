@@ -21,9 +21,31 @@ log = logging.getLogger(__name__)
 _DB_PATH: Path = config.DB_PATH
 _lock = threading.RLock()
 
+# Callbacks run *after* a transaction committed with at least one changed row.
+# Used by backup.py to schedule the JSON export; a failing hook must never
+# affect the database transaction it follows.
+_write_hooks: list = []
+
 
 class DatabaseError(Exception):
     """Raised for any database failure (wraps sqlite3 errors)."""
+
+
+def add_write_hook(fn) -> None:
+    if fn not in _write_hooks:
+        _write_hooks.append(fn)
+
+
+def clear_write_hooks() -> None:
+    _write_hooks.clear()
+
+
+def _notify_write_hooks(changed: int) -> None:
+    for fn in list(_write_hooks):
+        try:
+            fn(f"db:{changed}")
+        except Exception:  # noqa: BLE001 — a hook must never break the bot
+            log.exception("Write hook %r failed", getattr(fn, "__name__", fn))
 
 
 def set_db_path(path: str | Path) -> None:
@@ -42,10 +64,12 @@ def connect():
     with _lock:
         con = sqlite3.connect(_DB_PATH, timeout=30)
         con.row_factory = sqlite3.Row
+        changed = 0
         try:
             con.execute("PRAGMA foreign_keys=ON")
             yield con
             con.commit()
+            changed = con.total_changes        # rows changed by this transaction
         except sqlite3.Error as exc:
             con.rollback()
             log.exception("Database error")
@@ -55,6 +79,8 @@ def connect():
             raise
         finally:
             con.close()
+        if changed:
+            _notify_write_hooks(changed)
 
 
 SCHEMA = """

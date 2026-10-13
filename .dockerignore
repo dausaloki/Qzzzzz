@@ -9,3 +9,4 @@ __pycache__/
 .pytest_cache/
 .venv/
 tests/
+quiz_backup.json*
