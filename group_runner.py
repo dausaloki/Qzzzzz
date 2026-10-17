@@ -26,7 +26,9 @@ from telegram.ext import Application, ContextTypes
 
 import config
 import database as db
+import keyboards as kb
 import quiz_engine as engine
+import review_pdf
 from keyboards import esc
 
 log = logging.getLogger(__name__)
@@ -294,10 +296,17 @@ async def _finish_locked(app: Application, s: dict, status: str) -> Optional[dic
     quiz = db.get_quiz(done["quiz_id"])
     text = result_text(done, quiz["title"] if quiz else "Quiz", status == "stopped")
     try:
-        for chunk in engine.split_message(text):
-            await app.bot.send_message(done["chat_id"], chunk, parse_mode=ParseMode.HTML)
+        chunks = engine.split_message(text)
+        for i, chunk in enumerate(chunks):
+            await app.bot.send_message(
+                done["chat_id"], chunk, parse_mode=ParseMode.HTML,
+                reply_markup=kb.group_review_markup(done["id"]) if i == len(chunks) - 1 else None)
     except TelegramError as exc:
         log.warning("could not send group result: %s", exc)
+    try:
+        await review_pdf.auto_group_after_finish(app, done)
+    except Exception:                       # noqa: BLE001
+        log.exception("group review PDF hook failed")
     return done
 
 

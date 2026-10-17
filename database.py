@@ -9,6 +9,7 @@ import json
 import logging
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -239,11 +240,34 @@ CREATE TABLE IF NOT EXISTS user_states (
     data_json TEXT DEFAULT '{}',
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+-- one row per delivered "complete review" PDF: prevents duplicate delivery.
+-- attempt_id → private quiz attempt; (session_id,user_id) → group quiz participant.
+CREATE TABLE IF NOT EXISTS review_pdfs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    attempt_id INTEGER,
+    session_id INTEGER,
+    user_id INTEGER NOT NULL,
+    chat_id INTEGER,
+    quiz_id TEXT DEFAULT '',
+    status TEXT DEFAULT 'pending',          -- pending|sent|failed|blocked
+    tries INTEGER DEFAULT 0,
+    bytes INTEGER DEFAULT 0,
+    pages INTEGER DEFAULT 0,
+    message_id INTEGER,
+    error TEXT DEFAULT '',
+    created_ts REAL DEFAULT 0,
+    sent_ts REAL
+);
 """
 
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_questions_quiz ON questions(quiz_id, position);
 CREATE INDEX IF NOT EXISTS idx_attempts_quiz ON attempts(quiz_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_pdfs_attempt ON review_pdfs(attempt_id)
+    WHERE attempt_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_pdfs_group ON review_pdfs(session_id, user_id)
+    WHERE session_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_attempts_user ON attempts(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_attempts_poll ON attempts(cur_poll_id);
 CREATE INDEX IF NOT EXISTS idx_answers_attempt ON answers(attempt_id);
@@ -1044,3 +1068,58 @@ def group_quiz_stats(qid: str) -> dict:
             WHERE s.quiz_id=? AND s.status IN ('finished','stopped')
         """, (qid,)).fetchone()
     return dict(row)
+
+
+# --------------------------------------------------------------- review PDFs
+def review_pdf_get(*, attempt_id: Optional[int] = None, session_id: Optional[int] = None,
+                   user_id: Optional[int] = None) -> Optional[dict]:
+    """The delivery record for a private attempt or a group participant."""
+    with connect() as con:
+        if attempt_id is not None:
+            row = con.execute("SELECT * FROM review_pdfs WHERE attempt_id=?", (int(attempt_id),)).fetchone()
+        elif session_id is not None and user_id is not None:
+            row = con.execute("SELECT * FROM review_pdfs WHERE session_id=? AND user_id=?",
+                              (int(session_id), int(user_id))).fetchone()
+        else:
+            row = None
+    return dict(row) if row else None
+
+
+def review_pdf_save(*, status: str, attempt_id: Optional[int] = None, session_id: Optional[int] = None,
+                    user_id: int, chat_id: Optional[int] = None, quiz_id: str = "",
+                    bytes_: int = 0, pages: int = 0, message_id: Optional[int] = None,
+                    error: str = "", bump: bool = False) -> dict:
+    """Insert/update the delivery record (never raises for a missing row)."""
+    now = time.time()
+    with connect() as con:
+        if attempt_id is not None:
+            row = con.execute("SELECT * FROM review_pdfs WHERE attempt_id=?", (int(attempt_id),)).fetchone()
+        elif session_id is not None:
+            row = con.execute("SELECT * FROM review_pdfs WHERE session_id=? AND user_id=?",
+                              (int(session_id), int(user_id))).fetchone()
+        else:
+            row = None
+        if row is None:
+            cur = con.execute("""
+                INSERT INTO review_pdfs(attempt_id,session_id,user_id,chat_id,quiz_id,status,tries,
+                                        bytes,pages,message_id,error,created_ts,sent_ts)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (attempt_id, session_id, int(user_id), chat_id, quiz_id or "", status,
+                  1 if bump else 0, int(bytes_ or 0), int(pages or 0), message_id, error or "",
+                  now, now if status == "sent" else None))
+            rid = cur.lastrowid
+        else:
+            rid = row["id"]
+            con.execute("""
+                UPDATE review_pdfs SET status=?, chat_id=COALESCE(?,chat_id),
+                       quiz_id=CASE WHEN ?<>'' THEN ? ELSE quiz_id END,
+                       bytes=CASE WHEN ?>0 THEN ? ELSE bytes END,
+                       pages=CASE WHEN ?>0 THEN ? ELSE pages END,
+                       message_id=COALESCE(?,message_id), error=?,
+                       tries=tries+?, sent_ts=CASE WHEN ?='sent' THEN ? ELSE sent_ts END
+                WHERE id=?
+            """, (status, chat_id, quiz_id or "", quiz_id or "", int(bytes_ or 0), int(bytes_ or 0),
+                  int(pages or 0), int(pages or 0), message_id, error or "", 1 if bump else 0,
+                  status, now, rid))
+        row = con.execute("SELECT * FROM review_pdfs WHERE id=?", (rid,)).fetchone()
+    return dict(row) if row else {}

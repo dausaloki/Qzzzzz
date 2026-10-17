@@ -174,6 +174,31 @@ def github_enabled() -> bool:
     return bool(GITHUB_TOKEN and GITHUB_REPO and "/" in GITHUB_REPO)
 
 
+# ---------------------------------------------------------------- HTML import
+# HTML quiz files (.html/.htm) are converted to the bot's normal import text by
+# html_quiz.py and then go through the SAME preview → confirm → create flow.
+# ``1`` restricts HTML import to BACKUP_ADMIN_IDS (the bot's admin list);
+# default 0 keeps HTML import as open as PDF/TXT import already is.
+HTML_IMPORT_ADMIN_ONLY = os.getenv("HTML_IMPORT_ADMIN_ONLY", "0").strip().lower() in ("1", "true", "yes")
+HTML_MAX_BYTES = int(os.getenv("HTML_MAX_BYTES", str(12 * 1024 * 1024)))
+HTML_MAX_NODES = int(os.getenv("HTML_MAX_NODES", "400000"))
+
+# ---------------------------------------------------------------- review PDF
+# Automatic "complete quiz review" PDF sent to the user's private chat after a
+# finished/stopped private quiz (every question, every option, ticks/crosses).
+REVIEW_PDF_ENABLED = os.getenv("REVIEW_PDF_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+REVIEW_PDF_PRIVATE_AUTO = os.getenv("REVIEW_PDF_PRIVATE_AUTO", "1").strip().lower() not in ("0", "false", "no")
+# Group quizzes: participants get the PDF from the "📄 my review PDF" button;
+# set to 1 to also send it automatically to every participant after the result.
+REVIEW_PDF_GROUP_AUTO = os.getenv("REVIEW_PDF_GROUP_AUTO", "0").strip().lower() in ("1", "true", "yes")
+REVIEW_PDF_RETRIES = max(0, int(os.getenv("REVIEW_PDF_RETRIES", "3")))
+# Fonts for the PDF (Devanagari + Latin).  Default: the fonts/ folder in the repo.
+PDF_FONT_DIR = Path(os.getenv("PDF_FONT_DIR", "").strip() or Path(__file__).resolve().parent / "fonts")
+PDF_FONT_DEVANAGARI = "NotoSansDevanagari-Regular.ttf"
+PDF_FONT_LATIN = "DejaVuSans.ttf"
+PDF_FONT_LATIN_BOLD = "DejaVuSans-Bold.ttf"
+
+
 def get_token() -> str:
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:

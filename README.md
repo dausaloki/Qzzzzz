@@ -1,8 +1,9 @@
 # 🎯 Telegram Quiz Bot (QuizBot-style) — Railway ready
 
 A production-ready Telegram quiz bot that works like the official **@QuizBot**:
-create quizzes step by step, import them from **PDF / text**, and play them
-**one question at a time** with Telegram's **native quiz polls**.
+create quizzes step by step, import them from **PDF / text / HTML**, play them
+**one question at a time** with Telegram's **native quiz polls**, and receive a
+**complete review PDF** of every finished quiz.
 
 * Python 3.11+ · python-telegram-bot **22.8** (Bot API 9.6) · SQLite · PyMuPDF · Tesseract OCR (Hindi + English) · long polling
 * Hindi + English. The source text is never guessed, shortened or lost.
@@ -20,6 +21,8 @@ create quizzes step by step, import them from **PDF / text**, and play them
 | Creating a quiz | Conversational, like @QuizBot (no "Step N" screens): `/newquiz` → send the **title** → send a **description** or `/skip` → send questions one after another → `/done`. Every question is **either** one text message (no length limit) with `(A) (B) …` options plus optional `उत्तर: B` / `व्याख्या: …` lines, **or** a quiz poll sent/forwarded to the bot (question, options, correct answer and explanation are captured). Telegram's own poll editor button (with its 300-character "-57" counter) is opt-in via `NATIVE_POLL_BUTTON=1`. If the correct answer is missing (regular poll, forwarded quiz with hidden answer, typed question without `उत्तर:`), the bot asks with buttons — it never guesses. `/undo` removes the last question. No total question limit: when a quiz holds `QUESTIONS_PER_PART` (500) questions the next part (`Title — Part 2`, same settings) is opened automatically. Any other text/photo/video/document sent before a question is **pre-question content of the next question** — it never becomes a question. `/done` needs at least 1 question and opens the management screen. `/cancel` deletes the draft. |
 | Question formats | Normal MCQ, statement based, matching, List-I/List-II, assertion-reason, ordering. Multi-line text is saved exactly as typed. You can paste the question and its options together and the bot detects the options. |
 | PDF / Text import | Text PDFs, **scanned/image PDFs (OCR, Hindi + English)**, PDFs in legacy Hindi fonts (Kruti Dev etc. are OCR'd), **two-column** layouts (read column by column), `.txt` files or pasted text (long text can arrive in several messages) |
+| HTML import | Send an `.html` / `.htm` / `.xhtml` quiz file and it goes through the **same preview → confirm → create** flow as PDF/TXT. Question blocks are found by class names (`question`, `mcq`, `quiz-question`…), by radio/checkbox groups (inside a block **or** as flat `<div><input>…</div>` siblings), by table rows (`question | A | B | C | D | answer`) or, when the page has no structure at all, by the normal text parser on the page text. The correct answer is taken only from an explicit signal — `class="correct"`, `checked` radio, `data-correct`, `Answer: B` / `उत्तर: (B)` text, an `(answer)` cell — a colour-only highlight is imported as a **जाँचें / review** item, and a question with **two** marked answers (multi-answer) is reported as an error because the bot's polls are single-answer. Missing answers become `Answer Not Found`; nothing is ever guessed. Text, Devanagari/English wording, numbering, option order, explanations and section headings (`<h2>भाग-अ`) are preserved exactly; `<script>`/`<style>` are ignored (the bot never re-implements the site's JavaScript, timers or scoring). Progress is shown for large files, malformed markup is rejected with a clear message, and the file is capped by `HTML_MAX_BYTES`. |
+| Review PDF | When a private quiz finishes, the bot sends a **personal PDF of the complete quiz** — every question (correct, incorrect, skipped/timed-out and never-attempted), every option in its original order, your selected option, the verified correct answer, ✓ / ✗ marks, a text label (`CORRECT` / `INCORRECT` / `NOT ATTEMPTED` — readable without colour) and the explanation. The summary page shows quiz name, your name + ID, date/time (IST and UTC), total / attempted / correct / incorrect / unanswered / score / max marks / percentage / negative-marking status, with `correct + incorrect + unanswered = total` verified on the page. Devanagari and Latin text are embedded with real fonts (`fonts/`), so Hindi renders everywhere and the text stays selectable/searchable. Delivery is **private** (never posted in a group), **deduplicated** (`review_pdfs` table; a later `/review` re-sends only when you ask), retried on transient errors (5 s / 20 s / 60 s, `REVIEW_PDF_RETRIES`) and never affects the saved result. If you never pressed Start in the bot's private chat, Telegram refuses the document — the bot then tells you to press **Start** and offers the PDF again. In group quizzes, the result message has a **📄 मेरा Review PDF** button that delivers each participant's own PDF to their private chat. |
 | Options | 2–12 options per question (Telegram's limit, Bot API 9.1+). **(E) and later options are never dropped.** |
 | Numbering | Numbering that restarts per section/page (`भाग-अ 1…100, भाग-ब 1…100`) is detected, with or without headings. Section-wise or combined answer keys are matched to the right section. |
 | Parser | Question markers `प्रश्न 1.` `1.` `1)` `Q1` `Q.1` `Question 1:`. It finds the **real** answer choices even when the question body contains A-D data (matching lists, List-I/II, ordering items, assertion (A)/(R), statements `1. 2. 3.`). |
@@ -44,7 +47,7 @@ create quizzes step by step, import them from **PDF / text**, and play them
 | Persistence | Everything lives in SQLite: users, quizzes, quiz_settings, questions, attempts (including live session state), answers, and the wizard state. Answers to polls sent before a restart are still counted, and timers are re-armed on startup. |
 
 ### Commands
-`/start` `/newquiz` `/myquizzes` `/import` `/stats` `/settings` `/done` `/undo` `/skip` `/stop` `/cancel` `/help` `/quiz <id>`
+`/start` `/newquiz` `/myquizzes` `/import` `/stats` `/settings` `/done` `/undo` `/skip` `/stop` `/cancel` `/help` `/quiz <id>` `/review`
 `/backup [now|verify|sync|restore]` — backup status (admins only, see **🗄️ Automatic backup**)
 
 `/skip` skips the optional step while creating (description / explanation) and skips the current question while playing.
@@ -66,6 +69,9 @@ config.py         env vars, Telegram limits, timer choices, data directory, back
 database.py       SQLite schema, in-place migration from the old schema, all queries
 pdf_extract.py    PDF → text: text layer, column order, garbled/legacy-font detection, OCR (dual-pass verify)
 pdf_parser.py     MCQ parser: formats, sections/restarts, answer keys, per-question errors
+html_quiz.py      HTML quiz → the same ParseResult: question blocks, radio/table/flat layouts,
+                  explicit answer signals only, text fallback, size/node caps
+review_pdf.py     complete quiz review PDF (Report → PDF), delivery, dedupe, retry, group button
 quiz_engine.py    pure logic: shuffle mapping, Telegram-safe poll payloads, lossless splitting
 quiz_creator.py   creation wizard, quiz editor, PDF/Text import flow (state kept in the DB)
 quiz_runner.py    private quiz sessions, PollAnswerHandler, timer, skip/stop, results, restart recovery
@@ -73,11 +79,12 @@ group_runner.py   quizzes inside groups: native non-anonymous quiz polls, per-us
 membership.py     join gate: getChatMember verification, cache, chat_member revocation
 keyboards.py      inline keyboards and help text
 stats.py          statistics formatting
+fonts/            NotoSansDevanagari-Regular + DejaVuSans(+Bold) — embedded into the review PDF
 Dockerfile        python:3.11-slim + pinned Hindi/English OCR models (sha256-checked) — used by Railway
 scripts/          fetch_tessdata.py: downloads the exact OCR models (image build + local tests)
                   backup_tool.py: export / verify / restore quiz_backup.json (admin tool)
 requirements.txt  Procfile  railway.json  .python-version  .dockerignore
-tests/            383 automated tests (parser, OCR, engine, DB, backup, end-to-end bot flows,
+tests/            427 automated tests (parser, OCR, engine, DB, backup, end-to-end bot flows,
                   real startup incl. a live backup run and a restart)
 ```
 
@@ -129,6 +136,14 @@ The `Procfile` (`worker: python bot.py`) is kept for other hosts. If you deploy 
 | `QUESTIONS_PER_PART` | no | `500` | Questions per quiz **part** (not a total limit). Imports of 456 → 1 quiz, 501 → 2 parts, 2378 → 5 parts |
 | `NATIVE_POLL_BUTTON` | no | `0` | `1` shows the “📝 प्रश्न बनाएँ” button that opens Telegram's poll editor (300-char limit) during creation |
 | `MAX_OCR_PAGES` | no | `300` | Upper limit of pages OCR'd per file (the rest is reported) |
+| `HTML_IMPORT_ADMIN_ONLY` | no | `0` | `1` restricts `.html` import to `BACKUP_ADMIN_IDS` (PDF/TXT import stays open) |
+| `HTML_MAX_BYTES` | no | `12582912` | Largest `.html` file accepted (12 MB) |
+| `HTML_MAX_NODES` | no | `400000` | DOM node cap that stops a pathological file from hanging the worker |
+| `REVIEW_PDF_ENABLED` | no | `1` | `0` turns the review PDF off completely |
+| `REVIEW_PDF_PRIVATE_AUTO` | no | `1` | `0` keeps the PDF available via `/review` but stops the automatic send |
+| `REVIEW_PDF_GROUP_AUTO` | no | `0` | `1` also sends every group participant their PDF automatically after the leaderboard (default: the button only) |
+| `REVIEW_PDF_RETRIES` | no | `3` | Retries after a failed delivery (0–3) |
+| `PDF_FONT_DIR` | no | `./fonts` | Folder with the embedded PDF fonts |
 | `TESSDATA_PREFIX` | no | set in Dockerfile | Folder with `*.traineddata` |
 | `TELEGRAM_API_BASE` | no | – | Custom Bot API server URL (for tests / self-hosted Bot API) |
 | `REQUIRED_CHAT` | no | `@kalam_kranti` | Group users must join (`@username` or `-100…` id). **The bot must be a member of this group** (admin for a channel; admin also enables instant revocation via `chat_member`). Empty = gate off |

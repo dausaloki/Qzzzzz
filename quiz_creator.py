@@ -26,6 +26,7 @@ from telegram.ext import ContextTypes
 
 import config
 import database as db
+import html_quiz
 import keyboards as kb
 import pdf_parser
 import quiz_engine as engine
@@ -1086,8 +1087,11 @@ async def handle_edit_message(update: Update, context, state: str, data: dict) -
 
 # ============================================================ IMPORT
 IMPORT_HELP = (
-    "📥 <b>Import PDF/Text</b>\n\n"
-    "<b>PDF</b> (text वाली या scanned — हिंदी/English OCR), <b>.txt</b> file, या सीधे <b>text</b> भेजें।\n\n"
+    "📥 <b>Import PDF/Text/HTML</b>\n\n"
+    "<b>PDF</b> (text वाली या scanned — हिंदी/English OCR), <b>.txt</b> file, <b>.html/.htm</b> quiz "
+    "file, या सीधे <b>text</b> भेजें।\n\n"
+    "• HTML: question blocks, (A)(B)… options, सही उत्तर (<code>checked</code>/class/data-correct/"
+    "<code>Answer: B</code>) और explanation अपने-आप निकाले जाते हैं — फिर वही preview → confirm step।\n"
     "• प्रश्न: <code>प्रश्न 1.</code> / <code>1.</code> / <code>1)</code> / <code>Q1</code> / <code>Q.1</code>\n"
     "• Options: <code>(A) (B) …</code> 2 से 12 तक, (E) भी (matching/assertion/ordering data के बाद आने वाले असली options पहचाने जाते हैं)\n"
     "• Numbering भाग/section में दोबारा 1 से शुरू हो सकती है (भाग-अ, भाग-ब…)\n"
@@ -1111,7 +1115,8 @@ def is_import_document(doc) -> bool:
         return False
     name = (doc.file_name or "").lower()
     mime = (doc.mime_type or "").lower()
-    return name.endswith((".pdf", ".txt")) or mime in ("application/pdf", "text/plain")
+    return (name.endswith((".pdf", ".txt", ".html", ".htm", ".xhtml"))
+            or mime in ("application/pdf", "text/plain", "text/html", "application/xhtml+xml"))
 
 
 async def _safe_edit(msg, text: str) -> None:
@@ -1119,6 +1124,34 @@ async def _safe_edit(msg, text: str) -> None:
         await msg.edit_text(text)
     except TelegramError:
         pass
+
+
+async def _extract_html(update: Update, raw: bytes, status_msg):
+    """HTML bytes → ParseResult (+notes).  Shows progress for large files."""
+    loop = asyncio.get_running_loop()
+    last = [0.0]
+
+    def progress(done: int, total: int) -> None:
+        now = time.monotonic()
+        if now - last[0] < 2.0 or total < 30:
+            return
+        last[0] = now
+        asyncio.run_coroutine_threadsafe(
+            _safe_edit(status_msg, f"🧩 HTML पढ़ा जा रहा है: {done}/{total} question blocks…"), loop)
+
+    try:
+        ex = await asyncio.to_thread(html_quiz.extract, raw, progress)
+    except html_quiz.HtmlError as exc:
+        await status_msg.edit_text(f"❌ {exc}")
+        return None, []
+    except Exception as exc:                     # noqa: BLE001 — malformed file must not crash
+        log.exception("HTML import failed")
+        await status_msg.edit_text(f"❌ HTML पढ़ने में समस्या: {exc}")
+        return None, []
+    notes = list(ex.notes)
+    if ex.structural:
+        notes.insert(0, f"HTML: {ex.questions} question blocks मिले, {ex.with_answer} में उत्तर स्पष्ट था।")
+    return ex.result, notes
 
 
 async def handle_import_document(update: Update, context) -> None:
@@ -1130,11 +1163,22 @@ async def handle_import_document(update: Update, context) -> None:
         return
     name = doc.file_name or "source"
     is_pdf = name.lower().endswith(".pdf") or (doc.mime_type or "") == "application/pdf"
+    is_html = html_quiz.looks_like_html(name, doc.mime_type or "")
+    if is_html and config.HTML_IMPORT_ADMIN_ONLY and user.id not in config.BACKUP_ADMIN_IDS:
+        await msg.reply_text("🔒 HTML import केवल administrator के लिए है। PDF/.txt import पहले की तरह खुला है।")
+        return
     status = await msg.reply_text("⏳ File पढ़ी जा रही है…")
     default_title = (msg.caption or "").strip() or Path(name).stem[:TITLE_MAX] or "Imported Quiz"
     try:
         tg_file = await doc.get_file()
         raw = bytes(await tg_file.download_as_bytearray())
+        if is_html:
+            res, hnotes = await _extract_html(update, raw, status)
+            if res is None:
+                return
+            await _parse_and_review(update, user.id, "", default_title, status_msg=status, res=res,
+                                    notes=hnotes, source="html")
+            return
         if is_pdf:
             loop = asyncio.get_running_loop()
             last = [0.0]
@@ -1294,7 +1338,8 @@ def _preview_lines(q: dict) -> list[str]:
 
 
 async def _parse_and_review(update: Update, user_id: int, text: str, default_title: str,
-                            status_msg=None, parts: int = 0, res=None) -> None:
+                            status_msg=None, parts: int = 0, res=None,
+                            notes: Optional[list] = None, source: str = "import") -> None:
     if res is None:
         try:
             res = await asyncio.to_thread(pdf_parser.parse_source, text)
@@ -1305,7 +1350,8 @@ async def _parse_and_review(update: Update, user_id: int, text: str, default_tit
     report = pdf_parser.import_report(res)
     data = {"buffer": text if parts else "", "parts": parts, "default_title": default_title,
             "questions": questions, "errors": [str(e) for e in res.errors],
-            "review": list(res.review), "report": report}
+            "review": list(res.review), "report": report, "source": source,
+            "notes": list(notes or [])}
     db.set_state(user_id, "imp_review", data)
 
     n, ne = len(questions), len(res.errors)
@@ -1334,6 +1380,8 @@ async def _parse_and_review(update: Update, user_id: int, text: str, default_tit
                     ", ".join(f"{_REMOVED_NAMES.get(k, k)}: {v}" for k, v in removed.items()))
     for w in res.warnings:
         head.append(f"⚠️ {esc(w)}")
+    for note in (notes or []):
+        head.append(f"🧩 {esc(note)}")
     if res.review:
         head += ["", "🔎 <b>Import से पहले जांचें:</b>"] + [f"• {esc(r)}" for r in res.review]
 
@@ -1447,7 +1495,8 @@ async def _create_imported(update: Update, user_id: int, data: dict, title: str)
     try:
         for part, chunk in enumerate(chunks, 1):
             t = title if len(chunks) == 1 else part_title(title, part)
-            qid = db.new_quiz(user_id, t, "Imported from PDF/Text", status="ready", source="import")
+            qid = db.new_quiz(user_id, t, "Imported from PDF/Text/HTML", status="ready",
+                              source=data.get("source") or "import")
             created.append(qid)
             if len(chunks) > 1:
                 db.set_part(qid, created[0], part)

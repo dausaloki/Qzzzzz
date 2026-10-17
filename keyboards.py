@@ -227,6 +227,11 @@ def result_markup(qid: str, next_part: Optional[dict] = None) -> M:
     return M(rows)
 
 
+def group_review_markup(session_id: int) -> M:
+    """Result message of a group quiz: each participant can fetch their own PDF."""
+    return M([[B("📄 मेरा Review PDF (private)", callback_data=f"p:g:{session_id}")]])
+
+
 def running_markup() -> M:
     return M([[B("⏭ Skip", callback_data="r:skip"), B("⏹ Stop", callback_data="r:stop")]])
 
@@ -259,6 +264,7 @@ HELP_TEXT = (
     "/undo — creation में आख़िरी प्रश्न हटाएँ\n"
     "/skip — optional step (description/explanation) या चल रहा प्रश्न skip करें\n"
     "/stop — चल रहा quiz रोकें (partial result save)\n"
+    "/review — पिछले quiz का पूरा Review PDF फिर भेजें\n"
     "/cancel — creation/import रद्द करें\n\n"
     "<b>Quiz बनाना</b>\n"
     "/newquiz → नाम → description (/skip) → प्रश्न भेजते जाएँ → /done. प्रश्नों की कोई "
@@ -270,8 +276,10 @@ HELP_TEXT = (
     "प्रश्न से पहले कोई text/photo/video भेजें तो वह अगले प्रश्न से पहले दिखाया जाएगा।\n\n"
     "Question में statement, matching, List-I/List-II, assertion-reason, ordering — "
     "कुछ भी multi-line लिख सकते हैं; text exactly वैसा ही save होता है।\n\n"
-    "<b>PDF/Text Import</b>\n"
-    "PDF (text वाली या scanned — OCR हिंदी+English), .txt file या text भेजें। प्रश्न 'प्रश्न 1.', "
+    "<b>PDF/Text/HTML Import</b>\n"
+    "PDF (text वाली या scanned — OCR हिंदी+English), .txt file, .html/.htm quiz file या text भेजें। "
+    "HTML में question blocks, options, सही उत्तर (checked / class / data-correct / 'Answer: B') और "
+    "explanation अपने-आप निकाले जाते हैं, फिर वही preview → confirm। प्रश्न 'प्रश्न 1.', "
     "'1.', '1)', 'Q1', 'Q.1' से, options (A)/(B)/… (2 से 12) में, और उत्तर 'उत्तर: (A)' / "
     "'Answer: B' या answer-key section में होना चाहिए। Numbering भाग/section में दोबारा 1 से "
     "शुरू हो सकती है; दो-column PDF column-wise पढ़ी जाती है। "

@@ -18,6 +18,7 @@ from telegram.ext import Application, ContextTypes
 
 import config
 import database as db
+import review_pdf
 import group_runner
 import keyboards as kb
 import quiz_engine as engine
@@ -387,6 +388,12 @@ async def _finish_locked(app: Application, att: dict, status: str) -> Optional[d
                                    parse_mode=ParseMode.HTML, reply_markup=kb.result_markup(done["quiz_id"], db.next_part(done["quiz_id"])))
     except TelegramError as exc:
         log.warning("could not send result: %s", exc)
+    # Complete review PDF (every question), sent right after the existing result.
+    # Guarded: a PDF problem can never affect the result that was already saved.
+    try:
+        await review_pdf.auto_after_finish(app, done)
+    except Exception:                       # noqa: BLE001
+        log.exception("review PDF hook failed")
     return done
 
 

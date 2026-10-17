@@ -33,6 +33,7 @@ import keyboards as kb
 import membership
 import quiz_creator as creator
 import quiz_engine as engine
+import review_pdf
 import quiz_runner as runner
 import stats as st
 from keyboards import esc
@@ -413,6 +414,28 @@ async def backup_cmd(update: Update, context) -> None:
     await chat.send_message(BACKUP_HELP, parse_mode=ParseMode.HTML)
 
 
+async def review_cmd(update: Update, context) -> None:
+    """/review — re-send the complete review PDF of the last finished quiz (explicit request)."""
+    if not is_private(update):
+        await update.effective_chat.send_message(
+            "📄 Review PDF private chat में भेजा जाता है — bot को private में /review भेजें।")
+        return
+    user = update.effective_user
+    att = review_pdf.last_attempt_for(user.id)
+    if not att:
+        await update.effective_chat.send_message("ℹ️ अभी कोई पूरा हुआ quiz नहीं मिला — पहले एक quiz खेलें।")
+        return
+    status = await update.effective_chat.send_message("⏳ आपका Review PDF बन रहा है…")
+    res = await review_pdf.deliver_attempt(context.bot, att, force=True, reason="command")
+    try:
+        await status.delete()
+    except TelegramError:
+        pass
+    if not res.get("ok"):
+        await update.effective_chat.send_message(
+            "❌ Review PDF नहीं भेजा जा सका। कृपया थोड़ी देर बाद /review दोबारा भेजें।")
+
+
 async def quiz_cmd(update: Update, context) -> None:
     """/quiz <id> — in groups shows a Start Privately card; in private starts it."""
     qid = context.args[0] if context.args else None
@@ -525,6 +548,24 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
     db.upsert_user(user)
     prefix = data.split(":", 1)[0]
+
+    if prefix == "p":
+        # 📄 my complete review PDF — always delivered to the *requesting* user's own chat
+        parts = data.split(":")
+        if len(parts) >= 3 and parts[1] == "g" and parts[2].isdigit():
+            await q.answer("⏳ आपका PDF बन रहा है…")
+            res = await review_pdf.deliver_group_member(context.bot, int(parts[2]), user.id, force=True,
+                                                        reason="button")
+            if res.get("ok"):
+                pass                      # the PDF itself was just delivered with its caption
+            elif res.get("blocked"):
+                await q.answer("⚠️ पहले bot को private में /start भेजें, फिर यह 📄 button दोबारा दबाएँ।",
+                               show_alert=True)
+            else:
+                await q.answer("❌ PDF नहीं भेजा जा सका — थोड़ी देर बाद दोबारा दबाएँ।", show_alert=True)
+        else:
+            await q.answer()
+        return
 
     if not is_private(update):
         parts = data.split(":")
@@ -769,6 +810,7 @@ BOT_COMMANDS = [
     BotCommand("undo", "आख़िरी प्रश्न हटाएँ (creation)"),
     BotCommand("skip", "Skip (प्रश्न / optional step)"), BotCommand("stop", "Quiz रोकें"),
     BotCommand("cancel", "रद्द करें"), BotCommand("help", "Help"),
+    BotCommand("review", "Review PDF (पिछला quiz)"),
     BotCommand("backup", "Backup status (admin)"),
 ]
 
@@ -841,6 +883,7 @@ def build_application(token: str, request=None, get_updates_request=None, rate_l
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("skip", skip_cmd))
     app.add_handler(CommandHandler("quiz", quiz_cmd))
+    app.add_handler(CommandHandler("review", review_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(PollAnswerHandler(runner.handle_poll_answer))

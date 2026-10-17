@@ -65,9 +65,11 @@ _TABLES: dict[str, str] = {
     "group_polls": "ORDER BY session_id, q_index",
     "group_answers": "ORDER BY session_id, q_index, id",
     "user_states": "ORDER BY user_id",          # wizard + pending-review state
+    "review_pdfs": "ORDER BY id",               # review-PDF delivery records (dedupe/retry)
 }
 _RESTORE_ORDER = ["users", "quizzes", "quiz_settings", "questions", "attempts",
-                  "answers", "group_sessions", "group_polls", "group_answers", "user_states"]
+                  "answers", "group_sessions", "group_polls", "group_answers", "user_states",
+                  "review_pdfs"]
 # Never exported, whatever happens (secrets / credentials).
 _FORBIDDEN_KEYS = {"token", "bot_token", "password", "secret", "api_key", "api_hash", "github_token"}
 
@@ -270,6 +272,7 @@ def build_payload(now: Optional[float] = None) -> dict:
         "group_sessions": sessions,
         "users": tables["users"],
         "pending_states": tables["user_states"],
+        "review_pdfs": tables["review_pdfs"],
     }
 
 
@@ -397,6 +400,7 @@ def validate_payload(data: dict) -> list[str]:
                   ("attempts", len(data.get("attempts") or [])),
                   ("answers", sum(len(a.get("answers") or []) for a in data.get("attempts") or [])),
                   ("group_sessions", len(data.get("group_sessions") or [])),
+                  ("review_pdfs", len(data.get("review_pdfs") or [])),
                   ("users", len(data.get("users") or []))]
         for key, actual in checks:
             if counts.get(key) != actual:
@@ -819,6 +823,7 @@ def restore_payload(data: dict, db_file: Optional[Path] = None, apply: bool = Fa
         rows["group_polls"] = [p for s in data.get("group_sessions") or [] for p in s.get("polls") or []]
         rows["group_answers"] = [a for s in data.get("group_sessions") or [] for a in s.get("answers") or []]
         rows["user_states"] = list(data.get("pending_states") or [])
+        rows["review_pdfs"] = list(data.get("review_pdfs") or [])
 
         names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         schema_missing = "quizzes" not in names
