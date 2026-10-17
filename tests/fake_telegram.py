@@ -59,6 +59,7 @@ class FakeTelegram(BaseRequest):
         self.conflicts_left = 0                   # getUpdates → 409 this many times
         self.get_updates_calls = 0
         self.fail_next: dict[str, str] = {}       # method -> error description (once)
+        self.fail_code: dict[str, int] = {}       # method -> HTTP status for that error (default 400)
         self.rejections: list[tuple[str, str]] = []  # (method, description) of every real 4xx
         self.inline_answers: list[dict] = []      # answerInlineQuery payloads
         # getChatMember: (chat_id as sent, user_id) -> status / member dict
@@ -97,7 +98,8 @@ class FakeTelegram(BaseRequest):
             self.uploads.append((api, params, files))
         if api in self.fail_next:
             desc = self.fail_next.pop(api)
-            return 400, json.dumps({"ok": False, "error_code": 400, "description": desc}).encode()
+            code = int(self.fail_code.pop(api, 400))
+            return code, json.dumps({"ok": False, "error_code": code, "description": desc}).encode()
         try:
             result = await self._dispatch(api, params)
         except _ApiError as exc:
