@@ -20,8 +20,9 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 COPY . .
 
-# Build fails here if OCR would not work at runtime.
+# Build fails here if OCR or Hindi Review PDF rendering would not work at runtime.
 RUN python -c "import pdf_extract as X; ok, info = X.ocr_status(); print('OCR:', ok, info); assert ok, info"
+RUN python -c "import review_pdf as R; ok, info = R.pdf_font_status(); print('PDF_FONTS:', ok, info); assert ok, info"
 
 # Exec form: python is PID 1 and receives Railway's SIGTERM directly
 # (python-telegram-bot then stops polling cleanly).  railway.json's
