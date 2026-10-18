@@ -412,15 +412,15 @@ def test_group_button_sends_the_pdf_privately_to_the_asking_member():
 
 
 def test_group_auto_off_by_default_but_button_is_always_there(monkeypatch):
-    # a group question closes when its timer runs out, so keep it short like the
-    # existing group tests do (the timer itself is covered by test_round5)
+    # Test both default automatic private PDF delivery to group participants
+    # (REVIEW_PDF_GROUP_AUTO=True) and explicit opt-out (REVIEW_PDF_GROUP_AUTO=False).
     monkeypatch.setattr(config, "GROUP_DEFAULT_TIMER", 1)
     monkeypatch.setattr(config, "GROUP_NEXT_DELAY", 0.05)
 
     async def t():
         async with Harness() as h:
             qid = make_quiz(owner=510, n=2, timer=0, title="Group Result")
-            u = h.f.user(510)
+            u = h.f.user(510, "Ramesh", "ramesh")
             await h.text(u, f"/start@TestQuizBot quiz_{qid}", chat_id=G1)
             await h.cb(u, f"g:go:{qid}", chat_id=G1)
             for i in range(2):
@@ -428,13 +428,27 @@ def test_group_auto_off_by_default_but_button_is_always_there(monkeypatch):
                 pid, poll = h.polls_for(G1)[-1]
                 await h.send(h.f.poll_answer(u, pid, poll["correct_option_id"]))
             await h.wait(lambda: "🏆" in h.all_text(G1), msg="group result")
+            await h.wait(lambda: h.api.sent("sendDocument", 510), msg="auto private PDF")
             with db.connect() as con:
                 sid = con.execute("SELECT id FROM group_sessions WHERE chat_id=? ORDER BY id DESC",
                                   (G1,)).fetchone()[0]
             marked = [m for m in h.api.sent("sendMessage", G1) if m.get("reply_markup")]
             cbs = [b.get("callback_data") for m in marked for b in buttons(m["reply_markup"])]
             assert f"p:g:{sid}" in cbs
-            assert h.api.sent("sendDocument") == []          # REVIEW_PDF_GROUP_AUTO default 0
+            assert h.api.sent("sendDocument", G1) == []      # never posted publicly in group
+            assert len(h.api.sent("sendDocument", 510)) == 1 # delivered privately to participant
+
+            # When REVIEW_PDF_GROUP_AUTO is disabled, only the button sends it
+            monkeypatch.setattr(config, "REVIEW_PDF_GROUP_AUTO", False)
+            u2 = h.f.user(515, "Sita", "sita")
+            await h.text(u2, f"/start@TestQuizBot quiz_{qid}", chat_id=-1002)
+            await h.cb(u2, f"g:go:{qid}", chat_id=-1002)
+            for i in range(2):
+                await h.wait(lambda: len(h.polls_for(-1002)) == i + 1)
+                pid, poll = h.polls_for(-1002)[-1]
+                await h.send(h.f.poll_answer(u2, pid, poll["correct_option_id"]))
+            await h.wait(lambda: "🏆" in h.all_text(-1002), msg="group 2 result")
+            assert h.api.sent("sendDocument", 515) == []
 
     run(t())
 
@@ -637,4 +651,127 @@ def test_pdf_font_status_self_check():
     ok, info = review_pdf.pdf_font_status()
     assert ok, info
     assert "dev=" in info and "embedded=" in info
+
+
+def test_38_question_attempt_retrieves_all_answers_and_recovers_from_empty_session():
+    """Verify a 38-question quiz records and retrieves all answers accurately,
+    and never returns an all-unanswered report if an empty duplicate session is created."""
+    qid = make_quiz(owner=801, n=38, timer=30, title="राजस्थान परीक्षा 38 प्रश्न")
+    qs = db.get_questions(qid)
+    assert len(qs) == 38
+
+    # User 801 answers 25 correctly, 8 wrongly, and leaves 5 unanswered/skipped
+    ans_spec = []
+    for i in range(25):
+        ans_spec.append(("correct", qs[i]["correct_index"]))
+    for i in range(25, 33):
+        wrong_choice = (qs[i]["correct_index"] + 1) % len(qs[i]["options"])
+        ans_spec.append(("wrong", wrong_choice))
+    for i in range(33, 36):
+        ans_spec.append(("skipped", None))
+
+    att_answered = _finished_attempt(qid, uid=801, answers=ans_spec)
+    rep1 = review_pdf.report_for_attempt(att_answered)
+    assert rep1.total == 38
+    assert rep1.attempted == 33
+    assert rep1.correct == 25
+    assert rep1.incorrect == 8
+    assert rep1.unanswered == 5
+    assert rep1.score == 25
+    assert rep1.max_score == 38
+    assert rep1.consistent
+
+    # Now simulate an accidental empty stopped attempt created right afterward on the same quiz
+    empty_aid = db.create_attempt(qid, 801, 801, [q["id"] for q in qs], 30, False, 2_000_000.0)
+    empty_att = db.finish_attempt(empty_aid, "stopped", 1.0)
+    rep_recovered = review_pdf.report_for_attempt(empty_att)
+    assert rep_recovered.total == 38
+    assert rep_recovered.attempted == 33
+    assert rep_recovered.correct == 25
+    assert rep_recovered.incorrect == 8
+    assert rep_recovered.unanswered == 5
+    assert review_pdf.last_attempt_for(801)["id"] == att_answered["id"]
+
+
+def test_owner_branding_clickable_links_and_watermark_on_every_page():
+    """Verify exact owner branding, clickable https://t.me/kalam_kranti link annotation
+    in the footer of every page, and the exact uploaded group DP watermark on every page."""
+    import hashlib
+    import fitz
+
+    db.upsert_user(type("U", (), {"id": 802, "username": "rahul_p", "first_name": "राहुल"})())
+    qid = make_quiz(owner=802, n=18, timer=30, title="Branding & Watermark Multi-Page Test")
+    qs = db.get_questions(qid)
+    att = _finished_attempt(
+        qid, uid=802,
+        answers=[("correct", qs[0]["correct_index"]), ("wrong", (qs[1]["correct_index"] + 1) % 4)],
+    )
+    rep = review_pdf.report_for_attempt(att)
+    pdf, pages = review_pdf.render_report(rep)
+    assert pages >= 2
+
+    doc = fitz.open(stream=pdf, filetype="pdf")
+    assert len(doc) == pages
+    full_text = "\n".join(page.get_text() for page in doc)
+
+    # Feature 3: Exact Owner Branding + separate participant label
+    assert "Quiz Bot Owner: LOKESH DAUSA" in full_text
+    assert "Telegram Username: @LOKESH_DAUSA" in full_text
+    assert "Official Telegram Group: https://t.me/kalam_kranti" in full_text
+    assert "राहुल (@rahul_p) · ID 802" in full_text
+
+    # Feature 4 & 5: Every page has clickable link annotation AND exact watermark image
+    expected_sha = "804a55ef7eff62d8a3b42126939851bf6931c548fd17bbbe0378bfbe811240ef"
+    asset_bytes = (review_pdf.Path(review_pdf.__file__).resolve().parent / "assets" / "group_dp_watermark.jpg").read_bytes()
+    assert hashlib.sha256(asset_bytes).hexdigest() == expected_sha
+
+    for pno, page in enumerate(doc, 1):
+        ptxt = page.get_text()
+        assert f"Page {pno}/{pages}" in ptxt
+        assert "https://t.me/kalam_kranti" in ptxt
+
+        links = page.get_links()
+        footer_links = [
+            lnk for lnk in links
+            if lnk.get("kind") == fitz.LINK_URI
+            and lnk.get("uri") == "https://t.me/kalam_kranti"
+            and lnk.get("from").y0 >= 800.0
+        ]
+        assert len(footer_links) >= 1, f"page {pno} missing footer link: {links}"
+
+        imgs = page.get_images(full=True)
+        assert len(imgs) >= 1, f"page {pno} missing watermark image"
+        xref, smask = imgs[0][0], imgs[0][1]
+        assert smask > 0, f"page {pno} watermark missing soft-mask opacity"
+        ext = doc.extract_image(xref)
+        assert hashlib.sha256(ext["image"]).hexdigest() == expected_sha
+        assert ext["width"] == 1536 and ext["height"] == 1536
+    doc.close()
+
+
+def test_review_command_delivers_latest_group_session_pdf():
+    """Verify /review in private chat delivers the user's completed group quiz PDF
+    even when the user only participated in a group quiz."""
+    async def t():
+        async with Harness() as h:
+            qid = _quiz_with_questions(owner=803, n=3, title="Group Review Cmd Quiz")
+            qs = db.get_questions(qid)
+            sid = db.create_group_session(qid, G1, 803, [q["id"] for q in qs], 30, False, 1_500_000.0)
+            wrong_idx = (qs[1]["correct_index"] + 1) % len(qs[1]["options"])
+            db.record_group_answer(sid, qid, G1, "gp1", qs[0]["id"], 0, 804, 0, qs[0]["correct_index"], True, 1.0, 1_500_001.0)
+            db.record_group_answer(sid, qid, G1, "gp2", qs[1]["id"], 1, 804, 0, wrong_idx, False, 1.2, 1_500_002.0)
+            db.finish_group_session(sid, "finished", 1_500_010.0)
+
+            u = h.f.user(804, "Kिरण", "kiran")
+            await h.text(u, "/review")
+            await h.wait(lambda: h.api.sent("sendDocument", 804), msg="group review PDF via /review")
+            docs = h.api.sent("sendDocument", 804)
+            assert len(docs) == 1
+            assert "1/3" in docs[0]["caption"]
+            pdf_bytes = [f for a, p, f in h.api.uploads if a == "sendDocument"][-1]["document"][1]
+            txt = _pdf_text(pdf_bytes)
+            assert "Quiz Bot Owner: LOKESH DAUSA" in txt
+            assert "https://t.me/kalam_kranti" in txt
+
+    run(t())
 
