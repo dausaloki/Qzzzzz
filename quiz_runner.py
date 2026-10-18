@@ -129,7 +129,12 @@ async def start_quiz(app: Application, user, chat_id: int, qid: str, chat_type: 
                 and old["quiz_id"] == qid:
             return None                      # double tap on the same Start button
         if old:
-            await _stop_locked(app, old, notify=True, reason="नया quiz शुरू करने पर पिछला quiz रोक दिया गया।")
+            had_answers = bool((old.get("correct") or 0) + (old.get("wrong") or 0) > 0)
+            await _stop_locked(
+                app, old, notify=True,
+                reason="नया quiz शुरू करने पर पिछला quiz रोक दिया गया।",
+                auto_pdf=had_answers,
+            )
         order = engine.build_order([q["id"] for q in questions], bool(quiz["shuffle_questions"]))
         attempt_id = db.create_attempt(qid, user.id, chat_id, order, int(quiz["timer"] or 0),
                                        bool(quiz["shuffle_options"]), time.time(), start_msg_id)
@@ -259,37 +264,37 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if not ans.option_ids:  # vote retracted (not possible for quizzes, but be safe)
         return
-    att = db.get_attempt_by_poll(ans.poll_id)
-    if not att:
-        # not a private session → maybe a poll of a group quiz session
-        await group_runner.handle_group_answer(update, context)
-        return
-    if att["user_id"] != ans.user.id:
-        return  # someone else's poll
     app = context.application
     async with user_lock(ans.user.id):
-        att = db.get_attempt(att["id"])
-        if not att or att["status"] != "active" or att.get("cur_poll_id") != ans.poll_id:
+        att = db.get_attempt_by_poll(ans.poll_id)
+        if att and att["user_id"] == ans.user.id:
+            att = db.get_attempt(att["id"])
+            if not att or att["status"] != "active" or att.get("cur_poll_id") != ans.poll_id:
+                return
+            _cancel_jobs(app, att["id"], ("timeout",))
+            chosen = ans.option_ids[0]
+            perm = att.get("cur_perm") or [0, 1, 2, 3]
+            if not 0 <= chosen < len(perm):
+                return
+            is_correct = chosen == att["cur_correct"]
+            elapsed = time.time() - (att.get("cur_sent_ts") or time.time())
+            post_expl = att.get("cur_post_explanation") or ""
+            db.record_answer(att["id"], att["cur_question_id"], att["current_index"],
+                             engine.original_choice(perm, chosen), is_correct,
+                             "correct" if is_correct else "wrong", elapsed)
+            if post_expl:
+                try:
+                    await _send_text(context.bot, att["chat_id"],
+                                     ("✅ सही!" if is_correct else "❌ गलत।") + "\n💡 Explanation:\n" + post_expl)
+                except TelegramError as exc:
+                    log.warning("could not send explanation: %s", exc)
+            _schedule(app, "next", att["id"], config.NEXT_QUESTION_DELAY,
+                      {"attempt_id": att["id"], "index": att["current_index"] + 1, "user_id": att["user_id"]})
             return
-        _cancel_jobs(app, att["id"], ("timeout",))
-        chosen = ans.option_ids[0]
-        perm = att.get("cur_perm") or [0, 1, 2, 3]
-        if not 0 <= chosen < len(perm):
-            return
-        is_correct = chosen == att["cur_correct"]
-        elapsed = time.time() - (att.get("cur_sent_ts") or time.time())
-        post_expl = att.get("cur_post_explanation") or ""
-        db.record_answer(att["id"], att["cur_question_id"], att["current_index"],
-                         engine.original_choice(perm, chosen), is_correct,
-                         "correct" if is_correct else "wrong", elapsed)
-        if post_expl:
-            try:
-                await _send_text(context.bot, att["chat_id"],
-                                 ("✅ सही!" if is_correct else "❌ गलत।") + "\n💡 Explanation:\n" + post_expl)
-            except TelegramError as exc:
-                log.warning("could not send explanation: %s", exc)
-        _schedule(app, "next", att["id"], config.NEXT_QUESTION_DELAY,
-                  {"attempt_id": att["id"], "index": att["current_index"] + 1, "user_id": att["user_id"]})
+    if att and att["user_id"] != ans.user.id:
+        return  # someone else's poll
+    # not a private session → maybe a poll of a group quiz session
+    await group_runner.handle_group_answer(update, context)
 
 
 async def _next_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -375,7 +380,7 @@ def result_text(att: dict, quiz_title: str, stopped: bool) -> str:
     return "\n".join(lines)
 
 
-async def _finish_locked(app: Application, att: dict, status: str) -> Optional[dict]:
+async def _finish_locked(app: Application, att: dict, status: str, *, auto_pdf: bool = True) -> Optional[dict]:
     _cancel_jobs(app, att["id"])
     duration = time.time() - (att.get("started_ts") or time.time())
     done = db.finish_attempt(att["id"], status, duration)
@@ -390,14 +395,16 @@ async def _finish_locked(app: Application, att: dict, status: str) -> Optional[d
         log.warning("could not send result: %s", exc)
     # Complete review PDF (every question), sent right after the existing result.
     # Guarded: a PDF problem can never affect the result that was already saved.
-    try:
-        await review_pdf.auto_after_finish(app, done)
-    except Exception:                       # noqa: BLE001
-        log.exception("review PDF hook failed")
+    if auto_pdf:
+        try:
+            await review_pdf.auto_after_finish(app, done)
+        except Exception:                       # noqa: BLE001
+            log.exception("review PDF hook failed")
     return done
 
 
-async def _stop_locked(app: Application, att: dict, notify: bool = True, reason: str = "") -> Optional[dict]:
+async def _stop_locked(app: Application, att: dict, notify: bool = True, reason: str = "",
+                       *, auto_pdf: bool = True) -> Optional[dict]:
     _cancel_jobs(app, att["id"])
     if att.get("cur_message_id"):
         try:
@@ -409,7 +416,7 @@ async def _stop_locked(app: Application, att: dict, notify: bool = True, reason:
             await app.bot.send_message(att["chat_id"], reason)
         except TelegramError:
             pass
-    return await _finish_locked(app, att, status="stopped")
+    return await _finish_locked(app, att, status="stopped", auto_pdf=auto_pdf)
 
 
 async def stop_quiz(app: Application, user_id: int) -> Optional[dict]:

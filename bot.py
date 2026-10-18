@@ -421,12 +421,12 @@ async def review_cmd(update: Update, context) -> None:
             "📄 Review PDF private chat में भेजा जाता है — bot को private में /review भेजें।")
         return
     user = update.effective_user
-    att = review_pdf.last_attempt_for(user.id)
-    if not att:
+    target = review_pdf.last_review_target_for(user.id)
+    if not target:
         await update.effective_chat.send_message("ℹ️ अभी कोई पूरा हुआ quiz नहीं मिला — पहले एक quiz खेलें।")
         return
     status = await update.effective_chat.send_message("⏳ आपका Review PDF बन रहा है…")
-    res = await review_pdf.deliver_attempt(context.bot, att, force=True, reason="command")
+    res = await review_pdf.deliver_latest_review(context.bot, user.id, target=target)
     try:
         await status.delete()
     except TelegramError:

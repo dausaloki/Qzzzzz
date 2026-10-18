@@ -1059,6 +1059,75 @@ def get_group_answers(session_id: int) -> list[dict]:
             "SELECT * FROM group_answers WHERE session_id=? ORDER BY q_index, user_id", (session_id,))]
 
 
+def latest_answered_attempt(user_id: int, quiz_id: Optional[str] = None) -> Optional[dict]:
+    """Most recent finished/stopped private attempt for ``user_id`` (optionally
+    for ``quiz_id``) that actually has recorded user answers."""
+    with connect() as con:
+        if quiz_id:
+            row = con.execute("""
+                SELECT a.* FROM attempts a
+                WHERE a.user_id=? AND a.quiz_id=? AND a.status IN ('finished','stopped')
+                  AND (a.correct + a.wrong > 0
+                       OR EXISTS (SELECT 1 FROM answers ans
+                                  WHERE ans.attempt_id=a.id AND ans.chosen_index IS NOT NULL))
+                ORDER BY a.id DESC LIMIT 1
+            """, (int(user_id), str(quiz_id))).fetchone()
+        else:
+            row = con.execute("""
+                SELECT a.* FROM attempts a
+                WHERE a.user_id=? AND a.status IN ('finished','stopped')
+                  AND (a.correct + a.wrong > 0
+                       OR EXISTS (SELECT 1 FROM answers ans
+                                  WHERE ans.attempt_id=a.id AND ans.chosen_index IS NOT NULL))
+                ORDER BY a.id DESC LIMIT 1
+            """, (int(user_id),)).fetchone()
+    return _attempt_row(row)
+
+
+def latest_answered_group_session(user_id: int, quiz_id: Optional[str] = None) -> Optional[dict]:
+    """Most recent group session where ``user_id`` has recorded answers in ``group_answers``."""
+    with connect() as con:
+        if quiz_id:
+            row = con.execute("""
+                SELECT s.* FROM group_sessions s
+                WHERE s.quiz_id=? AND EXISTS (
+                    SELECT 1 FROM group_answers ga
+                    WHERE ga.session_id=s.id AND ga.user_id=?
+                )
+                ORDER BY CASE WHEN s.status IN ('finished','stopped') THEN 0 ELSE 1 END, s.id DESC
+                LIMIT 1
+            """, (str(quiz_id), int(user_id))).fetchone()
+        else:
+            row = con.execute("""
+                SELECT s.* FROM group_sessions s
+                WHERE s.status IN ('finished','stopped') AND EXISTS (
+                    SELECT 1 FROM group_answers ga
+                    WHERE ga.session_id=s.id AND ga.user_id=?
+                )
+                ORDER BY s.id DESC LIMIT 1
+            """, (int(user_id),)).fetchone()
+    return _gs_row(row)
+
+
+def user_group_history(user_id: int, limit: int = 10) -> list[dict]:
+    """Finished/stopped group sessions where ``user_id`` participated or started."""
+    with connect() as con:
+        rows = con.execute("""
+            SELECT s.*, q.title AS quiz_title,
+                   (SELECT COUNT(*) FROM group_answers ga
+                    WHERE ga.session_id=s.id AND ga.user_id=?) AS user_answered
+            FROM group_sessions s
+            LEFT JOIN quizzes q ON q.id=s.quiz_id
+            WHERE s.status IN ('finished','stopped')
+              AND (s.started_by=? OR EXISTS (
+                  SELECT 1 FROM group_answers ga WHERE ga.session_id=s.id AND ga.user_id=?
+              ))
+            ORDER BY CASE WHEN user_answered > 0 THEN 0 ELSE 1 END, s.id DESC
+            LIMIT ?
+        """, (int(user_id), int(user_id), int(user_id), int(limit))).fetchall()
+    return [_gs_row(r) for r in rows if r]
+
+
 def group_quiz_stats(qid: str) -> dict:
     with connect() as con:
         row = con.execute("""

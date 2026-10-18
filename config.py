@@ -185,18 +185,28 @@ HTML_MAX_NODES = int(os.getenv("HTML_MAX_NODES", "400000"))
 
 # ---------------------------------------------------------------- review PDF
 # Automatic "complete quiz review" PDF sent to the user's private chat after a
-# finished/stopped private quiz (every question, every option, ticks/crosses).
+# finished/stopped private or group quiz (every question, every option, ticks/crosses).
 REVIEW_PDF_ENABLED = os.getenv("REVIEW_PDF_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 REVIEW_PDF_PRIVATE_AUTO = os.getenv("REVIEW_PDF_PRIVATE_AUTO", "1").strip().lower() not in ("0", "false", "no")
-# Group quizzes: participants get the PDF from the "📄 my review PDF" button;
-# set to 1 to also send it automatically to every participant after the result.
-REVIEW_PDF_GROUP_AUTO = os.getenv("REVIEW_PDF_GROUP_AUTO", "0").strip().lower() in ("1", "true", "yes")
+# Group quizzes: automatically send each participant their personalized review PDF
+# privately after the quiz finishes (and also offer the "📄 मेरा Review PDF" button).
+REVIEW_PDF_GROUP_AUTO = os.getenv("REVIEW_PDF_GROUP_AUTO", "1").strip().lower() not in ("0", "false", "no")
 REVIEW_PDF_RETRIES = max(0, int(os.getenv("REVIEW_PDF_RETRIES", "3")))
 # Fonts for the PDF (Devanagari + Latin).  Default: the fonts/ folder in the repo.
 PDF_FONT_DIR = Path(os.getenv("PDF_FONT_DIR", "").strip() or Path(__file__).resolve().parent / "fonts")
 PDF_FONT_DEVANAGARI = "NotoSansDevanagari-Regular.ttf"
 PDF_FONT_LATIN = "DejaVuSans.ttf"
 PDF_FONT_LATIN_BOLD = "DejaVuSans-Bold.ttf"
+# Official Telegram group DP watermark bundled in the project (assets/group_dp_watermark.jpg).
+WATERMARK_IMAGE_PATH = Path(
+    os.getenv("WATERMARK_IMAGE_PATH", "").strip()
+    or Path(__file__).resolve().parent / "assets" / "group_dp_watermark.jpg"
+)
+WATERMARK_OPACITY = max(0.08, min(0.12, float(os.getenv("WATERMARK_OPACITY", "0.102"))))
+# Exact owner branding displayed in every generated Quiz Review PDF.
+QUIZ_BOT_OWNER = "LOKESH DAUSA"
+QUIZ_BOT_OWNER_USERNAME = "@LOKESH_DAUSA"
+OFFICIAL_TELEGRAM_GROUP_URL = "https://t.me/kalam_kranti"
 
 
 def get_token() -> str:

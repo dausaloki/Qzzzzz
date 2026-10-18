@@ -32,10 +32,11 @@ import html as _html
 import io
 import logging
 import re
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import fitz
 
@@ -46,8 +47,44 @@ log = logging.getLogger("quizbot.review_pdf")
 
 PAGE_W, PAGE_H = 595.0, 842.0         # A4 portrait (points)
 MARGIN_L, MARGIN_R = 44.0, 44.0
-MARGIN_TOP, MARGIN_BOTTOM = 46.0, 46.0
+MARGIN_TOP, MARGIN_BOTTOM = 46.0, 54.0
 CONTENT_W = PAGE_W - MARGIN_L - MARGIN_R
+
+OWNER_NAME = "LOKESH DAUSA"
+OWNER_USERNAME = "@LOKESH_DAUSA"
+OFFICIAL_GROUP_URL = "https://t.me/kalam_kranti"
+OWNER_LINE_OWNER = f"Quiz Bot Owner: {OWNER_NAME}"
+OWNER_LINE_USER = f"Telegram Username: {OWNER_USERNAME}"
+OWNER_LINE_GROUP = f"Official Telegram Group: {OFFICIAL_GROUP_URL}"
+
+_WM_CACHE: dict[str, tuple[bytes, int, int, bytes]] = {}
+
+
+def _load_watermark() -> Optional[tuple[bytes, int, int, bytes]]:
+    """Return ``(jpeg_bytes, width, height, flate_alpha_stream)`` for the official
+    group DP watermark image bundled in ``assets/group_dp_watermark.jpg``."""
+    candidates = [
+        Path(getattr(config, "WATERMARK_IMAGE_PATH", "")),
+        Path(__file__).resolve().parent / "assets" / "group_dp_watermark.jpg",
+    ]
+    alpha_val = max(20, min(31, int(round(255 * float(getattr(config, "WATERMARK_OPACITY", 0.102))))))
+    for p in candidates:
+        try:
+            if p and p.is_file():
+                key = f"{p.resolve()}:{alpha_val}"
+                cached = _WM_CACHE.get(key)
+                if cached is not None:
+                    return cached
+                raw = p.read_bytes()
+                pix = fitz.Pixmap(raw)
+                w, h = int(pix.width), int(pix.height)
+                alpha_z = zlib.compress(bytes([alpha_val]) * (w * h))
+                res = (raw, w, h, alpha_z)
+                _WM_CACHE[key] = res
+                return res
+        except Exception as exc:                        # noqa: BLE001
+            log.warning("watermark load failed for %s: %s", p, exc)
+    return None
 
 C_DARK = (0.10, 0.11, 0.13)
 C_GREY = (0.36, 0.38, 0.42)
@@ -354,8 +391,9 @@ def _silence_story_text(story_doc) -> None:
 
 
 class _Canvas:
-    """Flowing page layout on top of PyMuPDF with HarfBuzz shaping via ``fitz.Story``
-    and an exact Unicode ``/ActualText`` layer on every page."""
+    """Flowing page layout on top of PyMuPDF with HarfBuzz shaping via ``fitz.Story``,
+    an exact Unicode ``/ActualText`` layer, centered official group DP watermark
+    behind all content, and clickable footer hyperlink annotations on every page."""
 
     def __init__(self, header: str = ""):
         self.doc = fitz.open()
@@ -366,6 +404,34 @@ class _Canvas:
         self.pages = 0
         self._cur_page_idx = 0
         self._page_items: dict[int, list[tuple[float, float, str, float, tuple, bool, int]]] = {}
+        self._wm_xref = 0
+        self._wm_smask_xref = 0
+
+    def _draw_watermark(self, page) -> None:
+        wm = _load_watermark()
+        if not wm:
+            return
+        raw, w, h, alpha_z = wm
+        wm_size = 348.0
+        cx = PAGE_W / 2.0
+        cy = (94.0 + (PAGE_H - MARGIN_BOTTOM)) / 2.0
+        rect = fitz.Rect(cx - wm_size / 2.0, cy - wm_size / 2.0, cx + wm_size / 2.0, cy + wm_size / 2.0)
+        try:
+            self._wm_xref = page.insert_image(
+                rect, stream=raw, keep_proportion=True, overlay=False, xref=self._wm_xref
+            )
+            if self._wm_smask_xref == 0 and self._wm_xref:
+                self._wm_smask_xref = self.doc.get_new_xref()
+                self.doc.update_object(
+                    self._wm_smask_xref,
+                    f"<< /Type /XObject /Subtype /Image /Width {w} /Height {h} "
+                    "/ColorSpace /DeviceGray /BitsPerComponent 8 >>",
+                )
+                self.doc.update_stream(self._wm_smask_xref, alpha_z, compress=False)
+                self.doc.xref_set_key(self._wm_smask_xref, "Filter", "/FlateDecode")
+                self.doc.xref_set_key(self._wm_xref, "SMask", f"{self._wm_smask_xref} 0 R")
+        except Exception as exc:                        # noqa: BLE001
+            log.warning("watermark draw failed: %s", exc)
 
     # -- pages ---------------------------------------------------------
     def new_page(self) -> None:
@@ -373,9 +439,11 @@ class _Canvas:
         self.pages += 1
         self._cur_page_idx = self.pages - 1
         self._page_items.setdefault(self._cur_page_idx, [])
+        self._draw_watermark(self.page)
         self.y = MARGIN_TOP
         if self.pages > 1 and self.header:
-            self._draw_runs(MARGIN_L, self.y + 2, self._short(self.header, 96, 8.5), 8.5, C_GREY)
+            hdr_txt = f"{self._short(self.header, 56, 8.2)}  ·  {OWNER_LINE_OWNER} ({OWNER_USERNAME})"
+            self._draw_runs(MARGIN_L, self.y + 2, self._short(hdr_txt, 110, 8.2), 8.2, C_GREY)
             self.page.draw_line(fitz.Point(MARGIN_L, self.y + 9), fitz.Point(PAGE_W - MARGIN_R, self.y + 9),
                                 color=C_LINE, width=0.6)
             self.y += 22
@@ -432,7 +500,7 @@ class _Canvas:
             return
         self.ensure(height + gap)
         rect = fitz.Rect(MARGIN_L, self.y, PAGE_W - MARGIN_R, self.y + height)
-        self.page.draw_rect(rect, color=border or bg, fill=bg, width=0.5)
+        self.page.draw_rect(rect, color=border or bg, fill=bg, width=0.5, fill_opacity=0.82)
         yy = self.y + pad
         for ln in wrapped:
             self._draw_runs(MARGIN_L + pad, yy + size * 0.95, ln, size, color)
@@ -445,7 +513,7 @@ class _Canvas:
         x0 = x_right - w
         self.ensure(size * 1.6)
         rect = fitz.Rect(x0, self.y + 1.5, x_right, self.y + size * 1.55)
-        self.page.draw_rect(rect, color=bg, fill=bg, width=0)
+        self.page.draw_rect(rect, color=bg, fill=bg, width=0, fill_opacity=0.88)
         self._draw_runs(x0 + 6, rect.y0 + size * 1.02, text, size, color, bold=False)
 
     def _story_css_and_archive(self) -> tuple[str, Optional[fitz.Archive]]:
@@ -556,27 +624,58 @@ class _Canvas:
 
     def save(self, footer_left: str = "") -> bytes:
         total = self.pages
+        footer_links: list[tuple[int, fitz.Rect]] = []
         for i, page in enumerate(self.doc, 1):
-            short_left = self._short(footer_left, 72, 8.0) if footer_left else ""
-            footer = f"{short_left}  ·  Page {i}/{total}" if short_left else f"Page {i}/{total}"
             self.page = page
             self._cur_page_idx = i - 1
-            self._draw_runs(MARGIN_L, PAGE_H - 24, footer, 8.0, C_GREY)
-            page.draw_line(fitz.Point(MARGIN_L, PAGE_H - 32), fitz.Point(PAGE_W - MARGIN_R, PAGE_H - 32),
-                           color=C_LINE, width=0.5)
+            page.draw_line(
+                fitz.Point(MARGIN_L, PAGE_H - 42),
+                fitz.Point(PAGE_W - MARGIN_R, PAGE_H - 42),
+                color=C_LINE, width=0.5,
+            )
+            owner_txt = f"{OWNER_LINE_OWNER}  ·  {OWNER_LINE_USER}"
+            page_txt = f"Page {i}/{total}"
+            page_w = self.fb.width(page_txt, 8.0, bold=True)
+            self._draw_runs(MARGIN_L, PAGE_H - 29, owner_txt, 7.9, C_GREY)
+            self._draw_runs(PAGE_W - MARGIN_R - page_w, PAGE_H - 29, page_txt, 8.0, C_DARK, bold=True)
+
+            prefix = "Official Telegram Group: "
+            url_x0 = self._draw_runs(MARGIN_L, PAGE_H - 15, prefix, 8.2, C_GREY)
+            url_x1 = self._draw_runs(url_x0, PAGE_H - 15, OFFICIAL_GROUP_URL, 8.2, C_BLUE, bold=True)
+            page.draw_line(
+                fitz.Point(url_x0, PAGE_H - 13.3),
+                fitz.Point(url_x1, PAGE_H - 13.3),
+                color=C_BLUE, width=0.5,
+            )
+            if footer_left:
+                rem_w = PAGE_W - MARGIN_R - url_x1 - 14.0
+                if rem_w > 60.0:
+                    tail = self._short("  ·  " + footer_left, 60, 7.8, max_w=rem_w)
+                    self._draw_runs(url_x1, PAGE_H - 15, tail, 7.8, C_GREY)
+            link_rect = fitz.Rect(url_x0 - 2.0, PAGE_H - 26.0, url_x1 + 4.0, PAGE_H - 11.0)
+            footer_links.append((i - 1, link_rect))
+
         self._flush_text_layers()
+        # Add clickable PDF hyperlink annotations on EVERY page after text overlay
+        for pno, link_rect in footer_links:
+            self.doc[pno].insert_link({
+                "kind": fitz.LINK_URI,
+                "from": link_rect,
+                "uri": OFFICIAL_GROUP_URL,
+            })
         out = self.doc.tobytes(garbage=4, deflate=True)
         self.doc.close()
         return out
 
     # -- helpers -------------------------------------------------------
-    def _short(self, text: str, n: int, size: float) -> str:
+    def _short(self, text: str, n: int, size: float, max_w: Optional[float] = None) -> str:
+        limit = CONTENT_W if max_w is None else max_w
         text = " ".join(str(text).split())
-        if self.fb.width(text, size) <= CONTENT_W:
+        if self.fb.width(text, size) <= limit:
             return text
-        while text and self.fb.width(text + "…", size) > CONTENT_W:
+        while text and self.fb.width(text + "…", size) > limit:
             text = text[:-1]
-        return text + "…"
+        return (text + "…") if text else ""
 
 
 # --------------------------------------------------------------------- report
@@ -585,7 +684,7 @@ class ReportQuestion:
     number: int
     text: str
     options: list[str]
-    chosen: Optional[int]
+    chosen: Optional[Union[int, list[int], tuple[int, ...], set[int]]]
     correct: list[int]
     status: str
     explanation: str = ""
@@ -669,33 +768,92 @@ def _correct_set(q: dict) -> list[int]:
     return []
 
 
+def _chosen_set(chosen) -> set[int]:
+    if chosen is None:
+        return set()
+    if isinstance(chosen, (list, tuple, set)):
+        return {int(x) for x in chosen if x is not None}
+    return {int(chosen)}
+
+
 def _label(i: int) -> str:
     return f"({config.OPTION_LABELS[i]})" if 0 <= i < len(config.OPTION_LABELS) else f"({i + 1})"
 
 
 # --------------------------------------------------------------- report build
+def _index_answers(raw_answers: list[dict], *, group: bool = False) -> tuple[dict[int, dict], dict[int, dict]]:
+    """Index recorded answers by ``question_id`` and by 0-based position/q_index."""
+    by_qid: dict[int, dict] = {}
+    by_pos: dict[int, dict] = {}
+    pos_key = "q_index" if group else "position"
+    for a in raw_answers:
+        qid = int(a.get("question_id") or 0)
+        has_choice = a.get("chosen_index") is not None
+        if qid and (qid not in by_qid or has_choice):
+            by_qid[qid] = a
+        pos = a.get(pos_key)
+        if pos is not None:
+            p = int(pos)
+            if p not in by_pos or has_choice:
+                by_pos[p] = a
+    return by_qid, by_pos
+
+
 def report_for_attempt(attempt: dict) -> Report:
-    quiz = db.get_quiz(attempt["quiz_id"]) or {"title": "Quiz"}
-    questions = db.get_questions(attempt["quiz_id"])
-    answers = {a["question_id"]: a for a in db.get_answers(attempt["id"])}
+    if attempt.get("id"):
+        fresh = db.get_attempt(int(attempt["id"]))
+        if fresh:
+            attempt = fresh
+    quiz_id = str(attempt["quiz_id"])
+    user_id = int(attempt["user_id"])
+    quiz = db.get_quiz(quiz_id) or {"title": "Quiz"}
+    questions = db.get_questions(quiz_id)
+    raw_answers = db.get_answers(attempt["id"])
+
+    # If this attempt row has 0 recorded answers (e.g. an accidental empty/stopped
+    # duplicate session), resolve to the user's actual completed/answered attempt
+    # or group session for the same quiz so a completed attempt's answers are never
+    # replaced by an empty answer dictionary.
+    if not raw_answers:
+        alt_att = db.latest_answered_attempt(user_id, quiz_id)
+        if alt_att and int(alt_att["id"]) != int(attempt["id"]):
+            attempt = alt_att
+            raw_answers = db.get_answers(attempt["id"])
+        else:
+            alt_sess = db.latest_answered_group_session(user_id, quiz_id)
+            if alt_sess:
+                rep = report_for_group(alt_sess, user_id)
+                rep.mode = "private"
+                return rep
+
+    by_qid, by_pos = _index_answers(raw_answers, group=False)
     finished = attempt.get("finished_at")
     utc, ist = _dt(finished, attempt.get("started_ts") if not finished else None)
     rows: list[ReportQuestion] = []
     correct = wrong = skipped = 0
-    for q in questions:
-        a = answers.get(q["id"])
+    for idx, q in enumerate(questions):
+        a = by_qid.get(int(q["id"]))
+        if a is None:
+            a = by_pos.get(idx)
         cs = _correct_set(q)
         chosen = None
         status = STATUS_UNANSWERED
         was_skipped = False
         if a is not None:
             chosen = a.get("chosen_index")
+            if chosen is not None:
+                chosen = int(chosen)
             st = (a.get("status") or "").lower()
-            if st in ("skipped", "timeout"):
-                was_skipped = True
-                skipped += 1
+            if st in ("skipped", "timeout") or chosen is None:
+                was_skipped = st in ("skipped", "timeout")
+                if was_skipped:
+                    skipped += 1
                 status = STATUS_UNANSWERED
-            elif int(a.get("correct") or 0) == 1 and chosen in cs:
+                chosen = None
+            elif int(a.get("correct") or 0) == 1 and (not cs or chosen in cs):
+                correct += 1
+                status = STATUS_CORRECT
+            elif cs and chosen in cs:
                 correct += 1
                 status = STATUS_CORRECT
             else:
@@ -708,11 +866,11 @@ def report_for_attempt(attempt: dict) -> Report:
             skipped=was_skipped))
     total = len(rows)
     unanswered = total - correct - wrong
-    score = int(attempt.get("correct") or correct)
+    score = correct
     pct = round(100.0 * correct / total, 2) if total else 0.0
     return Report(
         quiz_title=quiz.get("title") or "Quiz",
-        user_label=_user_label(attempt["user_id"]),
+        user_label=_user_label(user_id),
         mode="private", when_utc=utc, when_local=ist,
         total=total, attempted=correct + wrong, correct=correct, incorrect=wrong,
         unanswered=unanswered, skipped=skipped, score=score, max_score=total,
@@ -721,19 +879,47 @@ def report_for_attempt(attempt: dict) -> Report:
 
 
 def report_for_group(session: dict, user_id: int) -> Report:
-    quiz = db.get_quiz(session["quiz_id"]) or {"title": "Quiz"}
-    questions = db.get_questions(session["quiz_id"])
-    answers = {a["question_id"]: a for a in db.get_group_answers(session["id"]) if a["user_id"] == user_id}
+    if session.get("id"):
+        fresh = db.get_group_session(int(session["id"]))
+        if fresh:
+            session = fresh
+    quiz_id = str(session["quiz_id"])
+    uid = int(user_id)
+    quiz = db.get_quiz(quiz_id) or {"title": "Quiz"}
+    questions = db.get_questions(quiz_id)
+    raw_answers = [a for a in db.get_group_answers(session["id"]) if int(a["user_id"]) == uid]
+
+    # If the user has 0 answers in this group session (e.g. a new/stopped session ID
+    # was referenced), check if the user has recorded answers in a previous group
+    # session or private attempt of the same quiz.
+    if not raw_answers:
+        alt_sess = db.latest_answered_group_session(uid, quiz_id)
+        if alt_sess and int(alt_sess["id"]) != int(session["id"]):
+            session = alt_sess
+            raw_answers = [a for a in db.get_group_answers(session["id"]) if int(a["user_id"]) == uid]
+        else:
+            alt_att = db.latest_answered_attempt(uid, quiz_id)
+            if alt_att:
+                rep = report_for_attempt(alt_att)
+                rep.mode = "group"
+                return rep
+
+    by_qid, by_pos = _index_answers(raw_answers, group=True)
     utc, ist = _dt(None, session.get("finished_ts") or session.get("started_ts"))
     rows: list[ReportQuestion] = []
     correct = wrong = 0
-    for q in questions:
-        a = answers.get(q["id"])
+    for idx, q in enumerate(questions):
+        a = by_qid.get(int(q["id"]))
+        if a is None:
+            a = by_pos.get(idx)
         cs = _correct_set(q)
         chosen = a.get("chosen_index") if a else None
-        if a is None:
+        if chosen is not None:
+            chosen = int(chosen)
+        if a is None or chosen is None:
             status = STATUS_UNANSWERED
-        elif int(a.get("is_correct") or 0) == 1:
+            chosen = None
+        elif int(a.get("is_correct") or 0) == 1 or (cs and chosen in cs):
             status = STATUS_CORRECT
             correct += 1
         else:
@@ -746,7 +932,7 @@ def report_for_group(session: dict, user_id: int) -> Report:
     total = len(rows)
     return Report(
         quiz_title=quiz.get("title") or "Quiz",
-        user_label=_user_label(user_id),
+        user_label=_user_label(uid),
         mode="group", when_utc=utc, when_local=ist,
         total=total, attempted=correct + wrong, correct=correct, incorrect=wrong,
         unanswered=total - correct - wrong, skipped=0,
@@ -767,18 +953,26 @@ def _status_style(status: str) -> tuple[tuple, str]:
 
 
 def render_report(rep: Report) -> tuple[bytes, int]:
-    rep.questions = list(rep.questions or [])
     """Report → (PDF bytes, page count).  Draws every question, never truncates."""
+    rep.questions = list(rep.questions or [])
     fb = fonts()
     cv = _Canvas(header=rep.quiz_title)
 
     # ---------------------------------------------------------- cover header
     cv.new_page()
-    cv.page.draw_rect(fitz.Rect(0, 0, PAGE_W, 86), color=C_BLUE, fill=C_BLUE, width=0)
-    cv._draw_runs(MARGIN_L, 44, "Complete Quiz Review" if rep.mode == "private" else "Quiz Review (Group)",
-                  19, (1, 1, 1), bold=True)
-    cv._draw_runs(MARGIN_L, 66, cv._short(rep.quiz_title, 180, 11.5), 11.5, (0.86, 0.90, 0.97))
-    cv.y = 104
+    cv.page.draw_rect(fitz.Rect(0, 0, PAGE_W, 96), color=C_BLUE, fill=C_BLUE, width=0)
+    cv._draw_runs(MARGIN_L, 32, "Complete Quiz Review" if rep.mode == "private" else "Quiz Review (Group)",
+                  18, (1, 1, 1), bold=True)
+    cv._draw_runs(MARGIN_L, 52, cv._short(rep.quiz_title, 180, 11.2), 11.2, (0.86, 0.90, 0.97))
+    cv._draw_runs(MARGIN_L, 70, f"{OWNER_LINE_OWNER}  ·  {OWNER_LINE_USER}", 8.4, (0.92, 0.95, 1.0), bold=True)
+    hdr_grp_x0 = MARGIN_L + fb.width("Official Telegram Group: ", 8.4, True)
+    hdr_grp_x1 = cv._draw_runs(MARGIN_L, 84, OWNER_LINE_GROUP, 8.4, (1, 1, 1), bold=True)
+    cv.page.insert_link({
+        "kind": fitz.LINK_URI,
+        "from": fitz.Rect(hdr_grp_x0 - 2.0, 73.0, hdr_grp_x1 + 4.0, 90.0),
+        "uri": OFFICIAL_GROUP_URL,
+    })
+    cv.y = 110
 
     # ---------------------------------------------------------- summary
     cv.line("परिणाम सारांश · Result Summary", 13, C_BLUE, bold=True, gap=3)
@@ -792,8 +986,11 @@ def render_report(rep: Report) -> tuple[bytes, int]:
         ("Incorrect / गलत", f"{rep.incorrect}"),
         ("Unanswered / अनुत्तरित", f"{rep.unanswered}"),
         ("Score / प्राप्तांक", f"{rep.score} / {rep.max_score}"),
+        ("Maximum marks / पूर्णांक", f"{rep.max_score}"),
         ("Percentage / प्रतिशत", f"{rep.percentage:.2f}%"),
         ("Negative marking / ऋणात्मक अंकन", rep.negative),
+        ("Final result / अंतिम परिणाम",
+         f"सही {rep.correct} + गलत {rep.incorrect} + अनुत्तरित {rep.unanswered} = कुल {rep.total} ({rep.percentage:.2f}%)"),
     ]
     if rep.skipped:
         rows.append(("Skipped or timed out / छोड़े गए", str(rep.skipped)))
@@ -842,9 +1039,10 @@ def render_report(rep: Report) -> tuple[bytes, int]:
         cv.line(q.text, 10.4, C_DARK, gap=5, leading=14.6)
 
         correct_set = list(q.correct or [])
+        chosen_set = _chosen_set(q.chosen)
         for i, opt in enumerate(q.options):
             is_correct = i in correct_set
-            is_chosen = q.chosen is not None and i == q.chosen
+            is_chosen = i in chosen_set
             if is_correct and is_chosen:
                 mark, suffix, oc = "✓", "  ← आपका उत्तर · सही (YOUR ANSWER · CORRECT)", C_GREEN
             elif is_correct:
@@ -891,7 +1089,8 @@ def render_report(rep: Report) -> tuple[bytes, int]:
 
 def pdf_font_status() -> tuple[bool, str]:
     """Self-test for build/startup: render a Hindi+English report and verify
-    both embedded Devanagari fonts and exact Unicode text extraction."""
+    embedded Devanagari fonts, exact Unicode text extraction, owner branding,
+    clickable group link annotations on every page, and watermark image on every page."""
     try:
         fb = fonts()
         sample = Report(
@@ -922,12 +1121,23 @@ def pdf_font_status() -> tuple[bool, str]:
         doc = fitz.open(stream=pdf, filetype="pdf")
         text = "\n".join(page.get_text() for page in doc)
         font_names = [f[3] for page in doc for f in page.get_fonts()]
+        links_ok = all(
+            any(lnk.get("uri") == OFFICIAL_GROUP_URL for lnk in page.get_links())
+            for page in doc
+        )
+        wm_ok = all(len(page.get_images(full=True)) >= 1 for page in doc)
         doc.close()
-        required = ("राजस्थान", "परिणाम सारांश", "निम्नलिखित", "प्रस्तावना", "संदर्भ", "क्षेत्रफल", "✓", "✗")
+        required = (
+            "राजस्थान", "परिणाम सारांश", "निम्नलिखित", "प्रस्तावना", "संदर्भ", "क्षेत्रफल", "✓", "✗",
+            OWNER_LINE_OWNER, OWNER_LINE_USER, OFFICIAL_GROUP_URL,
+        )
         missing = [w for w in required if w not in text]
         has_dev_font = any("devanagari" in (fn or "").lower() for fn in font_names)
-        if missing or "????" in text or not has_dev_font or pages < 1:
-            return False, f"missing={missing} has_dev_font={has_dev_font} fonts={font_names}"
+        if missing or "????" in text or not has_dev_font or not links_ok or not wm_ok or pages < 1:
+            return False, (
+                f"missing={missing} has_dev_font={has_dev_font} "
+                f"links_ok={links_ok} wm_ok={wm_ok} fonts={font_names}"
+            )
         return True, f"dev={fb.dev_name} lat={fb.lat_name} embedded={sorted(set(font_names))}"
     except Exception as exc:                            # noqa: BLE001
         return False, f"error: {exc}"
@@ -1074,8 +1284,12 @@ async def _retry_job(context) -> None:
             return
         await deliver_attempt(context.bot, att, reason="retry")
     elif kind == "group":
-        await deliver_group_member(context.bot, int(data["session_id"]), int(data["user_id"]),
-                                   reason="retry")
+        sid = int(data["session_id"])
+        uid = int(data["user_id"])
+        rec = db.review_pdf_get(session_id=sid, user_id=uid)
+        if rec and rec.get("status") == "sent":
+            return
+        await deliver_group_member(context.bot, sid, uid, force=False, reason="retry")
 
 
 def schedule_retry(app, *, kind: str, attempt_id: Optional[int] = None, session_id: Optional[int] = None,
@@ -1109,18 +1323,23 @@ async def auto_after_finish(app, attempt: dict) -> dict:
 
 
 async def auto_group_after_finish(app, session: dict) -> dict:
-    """Optional: send every participant their PDF (REVIEW_PDF_GROUP_AUTO=1)."""
+    """Automatically send every group quiz participant their personalized review PDF privately."""
     if not (config.REVIEW_PDF_ENABLED and config.REVIEW_PDF_GROUP_AUTO):
         return {"skipped": "group-auto-off"}
     sent = blocked = 0
     try:
         for row in db.group_leaderboard(session["id"]):
-            res = await deliver_group_member(app.bot, session["id"], int(row["user_id"]), force=False,
+            uid = int(row["user_id"])
+            res = await deliver_group_member(app.bot, session["id"], uid, force=False,
                                              reason="group-auto")
             if res.get("ok"):
                 sent += 1
             elif res.get("blocked"):
                 blocked += 1
+            elif res.get("error") and not res.get("skipped"):
+                rec = db.review_pdf_get(session_id=int(session["id"]), user_id=uid)
+                schedule_retry(app, kind="group", session_id=int(session["id"]), user_id=uid,
+                               tries=int((rec or {}).get("tries") or 0))
         return {"sent": sent, "blocked": blocked}
     except Exception:                                   # noqa: BLE001
         log.exception("automatic group review PDFs failed")
@@ -1128,6 +1347,47 @@ async def auto_group_after_finish(app, session: dict) -> dict:
 
 
 def last_attempt_for(user_id: int) -> Optional[dict]:
-    """Most recent finished/stopped attempt of this user (for /review)."""
-    rows = db.user_history(user_id, limit=5)
+    """Most recent finished/stopped attempt of this user (for /review), preferring
+    an attempt that actually has recorded answers over an unattempted stopped session."""
+    ans_att = db.latest_answered_attempt(int(user_id))
+    if ans_att:
+        return ans_att
+    rows = db.user_history(int(user_id), limit=10)
     return rows[0] if rows else None
+
+
+def last_review_target_for(user_id: int) -> Optional[dict]:
+    """Resolve the user's most recent completed quiz (private attempt or group session)
+    for ``/review``. Prefers attempts/sessions with recorded answers."""
+    uid = int(user_id)
+    att = db.latest_answered_attempt(uid)
+    grp = db.latest_answered_group_session(uid)
+    if att and grp:
+        att_ts = float(att.get("started_ts") or 0)
+        grp_ts = float(grp.get("finished_ts") or grp.get("started_ts") or 0)
+        if grp_ts > att_ts:
+            return {"kind": "group", "session": grp, "user_id": uid}
+        return {"kind": "attempt", "attempt": att}
+    if att:
+        return {"kind": "attempt", "attempt": att}
+    if grp:
+        return {"kind": "group", "session": grp, "user_id": uid}
+    # Fall back to any finished/stopped attempt or group session even if 0 answers
+    raw_att = last_attempt_for(uid)
+    if raw_att:
+        return {"kind": "attempt", "attempt": raw_att}
+    grp_hist = db.user_group_history(uid, limit=1)
+    if grp_hist:
+        return {"kind": "group", "session": grp_hist[0], "user_id": uid}
+    return None
+
+
+async def deliver_latest_review(bot, user_id: int, *, target: Optional[dict] = None) -> dict:
+    """Deliver the user's most recent quiz review PDF (private or group) for ``/review``."""
+    tgt = target or last_review_target_for(int(user_id))
+    if not tgt:
+        return {"ok": False, "error": "no-target"}
+    if tgt.get("kind") == "group":
+        sess = tgt["session"]
+        return await deliver_group_member(bot, int(sess["id"]), int(user_id), force=True, reason="command")
+    return await deliver_attempt(bot, tgt["attempt"], force=True, reason="command")
