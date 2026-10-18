@@ -481,3 +481,160 @@ def test_disabled_by_config_sends_nothing(monkeypatch):
             assert h.api.sent("sendDocument") == []
 
     run(t())
+
+
+def test_pdf_hindi_unicode_matras_conjuncts_and_no_question_marks():
+    """Verify Hindi matras, conjuncts, headers, footers, labels and explanations
+    across multiple pages with zero '????' corruption."""
+    import fitz
+
+    rep = Report(
+        quiz_title="राजस्थान का सामान्य ज्ञान — परीक्षा श्रृंखला",
+        user_label="लोकेश कुमार मीणा (राजस्थान प्रशासनिक सेवा अभ्यर्थी) (@lokesh) · ID 99",
+        mode="group",
+        when_utc="2026-10-18 07:25 UTC",
+        when_local="2026-10-18 12:55 IST",
+        total=4, attempted=2, correct=1, incorrect=1, unanswered=2, skipped=1,
+        score=1, max_score=4, percentage=25.0,
+        stopped=True,
+        questions=[
+            ReportQuestion(
+                1,
+                "निम्नलिखित में से राजस्थान की चित्रकला की शैलियों और उनके प्रमुख चित्रकारों का सही मिलान कीजिए:\n"
+                "कथन I: किशनगढ़ शैली का स्वर्णकाल सावंत सिंह (नागरीदास) का शासनकाल माना जाता है।\n"
+                "कथन II: नाथद्वारा शैली में 'पिछवाई चित्रण' प्रमुख विशेषता है, जिसमें कमला और इलायची प्रसिद्ध हैं।\n"
+                "कथन III: 'चावंड शैली' के प्रमुख चित्रकार नसीरुद्दीन (निसारदी) थे।\n"
+                "उपर्युक्त कथनों में से कौन-सा/से सही है/हैं?",
+                ["केवल I तथा II", "केवल II तथा III", "केवल I तथा III", "I, II तथा III सभी"],
+                1, [3], "wrong",
+                explanation="तीनों कथन राजस्थान की चित्रशैलियों (किशनगढ़, नाथद्वारा, चावंड) के संदर्भ में पूर्णतः सत्य हैं।",
+                section="भाग-अ: राजस्थान की कला एवं संस्कृति",
+            ),
+            ReportQuestion(
+                2,
+                "क्षेत्रफल की दृष्टि से भारत का सबसे बड़ा राज्य कौन-सा है?",
+                ["राजस्थान", "मध्य प्रदेश", "महाराष्ट्र", "उत्तर प्रदेश"],
+                0, [0], "correct",
+                explanation="क्षेत्रफल की दृष्टि से राजस्थान भारत का सबसे बड़ा राज्य है।",
+                section="भाग-अ: राजस्थान की कला एवं संस्कृति",
+            ),
+            ReportQuestion(
+                3,
+                "सुमेलित कीजिए:\nसूची-I (संप्रदाय) / सूची-II (प्रमुख पीठ)\n"
+                "(A) जसनाथी संप्रदाय — (1) कतरियासर, बीकानेर\n"
+                "(B) विश्नोई संप्रदाय — (2) मुकाम तालवा, नोखा\n"
+                "(C) रामस्नेही संप्रदाय — (3) शाहपुरा, भीलवाड़ा\n"
+                "(D) दादूपंथी संप्रदाय — (4) नरेना (नारायणा), जयपुर",
+                ["A-4, B-2, C-3, D-1", "A-3, B-2, C-4, D-1", "A-1, B-2, C-3, D-4", "A-4, B-3, C-2, D-1"],
+                None, [2], "unanswered",
+                explanation="जसनाथी संप्रदाय की प्रमुख पीठ कतरियासर (बीकानेर) तथा दादूपंथी की नरेना (जयपुर) में स्थित है।",
+                section="भाग-ब: भारतीय संविधान एवं राजव्यवस्था",
+                skipped=True,
+            ),
+            ReportQuestion(
+                4,
+                "भारतीय संविधान की प्रस्तावना एवं मूल अधिकारों के संदर्भ में विचार कीजिए:\n"
+                "कथन I: 42वें संविधान संशोधन अधिनियम, 1976 द्वारा प्रस्तावना में 'समाजवादी', 'पंथनिरपेक्ष' और 'अखंडता' शब्द जोड़े गए।\n"
+                "कथन II: अनुच्छेद 32 को डॉ. भीमराव अंबेडकर ने 'संविधान की आत्मा और हृदय' कहा है।\n"
+                "कथन III: संपत्ति के अधिकार को 44वें संशोधन द्वारा मूल अधिकारों की श्रेणी से हटाकर विधिक अधिकार बनाया गया।",
+                ["केवल I तथा II", "केवल II तथा III", "केवल I तथा III", "I, II तथा III सभी"],
+                None, [3], "unanswered",
+                explanation="तीनों कथन भारतीय संविधान के संदर्भ में पूर्णतः सत्य हैं।",
+                section="भाग-ब: भारतीय संविधान एवं राजव्यवस्था",
+            ),
+        ],
+    )
+    pdf, pages = review_pdf.render_report(rep)
+    assert pages >= 2
+    doc = fitz.open(stream=pdf, filetype="pdf")
+    full_text = "\n".join(page.get_text() for page in doc)
+
+    assert "????" not in full_text
+    for word in (
+        "राजस्थान का सामान्य ज्ञान — परीक्षा श्रृंखला",
+        "लोकेश कुमार मीणा",
+        "परिणाम सारांश",
+        "उपयोगकर्ता",
+        "दिनांक-समय",
+        "कुल प्रश्न",
+        "प्रयास किए",
+        "अनुत्तरित",
+        "प्राप्तांक",
+        "प्रतिशत",
+        "ऋणात्मक अंकन",
+        "लागू नहीं (हर सही उत्तर पर 1 अंक)",
+        "सभी प्रश्नों की संख्या = सही + गलत + अनुत्तरित ✓",
+        "किशनगढ़",
+        "स्वर्णकाल",
+        "नाथद्वारा",
+        "प्रसिद्ध",
+        "नसीरुद्दीन",
+        "उपर्युक्त",
+        "क्षेत्रफल",
+        "दृष्टि",
+        "विश्नोई",
+        "रामस्नेही",
+        "पंथनिरपेक्ष",
+        "अनुच्छेद",
+        "हृदय",
+        "संपत्ति",
+        "श्रेणी",
+        "पूर्णतः",
+        "← आपका उत्तर · गलत (YOUR ANSWER · INCORRECT)",
+        "← आपका उत्तर · सही (YOUR ANSWER · CORRECT)",
+        "← सही उत्तर (CORRECT ANSWER)",
+        f"Page 1/{pages}",
+        f"Page {pages}/{pages}",
+    ):
+        assert word in full_text, f"missing Hindi/label text: {word!r}"
+
+    for pno, page in enumerate(doc, 1):
+        pfonts = [f[3] for f in page.get_fonts()]
+        assert any("devanagari" in (fn or "").lower() for fn in pfonts), f"page {pno} fonts: {pfonts}"
+    doc.close()
+
+
+def test_pdf_renders_hindi_without_external_font_files(monkeypatch, tmp_path):
+    """Even if the fonts/ directory is missing on the server, built-in MuPDF
+    Devanagari fonts must be extracted and embedded with zero '????' output."""
+    import fitz
+
+    monkeypatch.setattr(review_pdf, "_BUILTIN_CACHE_DIR", tmp_path / "builtin_fonts")
+    monkeypatch.setattr(review_pdf.FontBook, "_candidates", lambda self, name: [])
+    review_pdf._FONTS.clear()
+    try:
+        fb = review_pdf.fonts()
+        assert not fb.degraded
+        rep = Report(
+            "राजस्थान सामान्य ज्ञान",
+            "राहुल शर्मा (@rahul) · ID 5",
+            "private",
+            "2026-10-18 07:25 UTC",
+            "2026-10-18 12:55 IST",
+            2, 1, 0, 1, 1, 0, 0, 2, 0.0,
+            [
+                ReportQuestion(1, "भारत की राजधानी क्या है?", ["मुंबई", "नई दिल्ली", "जयपुर", "कोलकाता"],
+                               0, [1], "wrong", "नई दिल्ली भारत की राजधानी है।"),
+                ReportQuestion(2, "राजस्थान की राजधानी कौन-सी है?", ["जोधपुर", "जयपुर", "उदयपुर", "कोटा"],
+                               None, [1], "unanswered"),
+            ],
+        )
+        pdf, pages = review_pdf.render_report(rep)
+        assert pages >= 1
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        txt = "\n".join(page.get_text() for page in doc)
+        font_names = [f[3] for page in doc for f in page.get_fonts()]
+        doc.close()
+        assert "????" not in txt
+        for w in ("राजस्थान सामान्य ज्ञान", "राहुल शर्मा", "परिणाम सारांश", "नई दिल्ली", "जयपुर", "✓", "✗"):
+            assert w in txt
+        assert any("devanagari" in (fn or "").lower() for fn in font_names), font_names
+    finally:
+        review_pdf._FONTS.clear()
+
+
+def test_pdf_font_status_self_check():
+    ok, info = review_pdf.pdf_font_status()
+    assert ok, info
+    assert "dev=" in info and "embedded=" in info
+
