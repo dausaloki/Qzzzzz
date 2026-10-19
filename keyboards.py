@@ -175,8 +175,19 @@ def correct_picker(options: list[str], prefix: str = "c:correct", current: int |
 
 
 def share_markup(link: str, title: str, qid: str | None = None, inline: bool = False,
-                 group_url: str = "") -> M:
-    share_url = f"https://t.me/share/url?url={quote(link, safe='')}&text={quote('Quiz: ' + title)}"
+                 group_url: str = "", question_count: int | None = None,
+                 timer: int | None = None) -> M:
+    share_lines = [f"🎯 Quiz: {title}"]
+    meta = []
+    if question_count is not None:
+        meta.append(f"📝 {question_count} {'question' if question_count == 1 else 'questions'}")
+    if timer is not None:
+        meta.append(f"⏱ {config.timer_label(timer)}")
+    if meta:
+        share_lines.append(" · ".join(meta))
+    share_lines.append(f"👤 {config.OWNER_NAME} ({config.OWNER_TELEGRAM})")
+    share_text = "\n".join(share_lines)
+    share_url = f"https://t.me/share/url?url={quote(link, safe='')}&text={quote(share_text)}"
     rows = [[B("▶️ Start Quiz", url=link)]]
     if group_url:
         rows.append([B("👥 Group में Quiz चलाएँ", url=group_url)])

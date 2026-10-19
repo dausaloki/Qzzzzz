@@ -42,7 +42,7 @@ OPTION_LABELS = "ABCDEFGHIJKL"[:MAX_OPTIONS]
 TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "").strip().rstrip("/")
 
 TIMER_CHOICES = [10, 15, 30, 60, 90, 120, 180, 300, 0]
-DEFAULT_TIMER = 30
+DEFAULT_TIMER = int(os.getenv("DEFAULT_TIMER", "45"))
 # "✏️ Custom Time": any whole number of seconds in this range (0 = No timer).
 # Telegram's poll open_period only accepts 5–600 s; longer timers are enforced
 # by the bot's own job, which closes the poll with stopPoll.
@@ -75,6 +75,10 @@ REQUIRED_CHAT_URL = os.getenv("REQUIRED_CHAT_URL", "").strip() or (
 # (and on every /start), so users who left the group must join again.
 MEMBERSHIP_RECHECK_SECONDS = int(os.getenv("MEMBERSHIP_RECHECK_SECONDS", "600"))
 
+# ---------------------------------------------------------------- support group notification
+# Group/channel notified once when a new user starts the bot (/start) for the first time.
+SUPPORT_NOTIFY_CHAT = os.getenv("SUPPORT_NOTIFY_CHAT", "@DAUSA_123").strip()
+
 # ---------------------------------------------------------------- creation
 # The "📝 प्रश्न बनाएँ" reply button opens Telegram's own poll editor, which
 # limits the question to 300 characters and shows its own "-57" style counter
@@ -85,7 +89,7 @@ NATIVE_POLL_BUTTON = os.getenv("NATIVE_POLL_BUTTON", "0").strip().lower() in ("1
 # ---------------------------------------------------------------- group quizzes
 # Seconds per question in a group when the quiz itself has "No timer"
 # (a group quiz needs a time limit to move on to the next question).
-GROUP_DEFAULT_TIMER = int(os.getenv("GROUP_DEFAULT_TIMER", "30"))
+GROUP_DEFAULT_TIMER = int(os.getenv("GROUP_DEFAULT_TIMER", "45"))
 # Pause between a group question closing and the next one.
 GROUP_NEXT_DELAY = float(os.getenv("GROUP_NEXT_DELAY", "2.0"))
 
@@ -203,9 +207,11 @@ WATERMARK_IMAGE_PATH = Path(
     or Path(__file__).resolve().parent / "assets" / "group_dp_watermark.jpg"
 )
 WATERMARK_OPACITY = max(0.08, min(0.12, float(os.getenv("WATERMARK_OPACITY", "0.102"))))
-# Exact owner branding displayed in every generated Quiz Review PDF.
+# Exact owner branding displayed in every generated Quiz Review PDF and share card.
 QUIZ_BOT_OWNER = "LOKESH DAUSA"
 QUIZ_BOT_OWNER_USERNAME = "@LOKESH_DAUSA"
+OWNER_NAME = QUIZ_BOT_OWNER
+OWNER_TELEGRAM = QUIZ_BOT_OWNER_USERNAME
 OFFICIAL_TELEGRAM_GROUP_URL = "https://t.me/kalam_kranti"
 
 

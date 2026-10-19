@@ -602,7 +602,7 @@ def install(do_startup_export: bool = True) -> dict:
 # --------------------------------------------------------------------- github
 def github_payload(data: dict) -> dict:
     """Redacted copy for GitHub: no user/chat/owner ids, no usernames."""
-    private = ("user_id", "chat_id", "owner_id", "started_by", "username", "first_name")
+    private = ("user_id", "chat_id", "owner_id", "started_by", "username", "first_name", "last_name")
 
     def scrub(row: dict) -> dict:
         return {k: v for k, v in row.items() if k not in private}

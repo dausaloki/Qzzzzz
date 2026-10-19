@@ -8,6 +8,7 @@ still running) is logged and retried by PTB instead of crashing the bot.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 import sys
@@ -45,6 +46,105 @@ logging.getLogger("apscheduler").setLevel(logging.WARNING)
 log = logging.getLogger("quizbot")
 
 _bot_username_cache: dict[str, object] = {}
+_IST = timezone(timedelta(hours=5, minutes=30))
+_notify_inflight: set[int] = set()
+
+
+def _now_ist_str() -> str:
+    return datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S IST")
+
+
+def format_first_start_notification(user, first_start_at: str) -> str:
+    first = (getattr(user, "first_name", None) or "").strip()
+    last = (getattr(user, "last_name", None) or "").strip()
+    full_name = " ".join(p for p in (first, last) if p) or "User"
+    raw_uname = (getattr(user, "username", None) or "").strip().lstrip("@")
+    uname_display = f"@{esc(raw_uname)}" if raw_uname else "No username"
+    profile_link = f'<a href="tg://user?id={user.id}">{esc(full_name)}</a>'
+    return (
+        "🆕 <b>NEW USER STARTED THE QUIZ BOT</b>\n\n"
+        f"👤 Name: {profile_link}\n\n"
+        f"🔗 Username: {uname_display}\n\n"
+        f"🆔 User ID: <code>{user.id}</code>\n\n"
+        f"🕒 First Start: {esc(first_start_at)}"
+    )
+
+
+async def _retry_first_start_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.job.data or {}
+    uid = data.get("user_id")
+    text = data.get("text")
+    ts = data.get("ts", "")
+    tries = int(data.get("tries", 1))
+    target = (config.SUPPORT_NOTIFY_CHAT or "").strip()
+    if not uid or not text or not target:
+        return
+    u_row = db.get_user(uid)
+    if u_row and int(u_row.get("first_start_notified") or 0):
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=target,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        db.mark_first_start_notified(uid, ts)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Support notification retry %d to %s for user %s failed: %s", tries, target, uid, exc)
+        if tries < 3 and context.application and context.application.job_queue:
+            context.application.job_queue.run_once(
+                _retry_first_start_job,
+                when=min(30.0 * tries, 120.0),
+                data={"user_id": uid, "text": text, "ts": ts, "tries": tries + 1},
+                name=f"first_start_notify:{uid}",
+            )
+
+
+async def notify_first_start(context, user) -> bool:
+    """Send a one-time notification to ``config.SUPPORT_NOTIFY_CHAT`` on a user's first ``/start``."""
+    target = (config.SUPPORT_NOTIFY_CHAT or "").strip()
+    if not target or user is None or getattr(user, "is_bot", False):
+        return False
+    uid = int(user.id)
+    if uid in _notify_inflight:
+        return False
+    now_str = _now_ist_str()
+    try:
+        should_notify, first_start_at = db.prepare_first_start_notification(user, now_str)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not prepare first-start notification for user %s: %s", uid, exc)
+        return False
+    if not should_notify:
+        return False
+    text = format_first_start_notification(user, first_start_at)
+    _notify_inflight.add(uid)
+    try:
+        await context.bot.send_message(
+            chat_id=target,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        db.mark_first_start_notified(uid, first_start_at)
+        app = getattr(context, "application", None)
+        if app and app.job_queue:
+            for job in app.job_queue.get_jobs_by_name(f"first_start_notify:{uid}"):
+                job.schedule_removal()
+        return True
+    except Exception as exc:  # noqa: BLE001 — never crash or block /start
+        log.warning("Failed to send first-start notification to %s for user %s: %s", target, uid, exc)
+        app = getattr(context, "application", None)
+        if app and app.job_queue and not app.job_queue.get_jobs_by_name(f"first_start_notify:{uid}"):
+            app.job_queue.run_once(
+                _retry_first_start_job,
+                when=5.0,
+                data={"user_id": uid, "text": text, "ts": first_start_at, "tries": 1},
+                name=f"first_start_notify:{uid}",
+            )
+        return False
+    finally:
+        _notify_inflight.discard(uid)
 
 
 async def _cache_me(bot) -> None:
@@ -118,7 +218,10 @@ async def membership_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     msg = update.effective_message
     force, payload = False, ""
-    if cq is None and msg is not None and msg.text and msg.text.split()[0].split("@")[0] == "/start":
+    is_start_cmd = bool(
+        cq is None and msg is not None and msg.text and msg.text.split()[0].split("@")[0] == "/start"
+    )
+    if is_start_cmd:
         # every /start asks Telegram again — a user who left must join again
         force = True
         parts = msg.text.split(maxsplit=1)
@@ -126,6 +229,8 @@ async def membership_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if await membership.has_access(context.bot, user.id, force=force):
         return
     db.upsert_user(user)
+    if is_start_cmd:
+        await notify_first_start(context, user)
     if payload == "join":
         payload = ""
     if cq is not None:
@@ -143,6 +248,7 @@ async def join_check(update: Update, context) -> None:
     payload = parts[2] if len(parts) > 2 else ""
     ok = await membership.verify_now(context.bot, user.id) if membership.enabled() else True
     if ok is True:
+        await notify_first_start(context, user)
         await q.answer("✅ Verified")
         await creator.respond(update, membership.VERIFIED_TEXT, None)
         qid = engine.parse_start_payload(payload) if payload else None
@@ -164,6 +270,8 @@ async def join_check(update: Update, context) -> None:
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     db.upsert_user(user)
+    if is_private(update):
+        await notify_first_start(context, user)
     if context.args and context.args[0] == "join":      # from the inline "join first" button
         context.args = []
     qid = engine.parse_start_payload(context.args[0]) if context.args else None
@@ -489,19 +597,60 @@ async def show_settings(update: Update, edit: bool = True) -> None:
                           kb.settings_menu(user), edit=edit)
 
 
+async def share_cmd(update: Update, context) -> None:
+    """/share [quiz_id] — share a quiz by ID or show the user's quizzes to share."""
+    qid = context.args[0] if context.args else None
+    if qid and qid.startswith("quiz_"):
+        qid = qid[5:]
+    if not is_private(update):
+        await group_redirect(update, context, qid)
+        return
+    if qid and db.get_quiz(qid):
+        await share_quiz(update, context, qid)
+        return
+    own = db.get_owner_quizzes(update.effective_user.id, include_drafts=False)
+    if not own:
+        await update.effective_chat.send_message(
+            "ℹ️ Share करने के लिए कोई तैयार quiz नहीं मिला। पहले quiz बनाएँ/import करें या <code>/share QUIZ_ID</code> भेजें।",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb.main_menu(),
+        )
+        return
+    rows = [[B(f"📤 {q['title'][:40]} ({q['question_count']})", callback_data=f"q:share:{q['id']}")] for q in own[:25]]
+    rows.append(kb.home_button())
+    await update.effective_chat.send_message(
+        "📤 <b>कौन-सा quiz share करना है?</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=M(rows),
+    )
+
+
 async def share_quiz(update: Update, context, qid: str) -> None:
     quiz = db.get_quiz(qid)
+    if not quiz:
+        await update.effective_chat.send_message("❌ Quiz नहीं मिला (शायद delete हो गया)।")
+        return
     username = await bot_username(context)
     link = engine.deep_link(username, qid)
     ready = quiz.get("status") == "ready" and quiz.get("question_count")
+    n = quiz.get("question_count", db.count_questions(qid))
+    timer_val = quiz.get("timer", config.DEFAULT_TIMER)
+    t_label = config.timer_label(timer_val)
+    desc = f"\n{esc(quiz['description'])}" if quiz.get("description") else ""
     await update.effective_chat.send_message(
-        f"🔗 <b>Share: {esc(quiz['title'])}</b>\n\n{link}\n\n"
+        f"🔗 <b>Share: {esc(quiz['title'])}</b>{desc}\n\n"
+        f"📝 Questions: <b>{n}</b> · ⏱ Timer: <b>{esc(t_label)}</b>\n"
+        f"👤 By: <b>{esc(config.OWNER_NAME)}</b> ({esc(config.OWNER_TELEGRAM)})\n\n"
+        f"{link}\n\n"
         "Link खोलने वाला हर user bot की private chat में अपना अलग quiz session शुरू करेगा।\n"
         "👥 <b>Group में Quiz चलाएँ</b> → group चुनें → वहाँ ▶️ दबाएँ: quiz उसी group में native quiz "
         "polls से चलेगा और अंत में leaderboard आएगा।",
         parse_mode=ParseMode.HTML,
-        reply_markup=kb.share_markup(link, quiz["title"], qid, inline=await inline_enabled(context),
-                                     group_url=engine.group_link(username, qid) if ready else ""),
+        reply_markup=kb.share_markup(
+            link, quiz["title"], qid, inline=await inline_enabled(context),
+            group_url=engine.group_link(username, qid) if ready else "",
+            question_count=n, timer=timer_val,
+        ),
         disable_web_page_preview=True)
 
 
@@ -531,11 +680,15 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     for quiz in quizzes:
         link = engine.deep_link(username, quiz["id"])
         n = quiz["question_count"]
-        text = (f"🎲 <b>{esc(quiz['title'])}</b>\n🖊 {n} {'question' if n == 1 else 'questions'} · "
-                f"⏱ {config.timer_label(quiz['timer'])}\n\nनीचे button दबाकर private chat में quiz शुरू करें 👇")
+        t_label = config.timer_label(quiz["timer"])
+        desc = f"\n{esc(quiz['description'])}" if quiz.get("description") else ""
+        text = (f"🎲 <b>{esc(quiz['title'])}</b>{desc}\n"
+                f"🖊 {n} {'question' if n == 1 else 'questions'} · ⏱ {t_label}\n"
+                f"👤 {esc(config.OWNER_NAME)} ({esc(config.OWNER_TELEGRAM)})\n\n"
+                "नीचे button दबाकर private chat में quiz शुरू करें 👇")
         results.append(InlineQueryResultArticle(
             id=quiz["id"][:64], title=quiz["title"][:100],
-            description=f"{n} questions · ⏱ {config.timer_label(quiz['timer'])}",
+            description=f"{n} questions · ⏱ {t_label} · {config.OWNER_NAME}",
             input_message_content=InputTextMessageContent(text, parse_mode=ParseMode.HTML),
             reply_markup=kb.start_privately(link)))
     await iq.answer(results, cache_time=5, is_personal=True)
@@ -635,7 +788,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 v = int(parts[2])
             except (IndexError, ValueError):
                 v = -1
-            if v in config.TIMER_CHOICES:
+            if v in config.TIMER_CHOICES or config.CUSTOM_TIMER_MIN <= v <= config.CUSTOM_TIMER_MAX:
                 db.update_user_settings(user.id, default_timer=v)
         elif parts[1] == "sq":
             db.update_user_settings(user.id, default_shuffle_questions=0 if u["default_shuffle_questions"] else 1)
@@ -806,6 +959,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 BOT_COMMANDS = [
     BotCommand("start", "Main menu"), BotCommand("newquiz", "नया quiz बनाएँ"),
     BotCommand("myquizzes", "मेरे quizzes"), BotCommand("import", "PDF/Text से quiz"),
+    BotCommand("share", "Quiz share करें"),
     BotCommand("stats", "मेरे results"), BotCommand("done", "Quiz creation पूरा करें"),
     BotCommand("undo", "आख़िरी प्रश्न हटाएँ (creation)"),
     BotCommand("skip", "Skip (प्रश्न / optional step)"), BotCommand("stop", "Quiz रोकें"),
@@ -883,6 +1037,7 @@ def build_application(token: str, request=None, get_updates_request=None, rate_l
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("skip", skip_cmd))
     app.add_handler(CommandHandler("quiz", quiz_cmd))
+    app.add_handler(CommandHandler("share", share_cmd))
     app.add_handler(CommandHandler("review", review_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CallbackQueryHandler(callback_router))

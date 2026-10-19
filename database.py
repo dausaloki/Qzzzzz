@@ -89,13 +89,16 @@ CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     username TEXT DEFAULT '',
     first_name TEXT DEFAULT '',
-    default_timer INTEGER DEFAULT 30,
+    last_name TEXT DEFAULT '',
+    default_timer INTEGER DEFAULT 45,
     default_shuffle_questions INTEGER DEFAULT 0,
     default_shuffle_options INTEGER DEFAULT 0,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     last_seen TEXT DEFAULT CURRENT_TIMESTAMP,
     member_verified_ts REAL DEFAULT 0,
-    member_checked_ts REAL DEFAULT 0
+    member_checked_ts REAL DEFAULT 0,
+    first_start_notified INTEGER DEFAULT 0,
+    first_start_at TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS quizzes (
@@ -112,7 +115,7 @@ CREATE TABLE IF NOT EXISTS quizzes (
 
 CREATE TABLE IF NOT EXISTS quiz_settings (
     quiz_id TEXT PRIMARY KEY,
-    timer INTEGER DEFAULT 30,
+    timer INTEGER DEFAULT 45,
     shuffle_questions INTEGER DEFAULT 0,
     shuffle_options INTEGER DEFAULT 0,
     FOREIGN KEY(quiz_id) REFERENCES quizzes(id) ON DELETE CASCADE
@@ -280,12 +283,15 @@ CREATE INDEX IF NOT EXISTS idx_ganswers_session ON group_answers(session_id, use
 # Columns that may be missing in databases created by the previous version.
 _MIGRATION_COLUMNS = {
     "users": {
-        "default_timer": "INTEGER DEFAULT 30",
+        "last_name": "TEXT DEFAULT ''",
+        "default_timer": "INTEGER DEFAULT 45",
         "default_shuffle_questions": "INTEGER DEFAULT 0",
         "default_shuffle_options": "INTEGER DEFAULT 0",
         "last_seen": "TEXT",
         "member_verified_ts": "REAL DEFAULT 0",
         "member_checked_ts": "REAL DEFAULT 0",
+        "first_start_notified": "INTEGER DEFAULT 0",
+        "first_start_at": "TEXT DEFAULT ''",
     },
     "quizzes": {
         "pre_text": "TEXT DEFAULT ''",
@@ -337,6 +343,10 @@ def _columns(con, table) -> set[str]:
 def init_db() -> None:
     with connect() as con:
         con.execute("PRAGMA journal_mode=WAL")
+        had_users_table = bool(
+            con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'").fetchone()
+        )
+        had_first_start_col = ("first_start_notified" in _columns(con, "users")) if had_users_table else True
         con.executescript(SCHEMA)
         # --- migrate older schema in place ---
         for table, cols in _MIGRATION_COLUMNS.items():
@@ -344,6 +354,15 @@ def init_db() -> None:
             for col, decl in cols.items():
                 if col not in existing:
                     con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        if had_users_table and not had_first_start_col:
+            # Pre-existing users in a migrated database already started the bot earlier;
+            # mark them notified so a redeploy/upgrade never spams duplicate notifications.
+            con.execute("""
+                UPDATE users
+                SET first_start_notified=1,
+                    first_start_at=COALESCE(NULLIF(first_start_at, ''), created_at, CURRENT_TIMESTAMP)
+                WHERE first_start_notified=0
+            """)
         qcols = _columns(con, "quizzes")
         if {"timer", "shuffle_questions", "shuffle_options"} <= qcols:
             # old version kept settings on the quizzes table
@@ -373,15 +392,17 @@ def init_db() -> None:
 def upsert_user(user) -> None:
     if user is None:
         return
+    last_name = getattr(user, "last_name", None) or ""
     with connect() as con:
         con.execute("""
-            INSERT INTO users(user_id, username, first_name, last_seen)
-            VALUES(?,?,?,CURRENT_TIMESTAMP)
+            INSERT INTO users(user_id, username, first_name, last_name, default_timer, last_seen)
+            VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)
             ON CONFLICT(user_id) DO UPDATE SET
               username=excluded.username,
               first_name=excluded.first_name,
+              last_name=excluded.last_name,
               last_seen=CURRENT_TIMESTAMP
-        """, (user.id, user.username or "", user.first_name or ""))
+        """, (user.id, user.username or "", user.first_name or "", last_name, config.DEFAULT_TIMER))
 
 
 def get_user(user_id: int) -> Optional[dict]:
@@ -392,9 +413,50 @@ def get_user(user_id: int) -> Optional[dict]:
 
 def ensure_user_row(user_id: int) -> dict:
     with connect() as con:
-        con.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (user_id,))
+        con.execute(
+            "INSERT OR IGNORE INTO users(user_id, default_timer) VALUES(?, ?)",
+            (user_id, config.DEFAULT_TIMER),
+        )
         row = con.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
     return dict(row)
+
+
+def prepare_first_start_notification(user, now_str: str) -> tuple[bool, str]:
+    """Ensure the user row exists and check whether first-start notification is needed.
+
+    Returns ``(should_notify, first_start_at)``.  ``first_start_notified`` is only
+    flipped to ``1`` by :func:`mark_first_start_notified` after the message to the
+    support group succeeds, so temporary delivery failures can retry safely while
+    keeping the original ``first_start_at`` timestamp.
+    """
+    if user is None:
+        return False, now_str
+    upsert_user(user)
+    with connect() as con:
+        row = con.execute(
+            "SELECT first_start_notified, first_start_at FROM users WHERE user_id=?",
+            (user.id,),
+        ).fetchone()
+        if not row:
+            return False, now_str
+        if int(row["first_start_notified"] or 0):
+            return False, row["first_start_at"] or now_str
+        ts = (row["first_start_at"] or "").strip() or now_str
+        if not (row["first_start_at"] or "").strip():
+            con.execute("UPDATE users SET first_start_at=? WHERE user_id=?", (ts, user.id))
+        return True, ts
+
+
+def mark_first_start_notified(user_id: int, ts_str: str = "") -> None:
+    with connect() as con:
+        if ts_str:
+            con.execute(
+                "UPDATE users SET first_start_notified=1, "
+                "first_start_at=COALESCE(NULLIF(first_start_at, ''), ?) WHERE user_id=?",
+                (ts_str, user_id),
+            )
+        else:
+            con.execute("UPDATE users SET first_start_notified=1 WHERE user_id=?", (user_id,))
 
 
 _USER_SETTING_FIELDS = {"default_timer", "default_shuffle_questions", "default_shuffle_options"}

@@ -823,7 +823,7 @@ async def handle_creator_callback(update: Update, context) -> None:
             val = int(val_s)
         except ValueError:
             val = -1
-        if val not in config.TIMER_CHOICES:
+        if val not in config.TIMER_CHOICES and not (config.CUSTOM_TIMER_MIN <= val <= config.CUSTOM_TIMER_MAX):
             await q.answer("⌛ यह button अब valid नहीं है।")
             return
         _set_creation_timer(data, val)
@@ -998,7 +998,7 @@ async def handle_edit_callback(update: Update, context) -> None:
                 parse_mode=ParseMode.HTML)
             return
         val = _qid_arg(parts, 3)
-        if val not in config.TIMER_CHOICES:
+        if val is None or (val not in config.TIMER_CHOICES and not (config.CUSTOM_TIMER_MIN <= val <= config.CUSTOM_TIMER_MAX)):
             return
         db.update_quiz(qid, timer=val)
         await show_quiz_settings(update, qid)
