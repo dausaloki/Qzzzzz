@@ -120,9 +120,11 @@ class FakeBotAPI:
                 self.msg_id += 1
                 self.sent.append(params)
                 mid = self.msg_id
+            raw_cid = str(params.get("chat_id", 0))
+            cid = int(raw_cid) if raw_cid.lstrip("-").isdigit() else -100999123
             return 200, {"ok": True, "result": {
                 "message_id": mid, "date": int(time.time()),
-                "chat": {"id": int(params.get("chat_id", 0)), "type": "private"},
+                "chat": {"id": cid, "type": "private" if cid > 0 else "supergroup"},
                 "text": params.get("text", "")}}
         return 200, {"ok": True, "result": True}
 

@@ -31,6 +31,24 @@ def _markup(p: dict) -> dict:
     return rm or {}
 
 
+def _cid_int(v) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return -100999123 if str(v).startswith("@") else 0
+
+
+def _same_chat(sent_cid, want_cid) -> bool:
+    if want_cid is None:
+        return True
+    if str(want_cid).startswith("@") or str(sent_cid).startswith("@"):
+        return str(sent_cid).lower() == str(want_cid).lower()
+    try:
+        return int(sent_cid) == int(want_cid)
+    except (TypeError, ValueError):
+        return str(sent_cid) == str(want_cid)
+
+
 def _check_markup(api: str, p: dict) -> None:
     """Enforce the Bot API rules the bot relies on for reply keyboards."""
     rm = _markup(p)
@@ -38,8 +56,8 @@ def _check_markup(api: str, p: dict) -> None:
         if api.startswith("edit"):
             # only inline keyboards can be attached by editing a message
             raise _ApiError(400, "Bad Request: inline keyboard expected")
-        if int(p.get("chat_id", 0)) < 0 and any(b.get("request_poll") for row in rm["keyboard"]
-                                                for b in row if isinstance(b, dict)):
+        if _cid_int(p.get("chat_id", 0)) < 0 and any(b.get("request_poll") for row in rm["keyboard"]
+                                                     for b in row if isinstance(b, dict)):
             raise _ApiError(400, "Bad Request: keyboard button request poll is allowed only in private chats")
 
 
@@ -110,12 +128,16 @@ class FakeTelegram(BaseRequest):
 
     # -- API emulation ------------------------------------------------------------
     def _message(self, chat_id, **extra) -> dict:
-        chat_id = int(chat_id)
-        chat = {"id": chat_id, "type": "private" if chat_id > 0 else "supergroup"}
-        if chat_id < 0:
-            chat["title"] = "Test Group"
+        raw_cid = str(chat_id)
+        if raw_cid.startswith("@"):
+            chat = {"id": -100999123, "type": "supergroup", "title": raw_cid, "username": raw_cid.lstrip("@")}
         else:
-            chat["first_name"] = "User"
+            cid = int(chat_id)
+            chat = {"id": cid, "type": "private" if cid > 0 else "supergroup"}
+            if cid < 0:
+                chat["title"] = "Test Group"
+            else:
+                chat["first_name"] = "User"
         m = {"message_id": next(self._msg_ids), "date": int(time.time()), "chat": chat,
              "from": BOT_USER}
         m.update(extra)
@@ -260,13 +282,13 @@ class FakeTelegram(BaseRequest):
         return base
 
     # -- helpers for assertions -----------------------------------------------------
-    def sent(self, api: str, chat_id: Optional[int] = None) -> list[dict]:
-        return [p for a, p in self.calls if a == api and (chat_id is None or int(p.get("chat_id", 0)) == chat_id)]
+    def sent(self, api: str, chat_id: Optional[int | str] = None) -> list[dict]:
+        return [p for a, p in self.calls if a == api and _same_chat(p.get("chat_id", 0), chat_id)]
 
-    def texts(self, chat_id: Optional[int] = None) -> list[str]:
+    def texts(self, chat_id: Optional[int | str] = None) -> list[str]:
         out = []
         for a, p in self.calls:
-            if a in ("sendMessage", "editMessageText") and (chat_id is None or int(p.get("chat_id", 0)) == chat_id):
+            if a in ("sendMessage", "editMessageText") and _same_chat(p.get("chat_id", 0), chat_id):
                 out.append(p.get("text", ""))
         return out
 
@@ -293,8 +315,14 @@ class UpdateFactory:
         self._uid = itertools.count(1)
         self._mid = itertools.count(1)
 
-    def user(self, uid: int, name: str = "Tester", username: Optional[str] = None) -> dict:
-        return {"id": uid, "is_bot": False, "first_name": name, "username": username or f"user{uid}"}
+    def user(self, uid: int, name: str = "Tester", username: Optional[str] = None,
+             last_name: Optional[str] = None, no_username: bool = False) -> dict:
+        u = {"id": uid, "is_bot": False, "first_name": name}
+        if not no_username:
+            u["username"] = username if username is not None else f"user{uid}"
+        if last_name is not None:
+            u["last_name"] = last_name
+        return u
 
     def _chat(self, chat_id: int) -> dict:
         if chat_id < 0:
