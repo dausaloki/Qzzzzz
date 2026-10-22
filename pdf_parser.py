@@ -46,6 +46,7 @@ from pdf_extract import SourceError  # re-exported  # noqa: F401
 LETTERS = "ABCDEFGHIJKL"[:MAX_OPTIONS]
 _LOWER = LETTERS.lower()
 _HINDI_LETTERS = "कखगघङचछजझञटठ"[:MAX_OPTIONS]
+_HINDI_ABSD = "अबसदइफयरलवशष"[:MAX_OPTIONS]
 _CIRCLED_UP = "".join(chr(0x24B6 + i) for i in range(MAX_OPTIONS))    # Ⓐ…Ⓛ
 _CIRCLED_LO = "".join(chr(0x24D0 + i) for i in range(MAX_OPTIONS))    # ⓐ…ⓛ
 _CIRCLED_NUM = "".join(chr(0x2460 + i) for i in range(MAX_OPTIONS))   # ①…⑫
@@ -138,15 +139,17 @@ class ParseResult:
 
 
 # ------------------------------------------------------------------ regexes
-_H = _HINDI_LETTERS
+_H = _HINDI_LETTERS + _HINDI_ABSD
 _TOK = (r"(?:1[0-2]|[1-9]|[A-La-l]|[" + _H + r"]|[" + _CIRCLED_UP + _CIRCLED_LO + _CIRCLED_NUM + r"])")
 
 STRONG_Q_RE = re.compile(
-    r"^\s*(?:प्रश्न|प्र\s*\.|Question|Ques\.?|Que\.?|Q)\s*(?:सं(?:ख्या)?\s*\.?|No\s*\.?)?"
-    r"\s*[\.\-:#]?\s*(?P<num>\d{1,4})\s*(?:[\.\):\-–—]+|(?=\s)|$)\s*(?P<rest>.*)$",
+    r"^\s*[\(\[\{]?\s*(?:प्रश्न|प्र\s*\.|Question|Ques\.?|Que\.?|Q)\s*(?:सं(?:ख्या)?\s*\.?|No\s*\.?)?"
+    r"\s*[\(\[\{]?\s*[\.\-:#–—]?\s*(?P<num>\d{1,4})\s*(?:[\.\)\]\}:;\-–—]+|(?=\s)|$)\s*(?P<rest>.*)$",
     re.IGNORECASE,
 )
-WEAK_Q_RE = re.compile(r"^\s*(?P<num>\d{1,4})\s*(?:\.(?!\d)|\))\s*(?P<rest>.*)$")
+WEAK_Q_RE = re.compile(
+    r"^\s*[\(\[]?\s*(?P<num>\d{1,4})\s*(?:\.(?!\d)|[\)\]]\.?)\s*(?P<rest>.*)$"
+)
 
 # Option markers at the start of a line
 _OPT_RE = re.compile(
@@ -300,7 +303,7 @@ def token_to_index(tok: str) -> Optional[int]:
     if not tok:
         return None
     if len(tok) == 1:
-        for alpha in (LETTERS, _LOWER, _HINDI_LETTERS, _CIRCLED_UP, _CIRCLED_LO, _CIRCLED_NUM):
+        for alpha in (LETTERS, _LOWER, _HINDI_LETTERS, _HINDI_ABSD, _CIRCLED_UP, _CIRCLED_LO, _CIRCLED_NUM):
             if tok in alpha:
                 return alpha.index(tok)
     if tok in _NUMS:
@@ -368,6 +371,8 @@ def _norm_cmp(s: str) -> str:
 def _family(tok: str) -> str:
     if tok in _HINDI_LETTERS:
         return "hindi"
+    if tok in _HINDI_ABSD:
+        return "hindi_absd"
     if tok in _CIRCLED_UP or tok in _CIRCLED_LO:
         return "circled"
     if tok in _CIRCLED_NUM:        # before isdigit(): "①".isdigit() is True
@@ -395,6 +400,8 @@ def parse_marker(line: str) -> Optional[tuple[str, int, str]]:
 def _marker_seq(start_tok: str) -> list[str]:
     if start_tok in _HINDI_LETTERS:
         return list(_HINDI_LETTERS)
+    if start_tok in _HINDI_ABSD:
+        return list(_HINDI_ABSD)
     if start_tok.isdigit():
         return list(_NUMS)
     if start_tok in _CIRCLED_UP:
@@ -789,11 +796,19 @@ class _Cand:
 
 
 def _question_candidates(lines: list[str]) -> list[_Cand]:
+    num_opt_lines = {
+        li
+        for r in complete_runs(lines)
+        if r.family == "num"
+        for li in r.marker_lines
+    }
     cands = []
     for i, ln in enumerate(lines):
         m = STRONG_Q_RE.match(ln)
         if m:
             cands.append(_Cand(i, int(m.group("num")), True))
+            continue
+        if i in num_opt_lines:
             continue
         m = WEAK_Q_RE.match(ln)
         if m:
@@ -955,7 +970,11 @@ def split_blocks(lines: list[str], evidence: Optional[list[int]] = None
             c, prev = cands[j], cands[acc[-1][0]]
             if prev.num < c.num <= prev.num + _JUMP:
                 ok = bw(prev.line, c.line) or (
-                    c.num == prev.num + 1 and _answer_line_before(lines, prev.line, c.line))
+                    c.num == prev.num + 1 and (
+                        _answer_line_before(lines, prev.line, c.line)
+                        or (prev.strong and c.strong)
+                    )
+                )
                 if ok and _monotone_ok(cands, j, prev.num, run_starts) and not dup_later(j):
                     acc.append((j, False))
                     j += 1
@@ -1460,9 +1479,20 @@ def parse_source(text: str, *, ocr: bool = False, line_pages: Optional[list[int]
         return page_of(pos[start]) if start < len(pos) else None
 
     if not blocks:
+        q_cands = _question_candidates(lines)
+        opt_runs = complete_runs(lines)
+        if q_cands and not opt_runs:
+            detail = (f"फ़ाइल में {len(q_cands)} प्रश्न-क्रमांक मिले, पर किसी में भी मान्य विकल्प "
+                      f"((A)/(B)/… या (अ)/(ब)/… या (क)/(ख)/…) नहीं मिले। ")
+        elif opt_runs and not q_cands:
+            detail = (f"फ़ाइल में {len(opt_runs)} विकल्प-समूह मिले, पर कोई मान्य प्रश्न-क्रमांक "
+                      f"('[प्रश्न 1]', 'प्रश्न 1.', '1.', '(1)', 'Q1') नहीं मिला। ")
+        else:
+            detail = f"({len(lines)} पंक्तियों में 0 प्रश्न-क्रमांक और 0 विकल्प-समूह मिले।) "
         result.errors.append(ParseError(
             None,
-            "कोई प्रश्न नहीं मिला। प्रश्न 'प्रश्न 1.', '1.', '1)', 'Q1', 'Q.1' से शुरू होने चाहिए "
+            "कोई प्रश्न नहीं मिला। " + detail +
+            "प्रश्न '[प्रश्न 1]', 'प्रश्न 1.', '1.', '1)', '(1)', 'Q1', 'Q.1' से शुरू होने चाहिए "
             "और हर प्रश्न में (A)/(B)/… options होने चाहिए। Scanned PDF या Kruti Dev जैसे "
             "legacy font वाली PDF के लिए OCR चाहिए।"))
         return result
