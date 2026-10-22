@@ -12,6 +12,7 @@ States
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import logging
 import time
@@ -1154,6 +1155,175 @@ async def _extract_html(update: Update, raw: bytes, status_msg):
     return ex.result, notes
 
 
+_GENERIC_STEMS = {
+    "source", "import", "quiz", "test", "questions", "question", "mcq", "mcqs",
+    "file", "doc", "document", "text", "txt", "pdf", "html", "data", "set",
+    "part", "paper", "exam", "notes", "sample", "new", "old", "untitled",
+}
+_TOPIC_PREFIX_ONLY_RE = re.compile(
+    r"^(?:topic|chapter|ch|unit|lesson|module|अध्याय|टॉपिक|इकाई|पाठ)$",
+    re.IGNORECASE,
+)
+_TOPIC_ID_RE = re.compile(
+    r"^(?:topic|chapter|ch|unit|lesson|module|अध्याय|टॉपिक|इकाई|पाठ)[\s_\-–—:.#]*0*(\d+)\b",
+    re.IGNORECASE,
+)
+_BATCH_SUFFIX_RE = re.compile(
+    r"(?:[\s_\-–—:.]+"
+    r"(?:"
+    r"full|complete|all|combined|master|final|extra|remaining|supplement|addendum"
+    r"|(?:part|pt|set|batch|vol|volume|section|sec|file|भाग|पार्ट|सेट|खण्ड|खंड)\s*[\.\-_#]?\s*(?:\d+|[a-dA-D]|[iIvVxX]+)"
+    r"|(?:q|ques|questions?|प्रश्न)?\s*\d+\s*(?:to|\-|–|_|से)\s*\d+"
+    r")"
+    r"|\s*[\(\[]\s*(?:(?:part|pt|set|भाग|पार्ट)\s*)?\d+\s*[\)\]]"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+
+def clean_topic_title(filename: str) -> str:
+    """Strip part/full/set/range suffixes from a filename stem to get the shared topic title."""
+    stem = Path(filename or "").stem.strip()
+    if not stem:
+        return ""
+    cur = stem
+    while True:
+        nxt = _BATCH_SUFFIX_RE.sub("", cur).strip(" _-–—:.")
+        if nxt and nxt != cur:
+            cur = nxt
+            continue
+        m = re.match(r"^(?P<head>.+?)[\s_\-–—]+(?P<num>\d{1,2})$", cur)
+        if m and not _TOPIC_PREFIX_ONLY_RE.match(m.group("head").strip()):
+            head_tokens = [t for t in re.split(r"[\s_\-–—:.]+", m.group("head")) if t and not t.isdigit()]
+            if any(not _TOPIC_PREFIX_ONLY_RE.match(t) and t.lower() not in _GENERIC_STEMS for t in head_tokens):
+                cur = m.group("head").strip(" _-–—:.")
+                continue
+        break
+    return cur or stem
+
+
+def extract_topic_info(filename: str, caption: str = "") -> dict:
+    """Return normalized topic metadata for grouping uploaded files."""
+    base = clean_topic_title(filename)
+    key = re.sub(r"[\s_\-–—:.]+", "_", base.lower()).strip("_")
+    m_id = _TOPIC_ID_RE.match(base) or _TOPIC_ID_RE.match(Path(filename or "").stem.strip())
+    topic_num = int(m_id.group(1)) if m_id else None
+    words = [
+        w for w in key.split("_")
+        if len(w) >= 2 and not w.isdigit() and not _TOPIC_PREFIX_ONLY_RE.match(w) and w not in _GENERIC_STEMS
+    ]
+    return {
+        "base_title": base,
+        "key": key,
+        "topic_num": topic_num,
+        "words": words,
+        "caption": (caption or "").strip(),
+    }
+
+
+def classify_topic_relation(existing_files: list[dict], new_entry: dict) -> str:
+    """Return ``'same'``, ``'different'``, or ``'ambiguous'`` for a newly uploaded file."""
+    if not existing_files:
+        return "same"
+    ref = existing_files[0]
+    info1 = extract_topic_info(ref.get("name", ""), ref.get("caption", ""))
+    info2 = extract_topic_info(new_entry.get("name", ""), new_entry.get("caption", ""))
+
+    # Explicit identical user caption on both files
+    if info1["caption"] and info2["caption"] and info1["caption"].lower() == info2["caption"].lower():
+        return "same"
+
+    t1, t2 = info1["topic_num"], info2["topic_num"]
+    w1, w2 = set(info1["words"]), set(info2["words"])
+
+    if t1 is not None and t2 is not None:
+        if t1 != t2:
+            return "different"
+        # Same topic number (e.g. Topic_02_... and Topic_02_...):
+        # if both have subject words, they must not be completely disjoint
+        if w1 and w2 and not (w1 & w2):
+            return "different"
+        return "same"
+
+    if (t1 is None) != (t2 is None):
+        # One has Topic_XX and the other doesn't: require >=2 shared subject words or exact subset
+        shared = w1 & w2
+        if len(shared) >= 2 or (shared and (w1 <= w2 or w2 <= w1)):
+            return "same"
+        return "different"
+
+    # Neither has an explicit Topic_XX number
+    if not w1 or not w2:
+        return "ambiguous"
+    if info1["key"] == info2["key"]:
+        if len(info1["key"]) < 3 or info1["key"] in _GENERIC_STEMS:
+            return "ambiguous"
+        return "same"
+    shared = w1 & w2
+    if len(shared) >= 2 or (shared and (w1 <= w2 or w2 <= w1) and max(len(x) for x in shared) >= 4):
+        return "same"
+    return "different"
+
+
+def _make_file_entry(name: str, raw: bytes, caption: str, default_title: str,
+                     res: pdf_parser.ParseResult, notes: Optional[list], source: str) -> dict:
+    questions = []
+    for q in res.questions:
+        qd = q.to_dict()
+        if not qd.get("source_ref"):
+            qd["source_ref"] = name
+        questions.append(qd)
+    return {
+        "name": name,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "caption": caption,
+        "default_title": default_title,
+        "source": source,
+        "questions": questions,
+        "raw_errors": [str(e) for e in res.errors],
+        "errors_meta": [
+            {"number": e.number, "message": e.message, "section": e.section, "page": e.page}
+            for e in res.errors
+        ],
+        "raw_warnings": list(res.warnings),
+        "raw_review": list(res.review),
+        "removed": list(res.removed),
+        "ocr_pages": list(res.ocr_pages),
+        "report": pdf_parser.import_report(res),
+        "notes": list(notes or []),
+    }
+
+
+def _question_sig(q: dict) -> tuple:
+    qnorm = re.sub(r"\s+", " ", (q.get("question") or "").strip()).lower()
+    onorm = tuple(re.sub(r"\s+", " ", str(o).strip()).lower() for o in (q.get("options") or []))
+    return (qnorm, onorm, int(q.get("correct_index", -1)))
+
+
+async def _send_topic_confirmation(update: Update, data: dict, new_entry: dict) -> None:
+    batch_files = data.get("batch_files") or []
+    prev_names = ", ".join(f["name"] for f in batch_files[:4])
+    if len(batch_files) > 4:
+        prev_names += f" (+{len(batch_files) - 4})"
+    pending = data.get("pending_files") or []
+    pend_names = ", ".join(f["name"] for f in pending)
+    text = (
+        "⚠️ <b>Topic / Batch Confirmation</b>\n\n"
+        f"नई file <b>{esc(new_entry['name'])}</b> का नाम/topic पहले से अपलोड की गई file(s) "
+        f"(<b>{esc(prev_names)}</b>) से अलग या अस्पष्ट लग रहा है।\n"
+        f"• मौजूदा batch: <b>{sum(len(f['questions']) for f in batch_files)}</b> प्रश्न ({len(batch_files)} file)\n"
+        f"• नई pending file(s) ({esc(pend_names)}): <b>{sum(len(f['questions']) for f in pending)}</b> प्रश्न\n\n"
+        "क्या आप इन्हें एक ही Combined Quiz में जोड़ना चाहते हैं, या अलग Quiz बनाना चाहते हैं?"
+    )
+    rows = [
+        [B("🔗 इसी Combined Quiz में जोड़ें (Merge)", callback_data="i:merge_pending")],
+        [B("🆕 सिर्फ नई File से अलग Quiz बनाएँ", callback_data="i:replace_pending")],
+        [B("🚫 नई File छोड़ें (मौजूदा batch रखें)", callback_data="i:drop_pending")],
+        [B("❌ Cancel", callback_data="i:cancel")],
+    ]
+    await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=M(rows))
+
+
 async def handle_import_document(update: Update, context) -> None:
     msg = update.effective_message
     user = update.effective_user
@@ -1168,7 +1338,10 @@ async def handle_import_document(update: Update, context) -> None:
         await msg.reply_text("🔒 HTML import केवल administrator के लिए है। PDF/.txt import पहले की तरह खुला है।")
         return
     status = await msg.reply_text("⏳ File पढ़ी जा रही है…")
-    default_title = (msg.caption or "").strip() or Path(name).stem[:TITLE_MAX] or "Imported Quiz"
+    caption = (msg.caption or "").strip()
+    default_title = caption or Path(name).stem[:TITLE_MAX] or "Imported Quiz"
+    source = "html" if is_html else "import"
+    hnotes: list[str] = []
     try:
         tg_file = await doc.get_file()
         raw = bytes(await tg_file.download_as_bytearray())
@@ -1176,10 +1349,8 @@ async def handle_import_document(update: Update, context) -> None:
             res, hnotes = await _extract_html(update, raw, status)
             if res is None:
                 return
-            await _parse_and_review(update, user.id, "", default_title, status_msg=status, res=res,
-                                    notes=hnotes, source="html")
-            return
-        if is_pdf:
+            text = ""
+        elif is_pdf:
             loop = asyncio.get_running_loop()
             last = [0.0]
 
@@ -1198,7 +1369,7 @@ async def handle_import_document(update: Update, context) -> None:
             text = ""
         else:
             text = pdf_parser.decode_text_bytes(raw)
-            res = None
+            res = await asyncio.to_thread(pdf_parser.parse_source, text)
     except pdf_parser.SourceError as exc:
         await status.edit_text(f"❌ {exc}")
         return
@@ -1209,12 +1380,59 @@ async def handle_import_document(update: Update, context) -> None:
         log.exception("import read failure")
         await status.edit_text(f"❌ File पढ़ने में समस्या: {exc}")
         return
-    await _parse_and_review(update, user.id, text, default_title, status_msg=status, res=res)
+
+    entry = _make_file_entry(name, raw, caption, default_title, res, hnotes, source)
+    state, prev_data = db.get_state(user.id)
+    prev_files = list((prev_data or {}).get("batch_files") or [])
+    prev_dups = list((prev_data or {}).get("dup_files") or [])
+    prev_pending = list((prev_data or {}).get("pending_files") or [])
+    explicit_batch = bool((prev_data or {}).get("explicit_batch"))
+    has_valid_prev = sum(len(f.get("questions") or []) for f in prev_files) > 0
+
+    if state in ("imp_review", "imp_title") and prev_files and (has_valid_prev or explicit_batch):
+        # Accidental duplicate upload of the exact same file in the current batch
+        if any(f.get("sha256") == entry["sha256"] for f in prev_files):
+            prev_dups.append({"name": name, "sha256": entry["sha256"], "count": len(entry["questions"])})
+            await _present_batch_review(
+                update,
+                user.id,
+                prev_files,
+                prev_dups,
+                status_msg=status,
+                extra_notes=[
+                    f"Duplicate file skipped: '{name}' ({len(entry['questions'])} प्रश्न पहले से इस batch में शामिल हैं — दोबारा import नहीं किए गए)।"
+                ],
+                pending_files=prev_pending,
+            )
+            return
+
+        rel = classify_topic_relation(prev_files, entry)
+        if not prev_pending and (rel == "same" or (explicit_batch and rel == "ambiguous")):
+            prev_files.append(entry)
+            await _present_batch_review(update, user.id, prev_files, prev_dups, status_msg=status)
+            return
+
+        # Different topic or ambiguous filename without explicit batch selection → ask confirmation
+        if status is not None:
+            try:
+                await status.delete()
+            except TelegramError:
+                pass
+        prev_pending.append(entry)
+        prev_data["pending_files"] = prev_pending
+        db.set_state(user.id, "imp_review", prev_data)
+        await _send_topic_confirmation(update, prev_data, entry)
+        return
+
+    await _present_batch_review(update, user.id, [entry], [], status_msg=status)
 
 
 async def handle_import_text(update: Update, context, state: str, data: dict) -> None:
     msg = update.effective_message
     user = update.effective_user
+    if msg.document and is_import_document(msg.document):
+        await handle_import_document(update, context)
+        return
     if state == "imp_title":
         title = (msg.text or "").strip()
         if not title:
@@ -1224,9 +1442,6 @@ async def handle_import_text(update: Update, context, state: str, data: dict) ->
             await msg.reply_text(f"⚠️ अधिकतम {TITLE_MAX} characters।")
             return
         await _create_imported(update, user.id, data, title)
-        return
-    if msg.document and is_import_document(msg.document):
-        await handle_import_document(update, context)
         return
     if not msg.text:
         await msg.reply_text("⚠️ PDF/.txt file या text भेजें।")
@@ -1266,14 +1481,19 @@ def part_ranges(chunks: list[list]) -> list[str]:
 
 def report_lines(rep: dict, parts: int) -> list[str]:
     """Import report (plain text; the caller escapes for HTML)."""
-    out = ["📊 Import Report",
-           f"• Total detected: {rep['total_detected']}",
-           f"• Parsed: {rep['parsed']}",
-           f"• Verification Required: {rep['verification_required']}",
-           f"• Failed: {rep['failed']}" + (f" (+{rep['other_errors']} अन्य समस्याएँ)" if rep.get("other_errors") else ""),
-           f"• Answer mapped: {rep['answer_key'] + rep['answer_inline']} "
-           f"(answer key से {rep['answer_key']}, प्रश्न के साथ लिखे {rep['answer_inline']})",
-           f"• Parts created: {parts}"]
+    out = ["📊 Import Report"]
+    if rep.get("files_combined") and rep["files_combined"] > 1:
+        out.append(f"• Files combined: {rep['files_combined']}")
+    out += [
+        f"• Total detected: {rep['total_detected']}",
+        f"• Parsed: {rep['parsed']}",
+        f"• Verification Required: {rep['verification_required']}",
+        f"• Failed: {rep['failed']}" + (f" (+{rep['other_errors']} अन्य समस्याएँ)" if rep.get("other_errors") else ""),
+        f"• Duplicates: {rep.get('duplicates', 0)}",
+        f"• Answer mapped: {rep['answer_key'] + rep['answer_inline']} "
+        f"(answer key से {rep['answer_key']}, प्रश्न के साथ लिखे {rep['answer_inline']})",
+        f"• Parts created: {parts}",
+    ]
     if rep.get("problems"):
         out.append("समस्याएँ (पेज · प्रश्न · कारण):")
         out += [f"  - पेज {pg or '?'} · {ref} · {why}" for pg, ref, why in rep["problems"]]
@@ -1446,6 +1666,234 @@ async def _parse_and_review(update: Update, user_id: int, text: str, default_tit
                                 reply_markup=M(rows) if i == len(msgs) - 1 else None)
 
 
+async def _present_batch_review(
+    update: Update,
+    user_id: int,
+    batch_files: list[dict],
+    dup_files: list[dict],
+    *,
+    status_msg=None,
+    extra_notes: Optional[list[str]] = None,
+    pending_files: Optional[list[dict]] = None,
+) -> None:
+    """Combine one or more uploaded files in exact upload order and show the review screen."""
+    multi = len(batch_files) > 1
+    questions: list[dict] = []
+    errors_str: list[str] = []
+    review_list: list[str] = []
+    warnings_list: list[str] = []
+    removed_list: list[tuple[str, str]] = []
+    ocr_pages_all: list[int] = []
+    notes_all: list[str] = []
+
+    seen_sigs: set[tuple] = set()
+    cross_file_dups = 0
+    for f in batch_files:
+        fname = f["name"]
+        file_sigs: set[tuple] = set()
+        for q in f["questions"]:
+            sig = _question_sig(q)
+            if sig in seen_sigs:
+                cross_file_dups += 1
+            file_sigs.add(sig)
+            questions.append(q)
+        seen_sigs |= file_sigs
+        if multi:
+            errors_str += [f"[{fname}] {e}" for e in f["raw_errors"]]
+            review_list += [f"[{fname}] {r}" for r in f["raw_review"]]
+            warnings_list += [f"[{fname}] {w}" for w in f["raw_warnings"]]
+            notes_all += [f"[{fname}] {nt}" for nt in f["notes"]]
+        else:
+            errors_str += list(f["raw_errors"])
+            review_list += list(f["raw_review"])
+            warnings_list += list(f["raw_warnings"])
+            notes_all += list(f["notes"])
+        removed_list += list(f["removed"])
+        ocr_pages_all += list(f["ocr_pages"])
+
+    if extra_notes:
+        notes_all += list(extra_notes)
+
+    dup_file_questions = sum(int(d.get("count", 0)) for d in (dup_files or []))
+    total_duplicates = dup_file_questions + cross_file_dups
+
+    problems_combined: list[tuple] = []
+    for f in batch_files:
+        fname = f["name"]
+        for pg, ref, why in f["report"].get("problems") or []:
+            pref = f"{fname} · {ref}" if multi else ref
+            problems_combined.append((pg, pref, why))
+
+    report = {
+        "files_combined": len(batch_files),
+        "total_detected": sum(int(f["report"]["total_detected"]) for f in batch_files),
+        "parsed": sum(int(f["report"]["parsed"]) for f in batch_files),
+        "verification_required": sum(int(f["report"]["verification_required"]) for f in batch_files),
+        "failed": sum(int(f["report"]["failed"]) for f in batch_files),
+        "other_errors": sum(int(f["report"].get("other_errors", 0)) for f in batch_files),
+        "duplicates": total_duplicates,
+        "answer_key": sum(int(f["report"]["answer_key"]) for f in batch_files),
+        "answer_inline": sum(int(f["report"]["answer_inline"]) for f in batch_files),
+        "problems": problems_combined,
+    }
+
+    if not multi:
+        default_title = batch_files[0]["default_title"]
+        source = batch_files[0]["source"]
+    else:
+        first_cap = next((f["caption"] for f in batch_files if f.get("caption")), "")
+        default_title = (
+            first_cap
+            or clean_topic_title(batch_files[0]["name"])[:TITLE_MAX]
+            or batch_files[0]["default_title"]
+            or "Imported Quiz"
+        )
+        sources = {f["source"] for f in batch_files}
+        source = "html" if sources == {"html"} else "import"
+
+    data = {
+        "buffer": "",
+        "parts": 0,
+        "default_title": default_title,
+        "questions": questions,
+        "errors": errors_str,
+        "review": review_list,
+        "report": report,
+        "source": source,
+        "notes": notes_all,
+        "batch_files": batch_files,
+        "dup_files": list(dup_files or []),
+        "pending_files": list(pending_files or []),
+        "explicit_batch": False,
+    }
+    db.set_state(user_id, "imp_review", data)
+
+    n, ne = len(questions), len(errors_str)
+    types = Counter(pdf_parser.QTYPE_LABELS.get(q["qtype"], q["qtype"]) for q in questions)
+    head = ["📥 <b>Import Result</b>", ""]
+    if multi:
+        head.append(f"📂 <b>Combined Topic Batch ({len(batch_files)} files):</b>")
+        for idx_f, f in enumerate(batch_files, 1):
+            head.append(f"  {idx_f}. <code>{esc(f['name'])}</code> — {len(f['questions'])} प्रश्न")
+        head.append("")
+    head += [f"✅ सही parse हुए प्रश्न: <b>{n}</b>", f"❌ समस्या वाले प्रश्न/हिस्से: <b>{ne}</b>"]
+    chunks = plan_parts(questions)
+    if len(chunks) > 1:
+        head.append(f"📦 {len(chunks)} parts बनेंगे (हर part में अधिकतम {config.QUESTIONS_PER_PART} प्रश्न, "
+                    "मूल क्रमांक वही रहेंगे):")
+        head += part_ranges(chunks)
+    head += [""] + [esc(x) for x in report_lines({**report, "problems": report["problems"][:15]}, len(chunks))]
+    if len(report["problems"]) > 15:
+        head.append(f"  … कुल {len(report['problems'])} समस्याएँ — पूरी list full_preview.txt में")
+    head.append("")
+    if types:
+        head.append("📚 " + ", ".join(f"{k}: {v}" for k, v in types.items()))
+    opt_counts = Counter(len(q["options"]) for q in questions)
+    if opt_counts:
+        head.append("🔢 Options: " + ", ".join(f"{k} options × {v}" for k, v in sorted(opt_counts.items())))
+    removed = Counter(kind for kind, _ in removed_list)
+    if removed:
+        head.append("🧹 अलग किए गए (प्रश्न नहीं): " +
+                    ", ".join(f"{_REMOVED_NAMES.get(k, k)}: {v}" for k, v in removed.items()))
+    for w in warnings_list:
+        head.append(f"⚠️ {esc(w)}")
+    for note in notes_all:
+        head.append(f"🧩 {esc(note)}")
+    if review_list:
+        head += ["", "🔎 <b>Import से पहले जांचें:</b>"] + [f"• {esc(r)}" for r in review_list[:20]]
+        if len(review_list) > 20:
+            head.append(f"• … +{len(review_list) - 20} और (full_preview.txt में देखें)")
+
+    previews: list[dict] = []
+    if n:
+        previews.append(questions[0])
+        if multi:
+            for f in batch_files[1:]:
+                if f["questions"]:
+                    previews.append(f["questions"][0])
+        if review_list:
+            major = opt_counts.most_common(1)[0][0]
+            previews += [q for q in questions if len(q["options"]) != major][:4]
+            if ocr_pages_all:
+                previews += questions[1:3]
+            previews += [q for q in questions if q.get("verify") or q.get("flags")][:4]
+        previews += [q for q in questions if q.get("pre_text")][:1]
+        seen_ids = set()
+        uniq = []
+        for q in previews:
+            key = (q.get("source_ref", ""), q.get("section", 0), q["number"])
+            if key not in seen_ids:
+                seen_ids.add(key)
+                uniq.append(q)
+        for q in uniq[: (2 if multi else 8)]:
+            head += [""] + _preview_lines(q)
+
+    rows = []
+    review = bool(review_list)
+    kparts = f" · {len(chunks)} parts" if len(chunks) > 1 else ""
+    if n and not ne:
+        if multi:
+            label = (
+                f"✅ Finish Upload / Create Combined Quiz ({n} प्रश्न · {len(batch_files)} files{kparts})"
+            )
+        else:
+            label = (f"✅ Preview जांच लिया — Quiz बनाएँ ({n}{kparts})" if review
+                     else f"✅ Quiz बनाएँ ({n} प्रश्न{kparts})")
+        rows.append([B(label, callback_data="i:reviewed" if review else "i:create")])
+    elif n and ne:
+        head += ["", f"⚠️ {ne} समस्याएँ हैं (ऊपर list)। Partial quiz तभी बनेगा जब आप नीचे confirm करें।"]
+        rows.append([B(f"⚠️ Confirm: सिर्फ {n} सही प्रश्नों से quiz बनाएँ{kparts}", callback_data="i:partial")])
+    if n:
+        # Offer merging into an existing imported quiz of the same topic owned by this user
+        first_entry = batch_files[0]
+        for qz in db.get_owner_quizzes(user_id)[:15]:
+            if (
+                qz.get("status") == "ready"
+                and not qz.get("series_id")
+                and classify_topic_relation([{"name": qz["title"], "caption": ""}], first_entry) == "same"
+            ):
+                existing_n = int(qz.get("question_count") or db.count_questions(qz["id"]))
+                if 0 < existing_n and existing_n + n <= config.QUESTIONS_PER_PART and (not ne):
+                    rows.append([
+                        B(
+                            f"🔗 मौजूदा Quiz “{qz['title'][:24]}” में जोड़ें ({existing_n}+{n} प्रश्न)",
+                            callback_data=f"i:appendquiz:{qz['id']}",
+                        )
+                    ])
+                break
+        rows.append([B("➕ इसी Topic की और File जोड़ें", callback_data="i:addmore")])
+        head += ["", "📄 सभी प्रश्नों का पूरा preview (प्रश्न, सभी options, Correct Answer) .txt file में भेजा गया है।"]
+    head += [
+        "",
+        "ℹ️ इसी Topic की और files (Part 2, Part 3…) एक ही Quiz में जोड़ने के लिए अगली file भेजें "
+        "या '➕ इसी Topic की और File जोड़ें' दबाएँ। Text कटा हुआ है तो बाकी हिस्सा भेजें।",
+    ]
+    rows.append([B("❌ Cancel", callback_data="i:cancel")])
+
+    chat = update.effective_chat
+    summary = "\n".join(head)
+    if status_msg is not None:
+        try:
+            await status_msg.delete()
+        except TelegramError:
+            pass
+    if ne:
+        err_text = "❌ <b>Parsing errors</b>\n" + "\n".join(f"• {esc(e)}" for e in errors_str)
+        for chunk in engine.split_message(err_text, 3800):
+            await chat.send_message(chunk, parse_mode=ParseMode.HTML)
+    if n:
+        preview = full_preview_text(questions, errors_str, review_list, default_title, report)
+        try:
+            await chat.send_document(InputFile(preview.encode("utf-8"), filename="full_preview.txt"),
+                                     caption=f"📄 Full Preview — {n} प्रश्न")
+        except TelegramError as exc:
+            log.warning("full preview upload failed: %s", exc)
+    msgs = engine.split_message(summary, 3800)
+    for i, chunk in enumerate(msgs):
+        await chat.send_message(chunk, parse_mode=ParseMode.HTML,
+                                reply_markup=M(rows) if i == len(msgs) - 1 else None)
+
+
 async def handle_import_callback(update: Update, context) -> None:
     q = update.callback_query
     user = update.effective_user
@@ -1461,7 +1909,56 @@ async def handle_import_callback(update: Update, context) -> None:
         await q.answer("⌛ यह import expire हो चुका है। फिर से file भेजें।", show_alert=True)
         return
     await q.answer()
+    if action == "addmore":
+        data["explicit_batch"] = True
+        db.set_state(user.id, "imp_review", data)
+        bfiles = data.get("batch_files") or []
+        nq = len(data.get("questions") or [])
+        await update.effective_chat.send_message(
+            f"📎 इसी Topic की अगली File (.txt / .pdf / .html) भेजें — इसके प्रश्न मौजूदा batch "
+            f"(<b>{len(bfiles)}</b> file(s), <b>{nq}</b> प्रश्न) के आगे क्रम से जुड़ जाएँगे।\n\n"
+            "जब सभी files अपलोड हो जाएँ, तो <b>✅ Finish Upload / Create Combined Quiz</b> दबाएँ।",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if action == "merge_pending":
+        pending = list(data.get("pending_files") or [])
+        if not pending:
+            return
+        bfiles = list(data.get("batch_files") or [])
+        dups = list(data.get("dup_files") or [])
+        extra_notes = []
+        for entry in pending:
+            if any(f.get("sha256") == entry["sha256"] for f in bfiles):
+                dups.append({"name": entry["name"], "sha256": entry["sha256"], "count": len(entry["questions"])})
+                extra_notes.append(
+                    f"Duplicate file skipped: '{entry['name']}' ({len(entry['questions'])} प्रश्न पहले से इस batch में शामिल हैं)।"
+                )
+            else:
+                bfiles.append(entry)
+        await _present_batch_review(update, user.id, bfiles, dups, extra_notes=extra_notes)
+        return
+    if action == "replace_pending":
+        pending = list(data.get("pending_files") or [])
+        if not pending:
+            return
+        await _present_batch_review(update, user.id, pending, [])
+        return
+    if action == "drop_pending":
+        bfiles = list(data.get("batch_files") or [])
+        dups = list(data.get("dup_files") or [])
+        data["pending_files"] = []
+        db.set_state(user.id, "imp_review", data)
+        if bfiles:
+            await _present_batch_review(update, user.id, bfiles, dups)
+        return
     if action in ("create", "partial", "split", "partialsplit", "reviewed", "reviewedsplit"):
+        if data.get("pending_files"):
+            await update.effective_chat.send_message(
+                "⚠️ आपने अतिरिक्त file(s) अपलोड की हैं जो अभी confirm नहीं हुई हैं — पहले ऊपर "
+                "'🔗 इसी Combined Quiz में जोड़ें' या '🚫 नई File छोड़ें' चुनें।"
+            )
+            return
         if not data.get("questions"):
             await update.effective_chat.send_message("❌ कोई valid प्रश्न नहीं है।")
             return
@@ -1477,7 +1974,33 @@ async def handle_import_callback(update: Update, context) -> None:
         await update.effective_chat.send_message(
             "📝 Quiz का नाम भेजें, या default नाम use करें:",
             reply_markup=M([[B(f"✅ Use: {title[:40]}", callback_data="i:usedefault")],
+                            [B("➕ इसी Topic की और File जोड़ें", callback_data="i:addmore")],
                             [B("❌ Cancel", callback_data="i:cancel")]]))
+    elif action.startswith("appendquiz:"):
+        target_qid = action.split(":", 1)[1]
+        quiz = db.get_quiz(target_qid)
+        if not owns(quiz, user.id):
+            await update.effective_chat.send_message("⛔ यह quiz आपका नहीं है।")
+            return
+        questions = data.get("questions") or []
+        if not questions or data.get("errors"):
+            await update.effective_chat.send_message("⚠️ केवल बिना error वाले मान्य प्रश्न ही मौजूदा quiz में जोड़े जा सकते हैं।")
+            return
+        try:
+            db.add_questions_bulk(target_qid, questions)
+        except (db.DatabaseError, ValueError) as exc:
+            await update.effective_chat.send_message(f"❌ प्रश्न जोड़े नहीं जा सके: {exc}")
+            return
+        db.clear_state(user.id)
+        updated_quiz = db.get_quiz(target_qid)
+        me = await update.get_bot().get_me()
+        link = engine.deep_link(me.username, target_qid)
+        await update.effective_chat.send_message(
+            f"✅ <b>{len(questions)} नए प्रश्न मौजूदा Quiz में जोड़ दिए गए!</b>\n\n{quiz_summary(updated_quiz, link)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb.quiz_card(target_qid, True),
+            disable_web_page_preview=True,
+        )
     elif action == "usedefault" and state == "imp_title":
         await _create_imported(update, user.id, data, data.get("default_title") or "Imported Quiz")
 
