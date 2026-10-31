@@ -98,7 +98,9 @@ CREATE TABLE IF NOT EXISTS users (
     member_verified_ts REAL DEFAULT 0,
     member_checked_ts REAL DEFAULT 0,
     first_start_notified INTEGER DEFAULT 0,
-    first_start_at TEXT DEFAULT ''
+    first_start_at TEXT DEFAULT '',
+    batches_json TEXT DEFAULT '[]',
+    is_banned INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS quizzes (
@@ -109,6 +111,12 @@ CREATE TABLE IF NOT EXISTS quizzes (
     pre_text TEXT DEFAULT '',
     status TEXT DEFAULT 'ready',
     source TEXT DEFAULT 'manual',
+    quiz_mode TEXT DEFAULT 'standard',
+    access_tier TEXT DEFAULT 'free',
+    batch_name TEXT DEFAULT '',
+    allowed_chats_json TEXT DEFAULT '[]',
+    section_timers_json TEXT DEFAULT '{}',
+    negative_mark REAL DEFAULT 0,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
@@ -135,6 +143,7 @@ CREATE TABLE IF NOT EXISTS questions (
     pre_media_id TEXT DEFAULT '',
     source_number INTEGER,
     source_ref TEXT DEFAULT '',
+    section TEXT DEFAULT '',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(quiz_id) REFERENCES quizzes(id) ON DELETE CASCADE
 );
@@ -154,6 +163,10 @@ CREATE TABLE IF NOT EXISTS attempts (
     score INTEGER DEFAULT 0,
     timer INTEGER DEFAULT 0,
     shuffle_options INTEGER DEFAULT 0,
+    quiz_mode TEXT DEFAULT 'standard',
+    section_scores_json TEXT DEFAULT '{}',
+    negative_mark REAL DEFAULT 0,
+    net_score REAL,
     started_at TEXT DEFAULT CURRENT_TIMESTAMP,
     started_ts REAL DEFAULT 0,
     finished_at TEXT,
@@ -201,7 +214,8 @@ CREATE TABLE IF NOT EXISTS group_sessions (
     cur_message_id INTEGER,
     cur_question_id INTEGER,
     cur_sent_ts REAL,
-    cur_post_explanation TEXT DEFAULT ''
+    cur_post_explanation TEXT DEFAULT '',
+    negative_mark REAL DEFAULT 0
 );
 
 -- every poll sent in a group session (answers can be mapped back even later)
@@ -262,6 +276,29 @@ CREATE TABLE IF NOT EXISTS review_pdfs (
     created_ts REAL DEFAULT 0,
     sent_ts REAL
 );
+
+CREATE TABLE IF NOT EXISTS batches (
+    name TEXT PRIMARY KEY,
+    description TEXT DEFAULT '',
+    created_by INTEGER DEFAULT 0,
+    created_at REAL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS batch_members (
+    batch_name TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    added_by INTEGER DEFAULT 0,
+    created_at REAL DEFAULT 0,
+    PRIMARY KEY (batch_name, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS authorized_chats (
+    chat_id INTEGER PRIMARY KEY,
+    title TEXT DEFAULT '',
+    batch_name TEXT DEFAULT '',
+    added_by INTEGER DEFAULT 0,
+    created_at REAL DEFAULT 0
+);
 """
 
 INDEXES = """
@@ -278,6 +315,7 @@ CREATE INDEX IF NOT EXISTS idx_quizzes_owner ON quizzes(owner_id);
 CREATE INDEX IF NOT EXISTS idx_gsessions_chat ON group_sessions(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_gpolls_session ON group_polls(session_id);
 CREATE INDEX IF NOT EXISTS idx_ganswers_session ON group_answers(session_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_batch_members_user ON batch_members(user_id);
 """
 
 # Columns that may be missing in databases created by the previous version.
@@ -287,19 +325,29 @@ _MIGRATION_COLUMNS = {
         "default_timer": "INTEGER DEFAULT 45",
         "default_shuffle_questions": "INTEGER DEFAULT 0",
         "default_shuffle_options": "INTEGER DEFAULT 0",
+        "created_at": "TEXT",
         "last_seen": "TEXT",
         "member_verified_ts": "REAL DEFAULT 0",
         "member_checked_ts": "REAL DEFAULT 0",
         "first_start_notified": "INTEGER DEFAULT 0",
         "first_start_at": "TEXT DEFAULT ''",
+        "batches_json": "TEXT DEFAULT '[]'",
+        "is_banned": "INTEGER DEFAULT 0",
     },
     "quizzes": {
         "pre_text": "TEXT DEFAULT ''",
         "status": "TEXT DEFAULT 'ready'",
         "source": "TEXT DEFAULT 'manual'",
+        "created_at": "TEXT",
         "updated_at": "TEXT",
         "series_id": "TEXT",
         "part_no": "INTEGER",
+        "quiz_mode": "TEXT DEFAULT 'standard'",
+        "access_tier": "TEXT DEFAULT 'free'",
+        "batch_name": "TEXT DEFAULT ''",
+        "allowed_chats_json": "TEXT DEFAULT '[]'",
+        "section_timers_json": "TEXT DEFAULT '{}'",
+        "negative_mark": "REAL DEFAULT 0",
     },
     "questions": {
         "qtype": "TEXT DEFAULT 'mcq'",
@@ -308,6 +356,7 @@ _MIGRATION_COLUMNS = {
         "pre_media_id": "TEXT DEFAULT ''",
         "source_number": "INTEGER",
         "source_ref": "TEXT DEFAULT ''",
+        "section": "TEXT DEFAULT ''",
         "created_at": "TEXT",
     },
     "attempts": {
@@ -317,6 +366,10 @@ _MIGRATION_COLUMNS = {
         "current_index": "INTEGER DEFAULT 0",
         "timer": "INTEGER DEFAULT 0",
         "shuffle_options": "INTEGER DEFAULT 0",
+        "quiz_mode": "TEXT DEFAULT 'standard'",
+        "section_scores_json": "TEXT DEFAULT '{}'",
+        "negative_mark": "REAL DEFAULT 0",
+        "net_score": "REAL",
         "started_ts": "REAL DEFAULT 0",
         "duration_sec": "REAL DEFAULT 0",
         "cur_poll_id": "TEXT",
@@ -332,6 +385,10 @@ _MIGRATION_COLUMNS = {
         "position": "INTEGER DEFAULT 0",
         "status": "TEXT DEFAULT 'answered'",
         "answered_at": "TEXT",
+    },
+    # negative mark snapshot taken when a group quiz starts (0 = disabled, the default)
+    "group_sessions": {
+        "negative_mark": "REAL DEFAULT 0",
     },
 }
 
@@ -540,7 +597,11 @@ def get_recent_played_quizzes(user_id: int, limit: int = 10) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-_QUIZ_FIELDS = {"title", "description", "pre_text", "status", "source"}
+_QUIZ_FIELDS = {
+    "title", "description", "pre_text", "status", "source",
+    "quiz_mode", "access_tier", "batch_name", "allowed_chats_json",
+    "section_timers_json", "negative_mark",
+}
 _SETTING_FIELDS = {"timer", "shuffle_questions", "shuffle_options"}
 
 
@@ -593,7 +654,8 @@ def count_questions(qid: str) -> int:
 def add_question(qid: str, question: str, options: list[str], correct_index: int,
                  explanation: str = "", *, qtype: str = "mcq", pre_text: str = "",
                  pre_media_type: str = "", pre_media_id: str = "",
-                 source_number: Optional[int] = None, source_ref: str = "") -> int:
+                 source_number: Optional[int] = None, source_ref: str = "",
+                 section: str = "") -> int:
     _check_question(question, options, correct_index)
     with connect() as con:
         n = con.execute("SELECT COUNT(*) FROM questions WHERE quiz_id=?", (qid,)).fetchone()[0]
@@ -605,11 +667,12 @@ def add_question(qid: str, question: str, options: list[str], correct_index: int
         cur = con.execute("""
             INSERT INTO questions(quiz_id,position,question,options_json,correct_index,
                                   explanation,qtype,pre_text,pre_media_type,pre_media_id,source_number,
-                                  source_ref)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                                  source_ref,section)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (qid, pos, question, json.dumps(list(options), ensure_ascii=False),
               int(correct_index), explanation or "", qtype, pre_text or "",
-              pre_media_type or "", pre_media_id or "", source_number, source_ref or ""))
+              pre_media_type or "", pre_media_id or "", source_number, source_ref or "",
+              (section or "").strip()))
         con.execute("UPDATE quizzes SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (qid,))
         return cur.lastrowid
 
@@ -642,11 +705,12 @@ def add_questions_bulk(qid: str, questions: Iterable[dict], source: str = "impor
         pos = con.execute("SELECT COALESCE(MAX(position),0) FROM questions WHERE quiz_id=?", (qid,)).fetchone()[0]
         con.executemany("""
             INSERT INTO questions(quiz_id,position,question,options_json,correct_index,explanation,qtype,
-                                  pre_text,pre_media_type,pre_media_id,source_number,source_ref)
-            VALUES(?,?,?,?,?,?,?,?,'','',?,?)
+                                  pre_text,pre_media_type,pre_media_id,source_number,source_ref,section)
+            VALUES(?,?,?,?,?,?,?,?,'','',?,?,?)
         """, [(qid, pos + i + 1, q["question"], json.dumps(list(q["options"]), ensure_ascii=False),
                int(q["correct_index"]), q.get("explanation", "") or "", q.get("qtype", "mcq") or "mcq",
-               q.get("pre_text", "") or "", q.get("number"), q.get("source_ref", "") or "") for i, q in enumerate(rows)])
+               q.get("pre_text", "") or "", q.get("number"), q.get("source_ref", "") or "",
+               (q.get("section") or q.get("section_label") or "").strip()) for i, q in enumerate(rows)])
         con.execute("UPDATE quizzes SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (qid,))
     return len(rows)
 
@@ -755,15 +819,18 @@ def move_question(qid: str, question_id: int, delta: int) -> bool:
 
 def user_rank(qid: str, user_id: int) -> tuple[int, int]:
     """(rank, participants) by each user's best finished attempt:
-    more correct first, then faster.  (0, n) if the user has none."""
+    higher net score first (net == correct unless the attempt used negative
+    marking), then faster.  (0, n) if the user has none."""
     with connect() as con:
         rows = con.execute("""
-            SELECT user_id, correct, duration_sec FROM attempts a
+            SELECT user_id, correct, duration_sec,
+                   (correct - wrong * COALESCE(negative_mark, 0)) AS net FROM attempts a
             WHERE quiz_id=? AND status='finished' AND id = (
                 SELECT b.id FROM attempts b WHERE b.quiz_id=a.quiz_id AND b.user_id=a.user_id
                   AND b.status='finished'
-                ORDER BY b.correct DESC, b.duration_sec ASC, b.id ASC LIMIT 1)
-            ORDER BY correct DESC, duration_sec ASC, id ASC
+                ORDER BY (b.correct - b.wrong * COALESCE(b.negative_mark, 0)) DESC,
+                         b.duration_sec ASC, b.id ASC LIMIT 1)
+            ORDER BY net DESC, duration_sec ASC, id ASC
         """, (qid,)).fetchall()
     for i, r in enumerate(rows, 1):
         if r["user_id"] == user_id:
@@ -785,7 +852,7 @@ def delete_question(question_id: int, qid: str) -> bool:
 # --------------------------------------------------------------- attempts
 def create_attempt(qid: str, user_id: int, chat_id: int, order: list[int],
                    timer: int, shuffle_options: bool, started_ts: float,
-                   start_msg_id: Optional[int] = None) -> int:
+                   start_msg_id: Optional[int] = None, *, snapshot_rules: bool = False) -> int:
     with connect() as con:
         cur = con.execute("""
             INSERT INTO attempts(quiz_id,user_id,chat_id,status,order_json,current_index,total,
@@ -793,6 +860,13 @@ def create_attempt(qid: str, user_id: int, chat_id: int, order: list[int],
             VALUES(?,?,?,'active',?,0,?,?,?,?,?)
         """, (qid, user_id, chat_id, json.dumps(order), len(order), int(timer or 0),
               int(bool(shuffle_options)), started_ts, start_msg_id))
+        if snapshot_rules:
+            # Snapshot mode and scoring before the first poll, in the same transaction.
+            # Later quiz edits must not change a running or completed attempt's rules.
+            con.execute("""UPDATE attempts SET
+                quiz_mode=COALESCE((SELECT quiz_mode FROM quizzes WHERE id=?), 'standard'),
+                negative_mark=COALESCE((SELECT negative_mark FROM quizzes WHERE id=?), 0)
+                WHERE id=?""", (qid, qid, cur.lastrowid))
         return cur.lastrowid
 
 
@@ -904,15 +978,20 @@ def quiz_stats(qid: str) -> tuple[dict, list[dict]]:
         # best attempt per user
         leaders = con.execute("""
             SELECT a.user_id, u.username, u.first_name, a.correct, a.wrong, a.skipped,
-                   a.total, a.duration_sec, a.finished_at, a.status
+                   a.total, a.duration_sec, a.finished_at, a.status,
+                   COALESCE(a.negative_mark, 0) AS negative_mark,
+                   (a.correct - a.wrong * COALESCE(a.negative_mark, 0)) AS net
             FROM attempts a LEFT JOIN users u ON u.user_id=a.user_id
             WHERE a.quiz_id=? AND a.status IN ('finished','stopped')
               AND a.id = (
                 SELECT b.id FROM attempts b
                 WHERE b.quiz_id=a.quiz_id AND b.user_id=a.user_id
                   AND b.status IN ('finished','stopped')
-                ORDER BY b.correct DESC, b.duration_sec ASC, b.id ASC LIMIT 1)
-            ORDER BY a.correct DESC, a.duration_sec ASC
+                ORDER BY (b.correct - b.wrong * COALESCE(b.negative_mark, 0)) DESC,
+                         b.duration_sec ASC, b.id ASC LIMIT 1)
+            -- net == correct when negative marking is off (the default), so the
+            -- ranking is unchanged for every quiz that does not use it
+            ORDER BY net DESC, a.duration_sec ASC
             LIMIT 10
         """, (qid,)).fetchall()
     return dict(row), [dict(x) for x in leaders]
@@ -1005,8 +1084,12 @@ def _gs_row(row) -> Optional[dict]:
 
 
 def create_group_session(qid: str, chat_id: int, started_by: int, order: list[int], timer: int,
-                         shuffle_options: bool, started_ts: float) -> Optional[int]:
-    """New session for this group; None if the group already runs a quiz."""
+                         shuffle_options: bool, started_ts: float,
+                         negative_mark: float = 0.0) -> Optional[int]:
+    """New session for this group; None if the group already runs a quiz.
+
+    ``negative_mark`` is a snapshot of the quiz setting at start time (0 = disabled,
+    the default), so later edits to the quiz never change a finished session's score."""
     with connect() as con:
         con.execute("BEGIN IMMEDIATE")
         busy = con.execute("SELECT id FROM group_sessions WHERE chat_id=? AND status='active'",
@@ -1015,10 +1098,10 @@ def create_group_session(qid: str, chat_id: int, started_by: int, order: list[in
             return None
         cur = con.execute("""
             INSERT INTO group_sessions(quiz_id,chat_id,started_by,status,order_json,current_index,total,
-                                       timer,shuffle_options,started_ts)
-            VALUES(?,?,?,'active',?,0,?,?,?,?)
+                                       timer,shuffle_options,started_ts,negative_mark)
+            VALUES(?,?,?,'active',?,0,?,?,?,?,?)
         """, (qid, chat_id, started_by, json.dumps(order), len(order), int(timer),
-              int(bool(shuffle_options)), started_ts))
+              int(bool(shuffle_options)), started_ts, max(0.0, float(negative_mark or 0.0))))
         return cur.lastrowid
 
 
@@ -1254,3 +1337,199 @@ def review_pdf_save(*, status: str, attempt_id: Optional[int] = None, session_id
                   status, now, rid))
         row = con.execute("SELECT * FROM review_pdfs WHERE id=?", (rid,)).fetchone()
     return dict(row) if row else {}
+
+
+# ------------------------------------ expansion: attempts metadata & sections
+def get_latest_completed_attempt(user_id: int, quiz_id: Optional[str] = None) -> Optional[dict]:
+    with connect() as con:
+        if quiz_id:
+            row = con.execute("""
+                SELECT * FROM attempts
+                WHERE user_id=? AND quiz_id=? AND status IN ('finished','stopped')
+                ORDER BY id DESC LIMIT 1
+            """, (int(user_id), str(quiz_id))).fetchone()
+        else:
+            row = con.execute("""
+                SELECT * FROM attempts
+                WHERE user_id=? AND status IN ('finished','stopped')
+                ORDER BY id DESC LIMIT 1
+            """, (int(user_id),)).fetchone()
+    return dict(row) if row else None
+
+
+def get_attempt_answers(attempt_id: int) -> list[dict]:
+    with connect() as con:
+        rows = con.execute("SELECT * FROM answers WHERE attempt_id=? ORDER BY position, id",
+                           (int(attempt_id),)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_attempt_metadata(attempt_id: int, *, quiz_mode: Optional[str] = None,
+                            section_scores: Optional[dict] = None,
+                            negative_mark: Optional[float] = None,
+                            net_score: Optional[float] = None) -> None:
+    sets = []
+    vals: list = []
+    if quiz_mode is not None:
+        sets.append("quiz_mode=?")
+        vals.append(str(quiz_mode))
+    if section_scores is not None:
+        sets.append("section_scores_json=?")
+        vals.append(json.dumps(section_scores, ensure_ascii=False))
+    if negative_mark is not None:
+        sets.append("negative_mark=?")
+        vals.append(float(negative_mark))
+    if net_score is not None:
+        sets.append("net_score=?")
+        vals.append(float(net_score))
+    if not sets:
+        return
+    vals.append(int(attempt_id))
+    with connect() as con:
+        con.execute(f"UPDATE attempts SET {', '.join(sets)} WHERE id=?", tuple(vals))
+
+
+# ------------------------------------ expansion: batches & authorized chats
+def create_batch(name: str, description: str = "", created_by: int = 0) -> dict:
+    bname = (name or "").strip()
+    if not bname:
+        raise ValueError("Batch name is empty")
+    now_ts = time.time()
+    with connect() as con:
+        con.execute("""
+            INSERT INTO batches(name, description, created_by, created_at)
+            VALUES(?,?,?,?)
+            ON CONFLICT(name) DO UPDATE SET description=excluded.description
+        """, (bname, description or "", int(created_by or 0), now_ts))
+        row = con.execute("SELECT * FROM batches WHERE name=?", (bname,)).fetchone()
+    return dict(row) if row else {}
+
+
+def delete_batch(name: str) -> bool:
+    bname = (name or "").strip()
+    with connect() as con:
+        cur = con.execute("DELETE FROM batches WHERE name=?", (bname,))
+        con.execute("DELETE FROM batch_members WHERE batch_name=?", (bname,))
+    return cur.rowcount > 0
+
+
+def list_batches() -> list[dict]:
+    with connect() as con:
+        rows = con.execute("""
+            SELECT b.*, (SELECT COUNT(*) FROM batch_members m WHERE m.batch_name=b.name) AS member_count
+              FROM batches b ORDER BY b.name
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_user_to_batch(batch_name: str, user_id: int, added_by: int = 0) -> None:
+    bname = (batch_name or "").strip()
+    if not bname:
+        raise ValueError("Batch name is empty")
+    uid = int(user_id)
+    now_ts = time.time()
+    ensure_user_row(uid)
+    with connect() as con:
+        con.execute("INSERT OR IGNORE INTO batches(name, created_by, created_at) VALUES(?,?,?)",
+                    (bname, int(added_by or 0), now_ts))
+        con.execute("""
+            INSERT OR REPLACE INTO batch_members(batch_name, user_id, added_by, created_at)
+            VALUES(?,?,?,?)
+        """, (bname, uid, int(added_by or 0), now_ts))
+        mrows = con.execute("SELECT batch_name FROM batch_members WHERE user_id=? ORDER BY batch_name",
+                            (uid,)).fetchall()
+        con.execute("UPDATE users SET batches_json=? WHERE user_id=?",
+                    (json.dumps([r["batch_name"] for r in mrows], ensure_ascii=False), uid))
+
+
+def remove_user_from_batch(batch_name: str, user_id: int) -> bool:
+    bname = (batch_name or "").strip()
+    uid = int(user_id)
+    with connect() as con:
+        cur = con.execute("DELETE FROM batch_members WHERE batch_name=? AND user_id=?", (bname, uid))
+        mrows = con.execute("SELECT batch_name FROM batch_members WHERE user_id=? ORDER BY batch_name",
+                            (uid,)).fetchall()
+        con.execute("UPDATE users SET batches_json=? WHERE user_id=?",
+                    (json.dumps([r["batch_name"] for r in mrows], ensure_ascii=False), uid))
+    return cur.rowcount > 0
+
+
+def get_user_batches(user_id: int) -> list[str]:
+    if not user_id:
+        return []
+    with connect() as con:
+        rows = con.execute("SELECT batch_name FROM batch_members WHERE user_id=? ORDER BY batch_name",
+                           (int(user_id),)).fetchall()
+    return [r["batch_name"] for r in rows]
+
+
+def user_in_batch(user_id: int, batch_name: str) -> bool:
+    bname = (batch_name or "").strip()
+    if not bname or not user_id:
+        return False
+    with connect() as con:
+        row = con.execute(
+            "SELECT 1 FROM batch_members WHERE LOWER(batch_name)=LOWER(?) AND user_id=?",
+            (bname, int(user_id)),
+        ).fetchone()
+    return bool(row)
+
+
+def list_batch_members(batch_name: str) -> list[int]:
+    bname = (batch_name or "").strip()
+    with connect() as con:
+        rows = con.execute("SELECT user_id FROM batch_members WHERE LOWER(batch_name)=LOWER(?) ORDER BY user_id",
+                           (bname,)).fetchall()
+    return [int(r["user_id"]) for r in rows]
+
+
+def add_authorized_chat(chat_id: int, title: str = "", batch_name: str = "", added_by: int = 0) -> dict:
+    cid = int(chat_id)
+    now_ts = time.time()
+    with connect() as con:
+        con.execute("""
+            INSERT INTO authorized_chats(chat_id, title, batch_name, added_by, created_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(chat_id) DO UPDATE
+               SET title=CASE WHEN excluded.title<>'' THEN excluded.title ELSE authorized_chats.title END,
+                   batch_name=excluded.batch_name
+        """, (cid, title or "", (batch_name or "").strip(), int(added_by or 0), now_ts))
+        row = con.execute("SELECT * FROM authorized_chats WHERE chat_id=?", (cid,)).fetchone()
+    return dict(row) if row else {}
+
+
+def remove_authorized_chat(chat_id: int) -> bool:
+    with connect() as con:
+        cur = con.execute("DELETE FROM authorized_chats WHERE chat_id=?", (int(chat_id),))
+    return cur.rowcount > 0
+
+
+def get_authorized_chat(chat_id: int) -> Optional[dict]:
+    if not chat_id:
+        return None
+    with connect() as con:
+        row = con.execute("SELECT * FROM authorized_chats WHERE chat_id=?", (int(chat_id),)).fetchone()
+    return dict(row) if row else None
+
+
+def list_authorized_chats() -> list[dict]:
+    with connect() as con:
+        rows = con.execute("SELECT * FROM authorized_chats ORDER BY chat_id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def chat_has_batch(chat_id: int, batch_name: str) -> bool:
+    bname = (batch_name or "").strip()
+    if not chat_id or not bname:
+        return False
+    row = get_authorized_chat(int(chat_id))
+    if not row:
+        return False
+    return (row.get("batch_name") or "").strip().lower() == bname.lower()
+
+
+def list_all_user_ids() -> list[int]:
+    with connect() as con:
+        rows = con.execute("SELECT user_id FROM users WHERE COALESCE(is_banned, 0)=0 ORDER BY user_id").fetchall()
+    return [int(r["user_id"]) for r in rows]
+

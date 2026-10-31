@@ -97,7 +97,47 @@ def edit_menu(qid: str, quiz: dict) -> M:
         [B("📝 Edit Title", callback_data=f"e:title:{qid}"), B("📄 Edit Description", callback_data=f"e:desc:{qid}")],
         [B(f"📋 Questions ({n})", callback_data=f"e:list:{qid}:0")],
         [B("➕ Add Question", callback_data=f"e:addq:{qid}")],
+        [B("🎯 Quiz Mode & Sections", callback_data=f"e:mode:{qid}"),
+         B("🔒 Access Control", callback_data=f"e:access:{qid}")],
+        [B("🧹 Smart Filter / Clean", callback_data=f"e:clean:{qid}")],
         [B("⬅️ Back", callback_data=f"q:view:{qid}")],
+    ])
+
+
+def quiz_mode_menu(qid: str, quiz: dict) -> M:
+    cur = (quiz.get("quiz_mode") or "standard").strip().lower()
+    import quiz_modes   # local import: quiz_modes imports keyboards
+    neg = quiz_modes.negative_of(quiz)
+    neg_lbl = f"-{quiz_modes.negative_label(neg)}" if neg > 0 else "OFF"
+    return M([
+        [B(f"{'✅ ' if cur == 'standard' else ''}🎯 Standard Mode", callback_data=f"e:setmode:{qid}:standard")],
+        [B(f"{'✅ ' if cur == 'practice' else ''}📘 Practice Mode (Instant Feedback)", callback_data=f"e:setmode:{qid}:practice")],
+        [B(f"{'✅ ' if cur == 'exam' else ''}📝 Exam Mode (Hidden Answers)", callback_data=f"e:setmode:{qid}:exam")],
+        [B(f"{'✅ ' if cur == 'sectional' else ''}📂 Sectional Mode (Section Timers)", callback_data=f"e:setmode:{qid}:sectional")],
+        [B(f"➖ Negative Marking: {neg_lbl}", callback_data=f"e:neg:{qid}")],
+        [B("⏱ Set Section Timer", callback_data=f"e:sectimer:{qid}")],
+        [B("⬅️ Back", callback_data=f"q:edit:{qid}")],
+    ])
+
+
+def quiz_access_menu(qid: str, quiz: dict) -> M:
+    cur = (quiz.get("access_tier") or "free").strip().lower()
+    if cur not in ("free", "batch", "private"):      # unknown/legacy value -> shown as Free
+        cur = "free"
+    batch = (quiz.get("batch_name") or "").strip()
+    return M([
+        [B(f"{'✅ ' if cur == 'free' else ''}🌐 Free (Open to All)", callback_data=f"e:settier:{qid}:free")],
+        [B(f"{'✅ ' if cur == 'batch' else ''}🎓 Batch Restricted" + (f" ({batch})" if batch else ""),
+           callback_data=f"e:settier:{qid}:batch")],
+        [B(f"{'✅ ' if cur == 'private' else ''}🔒 Private (Owner Only)", callback_data=f"e:settier:{qid}:private")],
+        [B("⬅️ Back", callback_data=f"q:edit:{qid}")],
+    ])
+
+
+def smart_clean_confirm_menu(qid: str) -> M:
+    return M([
+        [B("✅ हाँ, Clean Tags/Links/Usernames", callback_data=f"e:cleanok:{qid}")],
+        [B("❌ रद्द करें", callback_data=f"q:edit:{qid}")],
     ])
 
 
@@ -276,6 +316,10 @@ HELP_TEXT = (
     "/skip — optional step (description/explanation) या चल रहा प्रश्न skip करें\n"
     "/stop — चल रहा quiz रोकें (partial result save)\n"
     "/review — पिछले quiz का पूरा Review PDF फिर भेजें\n"
+    "/htmlreport — पिछले quiz का Interactive HTML Report (KaTeX + Question Navigator)\n"
+    "/aiquiz — AI (OpenRouter) की मदद से किसी भी विषय पर नया quiz बनाएँ\n"
+    "/quizmode — Quiz mode (Standard / Practice / Exam / Sectional) बदलें\n"
+    "/access — Quiz की Access (Free / Batch / Private) बदलें\n"
     "/cancel — creation/import रद्द करें\n\n"
     "<b>Quiz बनाना</b>\n"
     "/newquiz → नाम → description (/skip) → प्रश्न भेजते जाएँ → /done. प्रश्नों की कोई "

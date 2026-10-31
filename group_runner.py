@@ -24,10 +24,12 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError, TimedOut
 from telegram.ext import Application, ContextTypes
 
+import access_control
 import config
 import database as db
 import keyboards as kb
 import quiz_engine as engine
+import quiz_modes
 import review_pdf
 from keyboards import esc
 
@@ -81,7 +83,7 @@ def ready_text(quiz: dict) -> str:
 
 # ------------------------------------------------------------ start / send
 async def start_group_quiz(app: Application, chat_id: int, qid: str, user) -> str:
-    """'ok' | 'busy' | 'missing' | 'empty' | 'draft'"""
+    """'ok' | 'busy' | 'missing' | 'empty' | 'draft' | 'denied'"""
     quiz = db.get_quiz(qid)
     if not quiz:
         return "missing"
@@ -90,10 +92,18 @@ async def start_group_quiz(app: Application, chat_id: int, qid: str, user) -> st
     questions = db.get_questions(qid)
     if not questions:
         return "empty"
+    ok_access, deny_msg = access_control.check_quiz_access(user.id if user else None, chat_id, quiz)
+    if not ok_access:
+        try:
+            await app.bot.send_message(chat_id, deny_msg, parse_mode=ParseMode.HTML)
+        except TelegramError:
+            pass
+        return "denied"
     order = engine.build_order([q["id"] for q in questions], bool(quiz["shuffle_questions"]))
     async with chat_lock(chat_id):
         sid = db.create_group_session(qid, chat_id, user.id, order, group_timer(quiz),
-                                      bool(quiz["shuffle_options"]), time.time())
+                                      bool(quiz["shuffle_options"]), time.time(),
+                                      negative_mark=quiz_modes.negative_of(quiz))
         if sid is None:
             return "busy"
         try:
@@ -277,11 +287,24 @@ def result_text(s: dict, title: str, stopped: bool) -> str:
         return "\n".join(lines)
     medals = ["🥇", "🥈", "🥉"]
     denom = asked or total
+    neg = quiz_modes.negative_of(s)             # snapshot taken at start; 0 = disabled (default)
+    if neg > 0:
+        # rank by net score (stable sort keeps the stored correct/elapsed order for ties)
+        board = sorted(board, key=lambda r: -quiz_modes.compute_net_score(
+            int(r["correct"]), int(r["wrong"]), neg))
+        lines.insert(-1, f"➖ Negative Marking: -{quiz_modes.negative_label(neg)} प्रति गलत उत्तर")
     for i, r in enumerate(board):
         correct, wrong, score = int(r["correct"]), int(r["wrong"]), int(r.get("score") or 0)
         skipped = max(0, denom - int(r["answered"]))
         pct = 100.0 * correct / denom if denom else 0.0
         mark = medals[i] if i < 3 else f"{i + 1}."
+        if neg > 0:
+            net = quiz_modes.compute_net_score(correct, wrong, neg)
+            lines.append(f"{mark} {esc(_name(r))} — Net {quiz_modes.format_score(net)}/{denom}")
+            lines.append(f"      ✅ Correct {correct} · ❌ Wrong {wrong} · ⌛ Skipped {skipped} · "
+                         f"Score {score}/{denom} · Net {quiz_modes.format_score(net)}/{denom} · "
+                         f"Percentage {pct:.2f}%")
+            continue
         lines.append(f"{mark} {esc(_name(r))} — {correct}/{denom}")
         lines.append(f"      ✅ Correct {correct} · ❌ Wrong {wrong} · ⌛ Skipped {skipped} · "
                      f"Score {score}/{denom} · Percentage {pct:.2f}%")

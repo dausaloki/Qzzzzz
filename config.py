@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+
+from envutil import env_float, env_int
 import re
 from pathlib import Path
 
@@ -33,7 +35,7 @@ SAFE_MESSAGE_CHUNK = 4000
 # A quiz ("part") holds at most this many questions.  There is NO limit on the
 # total: bigger imports are split automatically into "<title> — Part 1/2/3…"
 # (Part 1 = Q1–Q500, Part 2 = Q501–Q1000, …) linked by one series id.
-QUESTIONS_PER_PART = max(1, int(os.getenv("QUESTIONS_PER_PART", "500")))
+QUESTIONS_PER_PART = max(1, env_int("QUESTIONS_PER_PART", "500"))
 MIN_OPTIONS = max(2, int(PollLimit.MIN_OPTION_NUMBER))     # 2 — a quiz question needs a choice (PTB 22.8 reports 1)
 MAX_OPTIONS = int(PollLimit.MAX_OPTION_NUMBER)             # 12
 OPTION_LABELS = "ABCDEFGHIJKL"[:MAX_OPTIONS]
@@ -42,20 +44,20 @@ OPTION_LABELS = "ABCDEFGHIJKL"[:MAX_OPTIONS]
 TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "").strip().rstrip("/")
 
 TIMER_CHOICES = [10, 15, 30, 60, 90, 120, 180, 300, 0]
-DEFAULT_TIMER = int(os.getenv("DEFAULT_TIMER", "45"))
+DEFAULT_TIMER = env_int("DEFAULT_TIMER", "45")
 # "✏️ Custom Time": any whole number of seconds in this range (0 = No timer).
 # Telegram's poll open_period only accepts 5–600 s; longer timers are enforced
 # by the bot's own job, which closes the poll with stopPoll.
-CUSTOM_TIMER_MIN = int(os.getenv("CUSTOM_TIMER_MIN", "5"))
-CUSTOM_TIMER_MAX = int(os.getenv("CUSTOM_TIMER_MAX", "3600"))
+CUSTOM_TIMER_MIN = env_int("CUSTOM_TIMER_MIN", "5")
+CUSTOM_TIMER_MAX = env_int("CUSTOM_TIMER_MAX", "3600")
 
 # Delay between an answer and the next question, so the user sees the native
 # correct/wrong animation.
-NEXT_QUESTION_DELAY = float(os.getenv("NEXT_QUESTION_DELAY", "1.5"))
+NEXT_QUESTION_DELAY = env_float("NEXT_QUESTION_DELAY", "1.5")
 # Extra grace after open_period before we mark the question as skipped.
-TIMER_GRACE = float(os.getenv("TIMER_GRACE", "1.0"))
+TIMER_GRACE = env_float("TIMER_GRACE", "1.0")
 # Active sessions older than this are expired on startup.
-SESSION_EXPIRY_HOURS = int(os.getenv("SESSION_EXPIRY_HOURS", "24"))
+SESSION_EXPIRY_HOURS = env_int("SESSION_EXPIRY_HOURS", "24")
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # Bot API getFile limit
 
 # ---------------------------------------------------------------- question tag
@@ -73,7 +75,7 @@ REQUIRED_CHAT_URL = os.getenv("REQUIRED_CHAT_URL", "").strip() or (
     f"https://t.me/{REQUIRED_CHAT.lstrip('@')}" if REQUIRED_CHAT.startswith("@") else "")
 # A verified membership is re-checked with getChatMember after this many seconds
 # (and on every /start), so users who left the group must join again.
-MEMBERSHIP_RECHECK_SECONDS = int(os.getenv("MEMBERSHIP_RECHECK_SECONDS", "600"))
+MEMBERSHIP_RECHECK_SECONDS = env_int("MEMBERSHIP_RECHECK_SECONDS", "600")
 
 # ---------------------------------------------------------------- support group notification
 # Group/channel notified once when a new user starts the bot (/start) for the first time.
@@ -89,9 +91,9 @@ NATIVE_POLL_BUTTON = os.getenv("NATIVE_POLL_BUTTON", "0").strip().lower() in ("1
 # ---------------------------------------------------------------- group quizzes
 # Seconds per question in a group when the quiz itself has "No timer"
 # (a group quiz needs a time limit to move on to the next question).
-GROUP_DEFAULT_TIMER = int(os.getenv("GROUP_DEFAULT_TIMER", "45"))
+GROUP_DEFAULT_TIMER = env_int("GROUP_DEFAULT_TIMER", "45")
 # Pause between a group question closing and the next one.
-GROUP_NEXT_DELAY = float(os.getenv("GROUP_NEXT_DELAY", "2.0"))
+GROUP_NEXT_DELAY = env_float("GROUP_NEXT_DELAY", "2.0")
 
 
 def timer_label(seconds: int) -> str:
@@ -145,15 +147,15 @@ BACKUP_PATH = Path(os.getenv("BACKUP_PATH", "").strip() or DATA_DIR / "quiz_back
 # hard deadline after which a backup is written even during non-stop activity.
 # ``<file>.prev`` keeps the previous good copy, ``<file>.lock`` is the
 # cross-process write guard.
-BACKUP_DEBOUNCE = float(os.getenv("BACKUP_DEBOUNCE", "5"))
-BACKUP_MIN_INTERVAL = float(os.getenv("BACKUP_MIN_INTERVAL", "30"))
-BACKUP_MAX_DELAY = float(os.getenv("BACKUP_MAX_DELAY", "120"))
+BACKUP_DEBOUNCE = env_float("BACKUP_DEBOUNCE", "5")
+BACKUP_MIN_INTERVAL = env_float("BACKUP_MIN_INTERVAL", "30")
+BACKUP_MAX_DELAY = env_float("BACKUP_MAX_DELAY", "120")
 # Safety net: even when nothing in this process is dirty, re-check this often
 # whether the database file changed behind our back (an external writer, e.g.
 # scripts/backup_tool.py or a manual sqlite edit) and re-export if it did.
-BACKUP_SAFETY_INTERVAL = float(os.getenv("BACKUP_SAFETY_INTERVAL", "300"))
-BACKUP_RETRIES = max(1, int(os.getenv("BACKUP_RETRIES", "5")))
-BACKUP_RETRY_DELAY = float(os.getenv("BACKUP_RETRY_DELAY", "3"))
+BACKUP_SAFETY_INTERVAL = env_float("BACKUP_SAFETY_INTERVAL", "300")
+BACKUP_RETRIES = max(1, env_int("BACKUP_RETRIES", "5"))
+BACKUP_RETRY_DELAY = env_float("BACKUP_RETRY_DELAY", "3")
 # /backup is restricted to these Telegram user ids (comma separated).
 BACKUP_ADMIN_IDS = tuple(
     int(x) for x in re.split(r"[,\s]+", os.getenv("BACKUP_ADMIN_IDS", "").strip()) if x.lstrip("-").isdigit()
@@ -169,9 +171,9 @@ GITHUB_BACKUP_PATH = os.getenv("GITHUB_BACKUP_PATH", "").strip() or "quiz_backup
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "").strip()        # empty = default branch
 # Minimum seconds between two GitHub commits (the supervisor syncs at most this
 # often; /backup sync forces an immediate upload).
-GITHUB_SYNC_INTERVAL = float(os.getenv("GITHUB_SYNC_INTERVAL", "300"))
+GITHUB_SYNC_INTERVAL = env_float("GITHUB_SYNC_INTERVAL", "300")
 GITHUB_API = os.getenv("GITHUB_API", "https://api.github.com").strip().rstrip("/")
-GITHUB_TIMEOUT = float(os.getenv("GITHUB_TIMEOUT", "20"))
+GITHUB_TIMEOUT = env_float("GITHUB_TIMEOUT", "20")
 
 
 def github_enabled() -> bool:
@@ -184,8 +186,8 @@ def github_enabled() -> bool:
 # ``1`` restricts HTML import to BACKUP_ADMIN_IDS (the bot's admin list);
 # default 0 keeps HTML import as open as PDF/TXT import already is.
 HTML_IMPORT_ADMIN_ONLY = os.getenv("HTML_IMPORT_ADMIN_ONLY", "0").strip().lower() in ("1", "true", "yes")
-HTML_MAX_BYTES = int(os.getenv("HTML_MAX_BYTES", str(12 * 1024 * 1024)))
-HTML_MAX_NODES = int(os.getenv("HTML_MAX_NODES", "400000"))
+HTML_MAX_BYTES = env_int("HTML_MAX_BYTES", str(12 * 1024 * 1024))
+HTML_MAX_NODES = env_int("HTML_MAX_NODES", "400000")
 
 # ---------------------------------------------------------------- review PDF
 # Automatic "complete quiz review" PDF sent to the user's private chat after a
@@ -195,7 +197,7 @@ REVIEW_PDF_PRIVATE_AUTO = os.getenv("REVIEW_PDF_PRIVATE_AUTO", "1").strip().lowe
 # Group quizzes: automatically send each participant their personalized review PDF
 # privately after the quiz finishes (and also offer the "📄 मेरा Review PDF" button).
 REVIEW_PDF_GROUP_AUTO = os.getenv("REVIEW_PDF_GROUP_AUTO", "1").strip().lower() not in ("0", "false", "no")
-REVIEW_PDF_RETRIES = max(0, int(os.getenv("REVIEW_PDF_RETRIES", "3")))
+REVIEW_PDF_RETRIES = max(0, env_int("REVIEW_PDF_RETRIES", "3"))
 # Fonts for the PDF (Devanagari + Latin).  Default: the fonts/ folder in the repo.
 PDF_FONT_DIR = Path(os.getenv("PDF_FONT_DIR", "").strip() or Path(__file__).resolve().parent / "fonts")
 PDF_FONT_DEVANAGARI = "NotoSansDevanagari-Regular.ttf"
@@ -206,13 +208,100 @@ WATERMARK_IMAGE_PATH = Path(
     os.getenv("WATERMARK_IMAGE_PATH", "").strip()
     or Path(__file__).resolve().parent / "assets" / "group_dp_watermark.jpg"
 )
-WATERMARK_OPACITY = max(0.08, min(0.12, float(os.getenv("WATERMARK_OPACITY", "0.102"))))
+WATERMARK_OPACITY = max(0.08, min(0.12, env_float("WATERMARK_OPACITY", "0.102")))
 # Exact owner branding displayed in every generated Quiz Review PDF and share card.
 QUIZ_BOT_OWNER = "LOKESH DAUSA"
 QUIZ_BOT_OWNER_USERNAME = "@LOKESH_DAUSA"
 OWNER_NAME = QUIZ_BOT_OWNER
 OWNER_TELEGRAM = QUIZ_BOT_OWNER_USERNAME
 OFFICIAL_TELEGRAM_GROUP_URL = "https://t.me/kalam_kranti"
+
+
+def _parse_id_set(raw: str) -> frozenset[int]:
+    ids = set()
+    for part in (raw or "").replace(";", ",").split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            ids.add(int(part))
+    return frozenset(ids)
+
+
+# ------------------------------------ Owner / Admin / Community / AI
+OWNER_ID: int = int(os.getenv("OWNER_ID", "0") or 0) if os.getenv("OWNER_ID", "0").strip().lstrip("-").isdigit() else 0
+ADMIN_IDS: frozenset[int] = (
+    frozenset(BACKUP_ADMIN_IDS)
+    | _parse_id_set(os.getenv("ADMIN_IDS", ""))
+    | (frozenset([OWNER_ID]) if OWNER_ID else frozenset())
+)
+
+# Optional Required Sub Channel alias (compatibility with devgaganin/Quizbot)
+REQUIRED_SUB_CHANNEL: str = os.getenv("REQUIRED_SUB_CHANNEL", "").strip()
+
+# Optional Admin / Logging / Community references
+LOG_GROUP: str = os.getenv("LOG_GROUP", "").strip()     # sanitized error alerts are sent here
+# BOT_GROUP / CHANNEL_ID are DISPLAY-ONLY references shown on the /admin dashboard.
+# They do NOT change the join gate (REQUIRED_CHAT), the PDF footer link, the
+# first-start notification target or any user-facing link.
+BOT_GROUP: str = os.getenv("BOT_GROUP", "").strip()
+CHANNEL_ID: str = os.getenv("CHANNEL_ID", "").strip()
+
+# Optional OpenRouter AI Question Generation settings (secrets loaded ONLY from env)
+OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_DEFAULT_KEYS: str = os.getenv("OPENROUTER_DEFAULT_KEYS", "").strip()
+# Abuse/cost guard for /aiquiz (every request is billed to the owner's key).
+# Per user: one generation at a time, a cooldown between requests and a cap per
+# rolling 24 h.  0 disables the respective limit.  Owner/admins are exempt.
+AI_QUIZ_COOLDOWN_SECONDS = max(0, env_int("AI_QUIZ_COOLDOWN_SECONDS", "60"))
+AI_QUIZ_DAILY_LIMIT = max(0, env_int("AI_QUIZ_DAILY_LIMIT", "20"))
+OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini").strip() or "openai/gpt-4o-mini"
+OPENROUTER_BASE_URL: str = (
+    os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip().rstrip("/")
+    or "https://openrouter.ai/api/v1"
+)
+
+# Variables mentioned by other Quizbot projects that are deliberately NOT supported
+# here.  They have no effect; if one is set the bot logs a warning at startup and
+# /admin lists it as "ignored" so nobody believes it is active.
+UNSUPPORTED_ENV_VARS: dict[str, str] = {
+    "FREE_BOT": ("not needed — every quiz is free; a quiz owner can only restrict who may "
+                 "play it (batch / private / authorized groups) with /access"),
+}
+
+
+def unsupported_env_settings() -> list[tuple[str, str]]:
+    """``[(name, reason)]`` for unsupported variables that are set in the environment."""
+    return [(k, why) for k, why in UNSUPPORTED_ENV_VARS.items() if os.getenv(k, "").strip()]
+
+
+# Optional automatic HTML report delivery alongside Review PDF
+AUTO_HTML_REPORT: bool = os.getenv("AUTO_HTML_REPORT", "0").strip().lower() in ("1", "true", "yes")
+
+
+def is_owner(user_id: int) -> bool:
+    """True when ``user_id`` is the configured OWNER_ID."""
+    if not user_id:
+        return False
+    uid = int(user_id)
+    env_owner = os.getenv("OWNER_ID", "").strip()
+    if env_owner.lstrip("-").isdigit() and int(env_owner) == uid and int(env_owner) != 0:
+        return True
+    return bool(OWNER_ID and uid == int(OWNER_ID))
+
+
+def is_admin(user_id: int) -> bool:
+    """True when ``user_id`` is owner or in ADMIN_IDS / BACKUP_ADMIN_IDS."""
+    if not user_id:
+        return False
+    uid = int(user_id)
+    if is_owner(uid):
+        return True
+    combined = (
+        set(BACKUP_ADMIN_IDS)
+        | set(ADMIN_IDS)
+        | set(_parse_id_set(os.getenv("ADMIN_IDS", "")))
+        | set(_parse_id_set(os.getenv("BACKUP_ADMIN_IDS", "")))
+    )
+    return uid in combined
 
 
 def get_token() -> str:

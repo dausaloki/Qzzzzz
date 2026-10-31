@@ -66,10 +66,29 @@ _TABLES: dict[str, str] = {
     "group_answers": "ORDER BY session_id, q_index, id",
     "user_states": "ORDER BY user_id",          # wizard + pending-review state
     "review_pdfs": "ORDER BY id",               # review-PDF delivery records (dedupe/retry)
+    # feature-expansion tables (absent in older databases -> exported as empty lists)
+    "batches": "ORDER BY name",
+    "batch_members": "ORDER BY batch_name, user_id",
+    "authorized_chats": "ORDER BY chat_id",
 }
+# Sections added to the backup by the feature expansion.  Older backup files do
+# not have them; they are then treated as empty (nothing is deleted on restore).
+_EXPANSION_SECTIONS = ("batches", "batch_members", "authorized_chats")
+# Sections/columns written only by an unreleased development build that had
+# payments / premium membership (removed again).  The production bot never had
+# them.  A backup that still contains them restores normally; this data is
+# ignored (reported, never written) and nothing in the live database is deleted.
+_REMOVED_SECTIONS = ("payments",)
+_REMOVED_COLUMNS: dict[str, tuple[str, ...]] = {"users": ("is_premium", "premium_until")}
 _RESTORE_ORDER = ["users", "quizzes", "quiz_settings", "questions", "attempts",
                   "answers", "group_sessions", "group_polls", "group_answers", "user_states",
-                  "review_pdfs"]
+                  "review_pdfs", "batches", "batch_members", "authorized_chats"]
+# Natural key used to upsert each table (default: "id").
+_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    "users": ("user_id",), "user_states": ("user_id",), "quiz_settings": ("quiz_id",),
+    "group_polls": ("poll_id",), "batches": ("name",), "batch_members": ("batch_name", "user_id"),
+    "authorized_chats": ("chat_id",),
+}
 # Never exported, whatever happens (secrets / credentials).
 _FORBIDDEN_KEYS = {"token", "bot_token", "password", "secret", "api_key", "api_hash", "github_token"}
 
@@ -186,6 +205,10 @@ def build_payload(now: Optional[float] = None) -> dict:
         try:
             tables = {name: [_plain(r) for r in _select(con, name, order)]
                       for name, order in _TABLES.items()}
+            for name, gone in _REMOVED_COLUMNS.items():   # removed feature: not exported
+                for r in tables.get(name, []):
+                    for col in gone:
+                        r.pop(col, None)
         finally:
             try:
                 con.execute("ROLLBACK")             # read-only snapshot
@@ -273,6 +296,9 @@ def build_payload(now: Optional[float] = None) -> dict:
         "users": tables["users"],
         "pending_states": tables["user_states"],
         "review_pdfs": tables["review_pdfs"],
+        "batches": tables["batches"],
+        "batch_members": tables["batch_members"],
+        "authorized_chats": tables["authorized_chats"],
     }
 
 
@@ -393,6 +419,8 @@ def validate_payload(data: dict) -> list[str]:
             if a.get("quiz_id") not in (None, sess.get("quiz_id")):
                 problems.append(f"{where}.answers[{j}]: quiz_id mismatch")
 
+    problems.extend(_validate_expansion_sections(data))
+
     counts = data.get("counts")
     if isinstance(counts, dict):
         checks = [("quizzes", len(quizzes)),
@@ -402,6 +430,9 @@ def validate_payload(data: dict) -> list[str]:
                   ("group_sessions", len(data.get("group_sessions") or [])),
                   ("review_pdfs", len(data.get("review_pdfs") or [])),
                   ("users", len(data.get("users") or []))]
+        for key in _EXPANSION_SECTIONS:          # only checked when the file has them
+            if key in counts and isinstance(data.get(key) or [], list):
+                checks.append((key, len(data.get(key) or [])))
         for key, actual in checks:
             if counts.get(key) != actual:
                 problems.append(f"counts.{key} {counts.get(key)} != {actual} actual")
@@ -414,6 +445,45 @@ def validate_payload(data: dict) -> list[str]:
         problems.append(f"payload is not JSON serialisable: {exc}")
         text = ""
     problems.extend(_secret_scan(text))
+    return problems
+
+
+def _validate_expansion_sections(data: dict) -> list[str]:
+    """Structure checks for batches / batch_members / authorized_chats."""
+    problems: list[str] = []
+    for key in _EXPANSION_SECTIONS:
+        if key in data and not isinstance(data[key], list):
+            problems.append(f"{key} is not a list")
+    def rows(key):
+        v = data.get(key)
+        return v if isinstance(v, list) else []
+    names: set = set()
+    for i, b in enumerate(rows("batches")):
+        n = b.get("name") if isinstance(b, dict) else None
+        if not isinstance(n, str) or not n.strip():
+            problems.append(f"batches[{i}]: missing name")
+        elif n in names:
+            problems.append(f"batches[{i}]: duplicate batch {n!r}")
+        else:
+            names.add(n)
+    pairs: set = set()
+    for i, m in enumerate(rows("batch_members")):
+        if not isinstance(m, dict) or not isinstance(m.get("batch_name"), str) or not isinstance(m.get("user_id"), int):
+            problems.append(f"batch_members[{i}]: needs batch_name (text) and user_id (int)")
+            continue
+        k = (m["batch_name"], m["user_id"])
+        if k in pairs:
+            problems.append(f"batch_members[{i}]: duplicate member {k!r}")
+        pairs.add(k)
+    chats: set = set()
+    for i, c in enumerate(rows("authorized_chats")):
+        cid = c.get("chat_id") if isinstance(c, dict) else None
+        if not isinstance(cid, int):
+            problems.append(f"authorized_chats[{i}]: chat_id must be an integer")
+        elif cid in chats:
+            problems.append(f"authorized_chats[{i}]: duplicate chat {cid}")
+        else:
+            chats.add(cid)
     return problems
 
 
@@ -623,6 +693,13 @@ def github_payload(data: dict) -> dict:
             ans["redacted"] = True
     for q in out.get("quizzes") or []:
         q["owner_id"] = None
+    # expansion tables: keep structure/counts, drop people and chats
+    for row in out.get("batch_members") or []:
+        row.update(user_id=None, added_by=None, redacted=True)
+    for row in out.get("batches") or []:
+        row.update(created_by=None)
+    for row in out.get("authorized_chats") or []:
+        row.update(chat_id=None, title=None, added_by=None, redacted=True)
     return out
 
 
@@ -778,7 +855,7 @@ def verify_file(path: Optional[Path] = None, compare_db: bool = True) -> tuple[b
     if compare_db:
         try:
             live = build_payload().get("counts") or {}
-            for key in ("quizzes", "questions", "attempts", "answers", "users"):
+            for key in ("quizzes", "questions", "attempts", "answers", "users") + _EXPANSION_SECTIONS:
                 a = (data.get("counts") or {}).get(key)
                 b = live.get(key)
                 if a is not None and b is not None and a != b:
@@ -799,6 +876,11 @@ def restore_payload(data: dict, db_file: Optional[Path] = None, apply: bool = Fa
     checked against the current database and a plan is returned.
     """
     problems = validate_payload(data)
+    if isinstance(data, dict) and data.get("redacted"):
+        problems = problems + [
+            "this is the REDACTED GitHub copy: user ids, chat ids, owner ids and names were removed, "
+            "so it cannot be restored safely. Restore the full quiz_backup.json from the volume "
+            "(or the admin /backup download) instead — nothing was written."]
     result: dict[str, Any] = {"ok": not problems, "problems": problems, "applied": False,
                               "inserted": {}, "updated": {}, "skipped": {}, "target": str(db_file or db_path())}
     if problems:
@@ -824,6 +906,37 @@ def restore_payload(data: dict, db_file: Optional[Path] = None, apply: bool = Fa
         rows["group_answers"] = [a for s in data.get("group_sessions") or [] for a in s.get("answers") or []]
         rows["user_states"] = list(data.get("pending_states") or [])
         rows["review_pdfs"] = list(data.get("review_pdfs") or [])
+        for key in _EXPANSION_SECTIONS:               # absent in older backups -> empty
+            rows[key] = list(data.get(key) or [])
+        # data of the removed payments / premium feature (development builds only):
+        # reported, never written; the live database is not touched for it
+        ignored: dict[str, int] = {}
+        for key in _REMOVED_SECTIONS:
+            if isinstance(data.get(key), list) and data[key]:
+                ignored[key] = len(data[key])
+        for table, gone in _REMOVED_COLUMNS.items():
+            for col in gone:
+                n = sum(1 for r in rows.get(table, []) if isinstance(r, dict)
+                        and r.get(col) not in (None, 0, 0.0, "", "0"))
+                if n:
+                    ignored[f"{table}.{col}"] = n
+        result["ignored_removed_feature"] = ignored
+
+        # every row needs its natural key — check BEFORE anything is written
+        # (a malformed/hand-edited file must not crash half-way or create a schema)
+        missing_keys = []
+        for table in _RESTORE_ORDER:
+            pks = _PRIMARY_KEYS.get(table, ("id",))
+            bad = sum(1 for r in rows[table]
+                      if not isinstance(r, dict) or any(r.get(k) is None for k in pks))
+            if bad:
+                missing_keys.append(f"{table}: {bad} row(s) without {'/'.join(pks)}")
+        if missing_keys:
+            con.rollback()
+            result["ok"] = False
+            result["problems"] = problems + ["rows without their key — nothing was written: "
+                                             + "; ".join(missing_keys)]
+            return result
 
         names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         schema_missing = "quizzes" not in names
@@ -838,7 +951,32 @@ def restore_payload(data: dict, db_file: Optional[Path] = None, apply: bool = Fa
         if schema_missing:                            # empty/new database → create the schema
             con.executescript(db.SCHEMA)
             con.executescript(db.INDEXES)
+            # SCHEMA alone lacks a few later columns (series_id, part_no, timeouts):
+            # add every migration column so a fresh target can hold the full backup.
+            for t, add_cols in db._MIGRATION_COLUMNS.items():
+                have = _columns(con, t)
+                for col, ddl in add_cols.items():
+                    if have and col not in have:
+                        con.execute(f"ALTER TABLE {t} ADD COLUMN {col} {ddl}")
+        else:
+            # An existing database created by an OLDER bot version would silently
+            # drop expansion data (batches, authorized chats, batch/private access
+            # tiers, quiz modes ...).  Refuse instead of half-restoring.
+            missing = _missing_for_expansion(con, rows)
+            if missing:
+                msg = ("target database schema is older than this backup and would lose: "
+                       + ", ".join(missing) + ". Upgrade the target first — run "
+                       "`python scripts/backup_tool.py restore --migrate ...` or start the "
+                       "bot once on it — nothing was written.")
+                result["schema_outdated"] = missing
+                if apply:
+                    con.rollback()
+                    result["ok"] = False
+                    result["problems"] = problems + [msg]
+                    return result
+                result["note"] = "WARNING: " + msg
 
+        conflicts: list[str] = []
         for table in _RESTORE_ORDER:
             table_rows = rows[table]
             if not table_rows:
@@ -848,23 +986,26 @@ def restore_payload(data: dict, db_file: Optional[Path] = None, apply: bool = Fa
             if not cols:
                 result.setdefault("skipped", {})[table] = "table missing"
                 continue
-            pk = "user_id" if table in ("users", "user_states") else (
-                "quiz_id" if table == "quiz_settings" else "poll_id" if table == "group_polls" else "id")
-            if pk not in cols:
-                result["skipped"][table] = f"no {pk} column"
+            pks = _PRIMARY_KEYS.get(table, ("id",))
+            if any(k not in cols for k in pks):
+                result["skipped"][table] = f"no {'/'.join(pks)} column"
                 continue
+            where = " AND ".join(f"{k}=?" for k in pks)
+            gone = _REMOVED_COLUMNS.get(table, ())
             ins = upd = 0
             for row in table_rows:
-                values = {k: v for k, v in row.items() if k in cols}
+                values = {k: v for k, v in row.items() if k in cols and k not in gone}
                 if not values:
                     continue
-                exists = con.execute(f"SELECT 1 FROM {table} WHERE {pk}=?", (values[pk],)).fetchone()
-                if exists:
-                    if apply:
-                        sets = ", ".join(f"{k}=?" for k in values if k != pk)
-                        if sets:
-                            con.execute(f"UPDATE {table} SET {sets} WHERE {pk}=?",
-                                        [v for k, v in values.items() if k != pk] + [values[pk]])
+                key = [values[k] for k in pks]
+                existing = con.execute(f"SELECT * FROM {table} WHERE {where}", key).fetchone()
+                if existing:
+                    sets = {k: v for k, v in values.items() if k not in pks}
+                    if table == "batch_members":
+                        sets = {}                     # membership row exists — nothing to change
+                    if apply and sets:
+                        con.execute(f"UPDATE {table} SET {', '.join(f'{k}=?' for k in sets)} WHERE {where}",
+                                    list(sets.values()) + key)
                     upd += 1
                 else:
                     if apply:
@@ -873,6 +1014,7 @@ def restore_payload(data: dict, db_file: Optional[Path] = None, apply: bool = Fa
                     ins += 1
             result["inserted"][table] = ins
             result["updated"][table] = upd
+        result["conflicts"] = conflicts
         if apply:
             con.commit()
             result["applied"] = True
@@ -886,6 +1028,38 @@ def restore_payload(data: dict, db_file: Optional[Path] = None, apply: bool = Fa
     finally:
         con.close()
     return result
+
+
+def _missing_for_expansion(con: sqlite3.Connection, rows: dict) -> list[str]:
+    """Tables/columns the backup really uses but the (older) target lacks."""
+    def nonzero(table, col, ignore=(None, 0, 0.0, "", "[]", "{}")):
+        return any(r.get(col) not in ignore for r in rows.get(table) or [])
+    need: list[tuple[str, Optional[str]]] = []
+    for t in _EXPANSION_SECTIONS:
+        if rows.get(t):
+            need.append((t, None))
+    if nonzero("users", "batches_json"):
+        need.append(("users", "batches_json"))
+    if any((r.get("access_tier") or "free") != "free" for r in rows.get("quizzes") or []):
+        need.append(("quizzes", "access_tier"))           # dropping it would open batch/private quizzes
+    for col in ("batch_name", "allowed_chats_json", "negative_mark", "section_timers_json"):
+        if nonzero("quizzes", col):
+            need.append(("quizzes", col))
+    if any((r.get("quiz_mode") or "standard") != "standard" for r in rows.get("quizzes") or []):
+        need.append(("quizzes", "quiz_mode"))
+    if nonzero("questions", "section"):
+        need.append(("questions", "section"))
+    for t in ("attempts", "group_sessions"):
+        if nonzero(t, "negative_mark"):
+            need.append((t, "negative_mark"))
+    missing: list[str] = []
+    for t, col in need:
+        cols = _columns(con, t)
+        if not cols:
+            missing.append(f"table {t}")
+        elif col and col not in cols:
+            missing.append(f"{t}.{col}")
+    return list(dict.fromkeys(missing))
 
 
 def restore_from_file(path: Path, db_file: Optional[Path] = None, apply: bool = False) -> dict:

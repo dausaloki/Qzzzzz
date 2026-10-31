@@ -1009,6 +1009,111 @@ async def handle_edit_callback(update: Update, context) -> None:
     elif action == "so":
         db.update_quiz(qid, shuffle_options=0 if quiz["shuffle_options"] else 1)
         await show_quiz_settings(update, qid)
+    elif action == "mode":
+        import quiz_modes
+        sec_timers = quiz_modes.get_section_timers(quiz)
+        sec_info = (
+            "\n".join(f"  • {esc(k)}: {config.timer_label(v)}" for k, v in sec_timers.items())
+            if sec_timers else "  (कोई अलग section timer नहीं)"
+        )
+        await respond(
+            update,
+            f"🎯 <b>Quiz Mode &amp; Section Settings</b>\n\n"
+            f"📚 Quiz: <b>{esc(quiz['title'])}</b>\n"
+            f"• Current Mode: <b>{esc(quiz_modes.mode_label(quiz.get('quiz_mode')))}</b>\n"
+            f"• Negative Marking: <b>{('-' + quiz_modes.negative_label(quiz_modes.negative_of(quiz)) + ' प्रति गलत उत्तर') if quiz_modes.negative_of(quiz) > 0 else 'OFF'}</b>\n"
+            f"• Section Timers:\n{sec_info}",
+            kb.quiz_mode_menu(qid, quiz),
+        )
+    elif action == "setmode" and len(parts) > 3:
+        import quiz_modes
+        m = quiz_modes.normalize_mode(parts[3])
+        db.update_quiz(qid, quiz_mode=m)
+        updated = db.get_quiz(qid)
+        await respond(
+            update,
+            f"✅ Quiz Mode updated: <b>{esc(quiz_modes.mode_label(m))}</b>",
+            kb.quiz_mode_menu(qid, updated),
+        )
+    elif action == "neg":
+        import quiz_modes
+        cur_neg = float(quiz.get("negative_mark") or 0.0)
+        # Cycle 0 -> 1/3 -> 0.25 -> 0.5 -> 0
+        if cur_neg <= 0.0:
+            next_neg = round(1.0 / 3.0, 6)
+        elif abs(cur_neg - 1.0 / 3.0) < 0.02:
+            next_neg = 0.25
+        elif abs(cur_neg - 0.25) < 0.02:
+            next_neg = 0.5
+        else:
+            next_neg = 0.0
+        db.update_quiz(qid, negative_mark=next_neg)
+        updated = db.get_quiz(qid)
+        await respond(
+            update,
+            f"✅ Negative marking updated: <b>{('-' + quiz_modes.negative_label(next_neg) + ' प्रति गलत उत्तर') if next_neg > 0 else 'OFF'}</b>",
+            kb.quiz_mode_menu(qid, updated),
+        )
+    elif action == "sectimer":
+        import quiz_modes
+        secs = quiz_modes.quiz_sections(qid)
+        sec_hint = f"\nमौजूदा sections: <code>{', '.join(esc(s) for s in secs)}</code>" if secs else ""
+        db.set_state(user.id, "e_sectimer", {"quiz_id": qid})
+        await update.effective_chat.send_message(
+            "⏱ <b>Section Timer सेट करें</b>\n\n"
+            "इस format में भेजें: <code>Section Name = 45 sec</code> (जैसे <code>भाग-अ = 30 sec</code> या <code>Reasoning = 1 min</code>)।"
+            f"{sec_hint}\n/cancel — रद्द",
+            parse_mode=ParseMode.HTML,
+        )
+    elif action == "access":
+        import access_control
+        tier = access_control.normalize_tier(quiz.get("access_tier"))
+        batch = (quiz.get("batch_name") or "").strip()
+        await respond(
+            update,
+            f"🔒 <b>Quiz Access Control</b>\n\n"
+            f"📚 Quiz: <b>{esc(quiz['title'])}</b>\n"
+            f"• Current Access: <b>{esc(access_control.tier_label(tier, batch))}</b>\n\n"
+            "नीचे से access tier चुनें:",
+            kb.quiz_access_menu(qid, quiz),
+        )
+    elif action == "settier" and len(parts) > 3:
+        import access_control
+        tier = access_control.normalize_tier(parts[3])
+        if tier == "batch":
+            db.set_state(user.id, "e_batch", {"quiz_id": qid})
+            await update.effective_chat.send_message(
+                "🎓 इस quiz के लिए <b>Batch का नाम</b> भेजें (जैसे <code>REET_2026</code> या <code>RAS_Batch_1</code>):\n"
+                "/cancel — रद्द",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        db.update_quiz(qid, access_tier=tier, batch_name="" if tier != "batch" else (quiz.get("batch_name") or ""))
+        updated = db.get_quiz(qid)
+        await respond(
+            update,
+            f"✅ Access Control updated: <b>{esc(access_control.tier_label(tier))}</b>",
+            kb.quiz_access_menu(qid, updated),
+        )
+    elif action == "clean":
+        await respond(
+            update,
+            f"🧹 <b>Smart Filter / Clean Quiz</b>\n\n"
+            f"क्या आप <b>{esc(quiz['title'])}</b> के सभी प्रश्नों और व्याख्याओं में से पुराने progress tags "
+            "(जैसे <code>[1/100]</code>), promo links और <code>@username</code> हटाना चाहते हैं?\n"
+            "(मूल प्रश्न और विकल्प सुरक्षित रहेंगे।)",
+            kb.smart_clean_confirm_menu(qid),
+        )
+    elif action == "cleanok":
+        import ai_gen
+        res = ai_gen.apply_smart_filter_to_quiz(qid)
+        updated = db.get_quiz(qid)
+        await respond(
+            update,
+            f"✅ Smart Filter पूरा हुआ: {res['updated']}/{res['total']} प्रश्न साफ किए गए।\n\n"
+            + quiz_summary(updated),
+            kb.edit_menu(qid, updated),
+        )
 
 
 async def handle_edit_message(update: Update, context, state: str, data: dict) -> None:
@@ -1084,6 +1189,46 @@ async def handle_edit_message(update: Update, context, state: str, data: dict) -
         for i, chunk in enumerate(chunks):
             await msg.reply_text(chunk, reply_markup=kb.correct_picker(
                 options, f"e:oc:{qid}:{question_id}", keep, f"e:q:{qid}:{question_id}") if i == len(chunks) - 1 else None)
+    elif state == "e_sectimer":
+        import quiz_modes
+        if "=" in text:
+            sec_part, timer_part = text.split("=", 1)
+        elif ":" in text and not text.strip()[0].isdigit():
+            sec_part, timer_part = text.split(":", 1)
+        else:
+            await msg.reply_text("⚠️ कृपया <code>Section Name = 45 sec</code> format में भेजें (या /cancel)।",
+                                 parse_mode=ParseMode.HTML)
+            return
+        sec_name = sec_part.strip()
+        try:
+            sec_val = config.parse_timer(timer_part.strip())
+            quiz_modes.set_section_timer(qid, sec_name, sec_val)
+        except ValueError as exc:
+            await msg.reply_text(f"⚠️ {exc}")
+            return
+        db.update_quiz(qid, quiz_mode="sectional")
+        db.clear_state(user.id)
+        updated = db.get_quiz(qid)
+        await msg.reply_text(
+            f"✅ Section <b>{esc(sec_name)}</b> का timer <b>{config.timer_label(sec_val)}</b> सेट किया गया।",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb.quiz_mode_menu(qid, updated),
+        )
+    elif state == "e_batch":
+        import access_control
+        bname = text.strip()
+        if not bname or len(bname) > 80:
+            await msg.reply_text("⚠️ कृपया मान्य Batch नाम (1-80 अक्षर) भेजें।")
+            return
+        db.create_batch(bname, created_by=user.id)
+        db.update_quiz(qid, access_tier="batch", batch_name=bname)
+        db.clear_state(user.id)
+        updated = db.get_quiz(qid)
+        await msg.reply_text(
+            f"✅ Access Control updated: <b>{esc(access_control.tier_label('batch', bname))}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb.quiz_access_menu(qid, updated),
+        )
 
 
 # ============================================================ IMPORT
@@ -1116,8 +1261,8 @@ def is_import_document(doc) -> bool:
         return False
     name = (doc.file_name or "").lower()
     mime = (doc.mime_type or "").lower()
-    return (name.endswith((".pdf", ".txt", ".html", ".htm", ".xhtml"))
-            or mime in ("application/pdf", "text/plain", "text/html", "application/xhtml+xml"))
+    return (name.endswith((".pdf", ".txt", ".html", ".htm", ".xhtml", ".json"))
+            or mime in ("application/pdf", "text/plain", "text/html", "application/xhtml+xml", "application/json"))
 
 
 async def _safe_edit(msg, text: str) -> None:
@@ -1333,6 +1478,7 @@ async def handle_import_document(update: Update, context) -> None:
         return
     name = doc.file_name or "source"
     is_pdf = name.lower().endswith(".pdf") or (doc.mime_type or "") == "application/pdf"
+    is_json = name.lower().endswith(".json") or (doc.mime_type or "") == "application/json"
     is_html = html_quiz.looks_like_html(name, doc.mime_type or "")
     if is_html and config.HTML_IMPORT_ADMIN_ONLY and user.id not in config.BACKUP_ADMIN_IDS:
         await msg.reply_text("🔒 HTML import केवल administrator के लिए है। PDF/.txt import पहले की तरह खुला है।")
@@ -1340,12 +1486,34 @@ async def handle_import_document(update: Update, context) -> None:
     status = await msg.reply_text("⏳ File पढ़ी जा रही है…")
     caption = (msg.caption or "").strip()
     default_title = caption or Path(name).stem[:TITLE_MAX] or "Imported Quiz"
-    source = "html" if is_html else "import"
+    source = "html" if is_html else ("json" if is_json else "import")
     hnotes: list[str] = []
     try:
         tg_file = await doc.get_file()
         raw = bytes(await tg_file.download_as_bytearray())
-        if is_html:
+        if is_json:
+            import ai_gen
+            jtitle, jquestions, jrejected = ai_gen.parse_json_quiz_report(pdf_parser.decode_text_bytes(raw))
+            if jtitle and not caption:
+                default_title = jtitle[:TITLE_MAX]
+            res = pdf_parser.ParseResult()
+            for jq in jquestions:
+                res.questions.append(pdf_parser.ParsedQuestion(
+                    number=jq.get("number") or (len(res.questions) + 1),
+                    question=jq["question"],
+                    options=list(jq["options"]),
+                    correct_index=int(jq["correct_index"]),
+                    explanation=jq.get("explanation") or "",
+                    qtype=jq.get("qtype") or "mcq",
+                    pre_text=jq.get("pre_text") or "",
+                    section_label=jq.get("section") or "",
+                ))
+            for jnum, jwhy in jrejected:        # shown in the import review, never dropped silently
+                res.errors.append(pdf_parser.ParseError(number=jnum, message=jwhy))
+            res.detected_blocks = len(res.questions) + len(jrejected)
+            res.mapped_answers = len(res.questions)
+            text = ""
+        elif is_html:
             res, hnotes = await _extract_html(update, raw, status)
             if res is None:
                 return

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import logging
 import os
+
+from envutil import env_float, env_int
 import re
 import unicodedata
 from collections import Counter
@@ -30,15 +32,15 @@ OCR_LANGUAGES = os.getenv("OCR_LANGUAGES", "eng+hin").strip() or "eng+hin"
 # Second English-only OCR pass that verifies Latin structural tokens (option
 # labels, answer/key letters) which the Hindi model misreads ((B)→(8), A→2).
 OCR_VERIFY = os.getenv("OCR_VERIFY", "1").strip().lower() not in ("0", "false", "no")
-OCR_DPI = int(os.getenv("OCR_DPI", "300"))
+OCR_DPI = env_int("OCR_DPI", "300")
 # Third, Hindi-only OCR pass at a higher resolution.  Devanagari words on which
 # the two readings disagree are NOT changed — they are reported per question as
 # "Verification Required" so a human checks them against the page.
 OCR_VERIFY_HINDI = os.getenv("OCR_VERIFY_HINDI", "1").strip().lower() not in ("0", "false", "no")
-OCR_VERIFY_DPI = int(os.getenv("OCR_VERIFY_DPI", str(OCR_DPI * 4 // 3)))
+OCR_VERIFY_DPI = env_int("OCR_VERIFY_DPI", str(OCR_DPI * 4 // 3))
 # Two OCR words closer than this fraction of the font size are one word.
-OCR_JOIN_GAP = float(os.getenv("OCR_JOIN_GAP", "0.08"))
-MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "300"))
+OCR_JOIN_GAP = env_float("OCR_JOIN_GAP", "0.08")
+MAX_OCR_PAGES = env_int("MAX_OCR_PAGES", "300")
 
 LEGACY_FONT_RE = re.compile(
     r"kruti|k010|devlys|dev\s*lys|chanakya|shivaji|walkman|agra|kundli|akruti|surekh|"
