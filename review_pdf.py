@@ -32,6 +32,7 @@ import html as _html
 import io
 import logging
 import re
+import unicodedata
 import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -45,10 +46,17 @@ import database as db
 
 log = logging.getLogger("quizbot.review_pdf")
 
-PAGE_W, PAGE_H = 595.0, 842.0         # A4 portrait (points)
-MARGIN_L, MARGIN_R = 44.0, 44.0
-MARGIN_TOP, MARGIN_BOTTOM = 46.0, 54.0
+PAGE_W, PAGE_H = 420.0, 842.0         # Narrow mobile portrait; original footer height retained
+MARGIN_L, MARGIN_R = 28.0, 28.0
+MARGIN_TOP, MARGIN_BOTTOM = 38.0, 64.0
 CONTENT_W = PAGE_W - MARGIN_L - MARGIN_R
+# Readability is a layout invariant: add pages, never shrink source content.
+TITLE_PT = 22.0
+SECTION_PT = 16.0
+QUESTION_PT = 14.0
+BODY_PT = 12.0
+FOOTER_PT = 9.0
+LINE_SPACING = 1.36
 
 OWNER_NAME = "LOKESH DAUSA"
 OWNER_USERNAME = "@LOKESH_DAUSA"
@@ -155,6 +163,25 @@ def _extract_builtin_fonts() -> dict[str, Path]:
 
 
 # --------------------------------------------------------------------- fonts
+def bundled_font_dirs(base: Optional[Path] = None) -> list[Path]:
+    """The project's bundled font folder, matched **case-insensitively**.
+
+    The repo ships ``fonts/``, but a browser upload to GitHub (or a clone on a
+    case-insensitive Windows/macOS disk) can turn it into ``Fonts/``.  Linux is
+    case-sensitive, so a plain ``fonts/`` lookup would then silently fall back
+    to MuPDF's built-in fonts.  ``fonts/`` is preferred when both exist.
+    """
+    base = Path(base) if base else Path(__file__).resolve().parent
+    exact = base / "fonts"
+    found = [exact] if exact.is_dir() else []
+    try:
+        found += sorted(p for p in base.iterdir()
+                        if p.is_dir() and p.name.lower() == "fonts" and p.name != "fonts")
+    except OSError:                                     # pragma: no cover - unreadable dir
+        pass
+    return found or [exact]
+
+
 class FontBook:
     """Devanagari + Latin fonts with per-character fallback and HarfBuzz support.
 
@@ -174,7 +201,7 @@ class FontBook:
 
     def _candidates(self, filename: str) -> list[Path]:
         return [self.dir / filename,
-                Path(__file__).resolve().parent / "fonts" / filename,
+                *(d / filename for d in bundled_font_dirs()),
                 Path("/usr/share/fonts/truetype/dejavu") / filename,
                 Path("/usr/share/fonts/truetype/noto") / filename,
                 Path("/usr/share/fonts/opentype/noto") / filename]
@@ -229,6 +256,23 @@ class FontBook:
         self.dev_name = Path(self.dev_file).name if self.dev_file else "NotoSerifDevanagari"
         self.lat_name = Path(self.lat_file).name if self.lat_file else "helv"
         self.latb_name = Path(self.latb_file).name if self.latb_file else self.lat_name
+
+    @property
+    def source(self) -> str:
+        """Where the fonts came from: ``bundled`` (project fonts folder),
+        ``system``, ``builtin-fallback`` (MuPDF's compiled-in fonts) or ``mixed``."""
+        kinds = set()
+        bundled = [str(d) for d in bundled_font_dirs()] + [str(self.dir)]
+        for f in (self.dev_file, self.lat_file, self.latb_file):
+            if not f:
+                kinds.add("builtin-fallback")
+            elif str(f).startswith(str(_BUILTIN_CACHE_DIR)):
+                kinds.add("builtin-fallback")
+            elif any(str(Path(f).parent) == b for b in bundled):
+                kinds.add("bundled")
+            else:
+                kinds.add("system")
+        return kinds.pop() if len(kinds) == 1 else "mixed"
 
     # -- glyph handling ------------------------------------------------
     def has_dev(self, ch: str) -> bool:
@@ -299,10 +343,26 @@ def fonts() -> FontBook:
 
 
 # --------------------------------------------------------------------- layout
+def _text_clusters(text: str) -> list[str]:
+    """Keep Devanagari matras/conjuncts attached in overlong words.
+
+    This is a conservative cluster breaker, not a general Unicode grapheme
+    implementation. It protects combining marks, virama joins and ZWJ/ZWNJ.
+    """
+    out: list[str] = []
+    for ch in text:
+        if out and (unicodedata.category(ch).startswith("M") or ch in "\u200c\u200d"
+                    or out[-1][-1] in "\u094d\u200c\u200d"):
+            out[-1] += ch
+        else:
+            out.append(ch)
+    return out
+
+
 def _wrap(text: str, size: float, width: float, bold: bool = False) -> list[str]:
     """Greedy word wrap that measures with the real fonts (and keeps \\n)."""
     fb = fonts()
-    eff_width = max(24.0, width * 0.97)
+    eff_width = max(24.0, width * 0.90)
     lines: list[str] = []
     for para in str(text or "").split("\n"):
         para = para.rstrip()
@@ -329,7 +389,7 @@ def _wrap(text: str, size: float, width: float, bold: bool = False) -> list[str]
             out.append(ln)
             continue
         part = ""
-        for ch in ln:
+        for ch in _text_clusters(ln):
             if fb.width(part + ch, size, bold) > eff_width and part:
                 out.append(part)
                 part = ch
@@ -442,8 +502,8 @@ class _Canvas:
         self._draw_watermark(self.page)
         self.y = MARGIN_TOP
         if self.pages > 1 and self.header:
-            hdr_txt = f"{self._short(self.header, 56, 8.2)}  ·  {OWNER_LINE_OWNER} ({OWNER_USERNAME})"
-            self._draw_runs(MARGIN_L, self.y + 2, self._short(hdr_txt, 110, 8.2), 8.2, C_GREY)
+            hdr_txt = f"{self._short(self.header, 56, 9.0)}  ·  {OWNER_LINE_OWNER} ({OWNER_USERNAME})"
+            self._draw_runs(MARGIN_L, self.y + 2, self._short(hdr_txt, 110, 9.0), 9.0, C_GREY)
             self.page.draw_line(fitz.Point(MARGIN_L, self.y + 9), fitz.Point(PAGE_W - MARGIN_R, self.y + 9),
                                 color=C_LINE, width=0.6)
             self.y += 22
@@ -464,10 +524,10 @@ class _Canvas:
             )
         return x + self.fb.width(clean, size, bold)
 
-    def line(self, text: str, size: float = 10.5, color=C_DARK, *, bold: bool = False,
+    def line(self, text: str, size: float = BODY_PT, color=C_DARK, *, bold: bool = False,
              indent: float = 0.0, gap: float = 0.0, leading: Optional[float] = None) -> None:
         width = CONTENT_W - indent
-        lead = leading if leading is not None else size * 1.42
+        lead = leading if leading is not None else size * LINE_SPACING
         for ln in _wrap(text, size, width, bold):
             self.ensure(lead)
             self._draw_runs(MARGIN_L + indent, self.y + size * 0.95, ln, size, color, bold)
@@ -484,7 +544,7 @@ class _Canvas:
                             color=color, width=width)
         self.y += gap_after
 
-    def box(self, lines: list[str], *, size: float = 9.5, color=C_DARK, bg=C_BOX,
+    def box(self, lines: list[str], *, size: float = BODY_PT, color=C_DARK, bg=C_BOX,
             pad: float = 7.0, gap: float = 8.0, border=None) -> None:
         """A light background box with wrapped lines (passages, explanations)."""
         if not lines:
@@ -493,7 +553,7 @@ class _Canvas:
         for ln in lines:
             wrapped.extend(_wrap(ln, size, CONTENT_W - 2 * pad) or [""])
         height = len(wrapped) * size * 1.4 + 2 * pad
-        if height > PAGE_H - MARGIN_TOP - MARGIN_BOTTOM:      # huge passage: flow normally
+        if height + gap > PAGE_H - MARGIN_TOP - MARGIN_BOTTOM - 22:      # huge passage: flow normally
             for ln in lines:
                 self.line(ln, size, color, indent=pad, gap=1)
             self.space(gap)
@@ -629,19 +689,20 @@ class _Canvas:
             self.page = page
             self._cur_page_idx = i - 1
             page.draw_line(
-                fitz.Point(MARGIN_L, PAGE_H - 42),
-                fitz.Point(PAGE_W - MARGIN_R, PAGE_H - 42),
+                fitz.Point(MARGIN_L, PAGE_H - 58),
+                fitz.Point(PAGE_W - MARGIN_R, PAGE_H - 58),
                 color=C_LINE, width=0.5,
             )
-            owner_txt = f"{OWNER_LINE_OWNER}  ·  {OWNER_LINE_USER}"
+            owner_txt = OWNER_LINE_OWNER
             page_txt = f"Page {i}/{total}"
-            page_w = self.fb.width(page_txt, 8.0, bold=True)
-            self._draw_runs(MARGIN_L, PAGE_H - 29, owner_txt, 7.9, C_GREY)
-            self._draw_runs(PAGE_W - MARGIN_R - page_w, PAGE_H - 29, page_txt, 8.0, C_DARK, bold=True)
+            page_w = self.fb.width(page_txt, FOOTER_PT, bold=True)
+            self._draw_runs(MARGIN_L, PAGE_H - 45, owner_txt, FOOTER_PT, C_GREY)
+            self._draw_runs(PAGE_W - MARGIN_R - page_w, PAGE_H - 45, page_txt, FOOTER_PT, C_DARK, bold=True)
 
+            self._draw_runs(MARGIN_L, PAGE_H - 30, OWNER_LINE_USER, FOOTER_PT, C_GREY)
             prefix = "Official Telegram Group: "
-            url_x0 = self._draw_runs(MARGIN_L, PAGE_H - 15, prefix, 8.2, C_GREY)
-            url_x1 = self._draw_runs(url_x0, PAGE_H - 15, OFFICIAL_GROUP_URL, 8.2, C_BLUE, bold=True)
+            url_x0 = self._draw_runs(MARGIN_L, PAGE_H - 15, prefix, FOOTER_PT, C_GREY)
+            url_x1 = self._draw_runs(url_x0, PAGE_H - 15, OFFICIAL_GROUP_URL, FOOTER_PT, C_BLUE, bold=True)
             page.draw_line(
                 fitz.Point(url_x0, PAGE_H - 13.3),
                 fitz.Point(url_x1, PAGE_H - 13.3),
@@ -650,8 +711,8 @@ class _Canvas:
             if footer_left:
                 rem_w = PAGE_W - MARGIN_R - url_x1 - 14.0
                 if rem_w > 60.0:
-                    tail = self._short("  ·  " + footer_left, 60, 7.8, max_w=rem_w)
-                    self._draw_runs(url_x1, PAGE_H - 15, tail, 7.8, C_GREY)
+                    tail = self._short("  ·  " + footer_left, 60, FOOTER_PT, max_w=rem_w)
+                    self._draw_runs(url_x1, PAGE_H - 15, tail, FOOTER_PT, C_GREY)
             link_rect = fitz.Rect(url_x0 - 2.0, PAGE_H - 26.0, url_x1 + 4.0, PAGE_H - 11.0)
             footer_links.append((i - 1, link_rect))
 
@@ -712,6 +773,10 @@ class Report:
     questions: list[ReportQuestion] = field(default_factory=list)
     negative: str = "लागू नहीं (हर सही उत्तर पर 1 अंक)"
     stopped: bool = False
+    # Optional negative marking (0 / None = disabled, the default — the report is
+    # scoring data then stays the same as before the feature existed).
+    negative_mark: float = 0.0
+    net_score: Optional[float] = None
 
     @property
     def consistent(self) -> bool:
@@ -799,6 +864,20 @@ def _index_answers(raw_answers: list[dict], *, group: bool = False) -> tuple[dic
     return by_qid, by_pos
 
 
+def _apply_negative(rep: Report, negative_mark: float) -> Report:
+    """Fill the negative-marking fields from the mark stored on the attempt/session."""
+    import quiz_modes                       # local import keeps module start-up light
+    neg = max(0.0, float(negative_mark or 0.0))
+    if neg <= 0:
+        return rep
+    penalty = round(rep.incorrect * neg, 2)
+    rep.negative_mark = neg
+    rep.net_score = quiz_modes.compute_net_score(rep.correct, rep.incorrect, neg)
+    rep.negative = (f"लागू: हर गलत उत्तर पर -{quiz_modes.negative_label(neg)} अंक "
+                    f"(कुल -{quiz_modes.format_score(penalty)})")
+    return rep
+
+
 def report_for_attempt(attempt: dict) -> Report:
     if attempt.get("id"):
         fresh = db.get_attempt(int(attempt["id"]))
@@ -862,20 +941,20 @@ def report_for_attempt(attempt: dict) -> Report:
         rows.append(ReportQuestion(
             number=_number_of(q), text=q["question"], options=list(q["options"]),
             chosen=chosen, correct=cs, status=status, explanation=q.get("explanation") or "",
-            section=q.get("section_label") or "", pre_text=q.get("pre_text") or "",
+            section=q.get("section") or q.get("section_label") or "", pre_text=q.get("pre_text") or "",
             skipped=was_skipped))
     total = len(rows)
     unanswered = total - correct - wrong
     score = correct
     pct = round(100.0 * correct / total, 2) if total else 0.0
-    return Report(
+    return _apply_negative(Report(
         quiz_title=quiz.get("title") or "Quiz",
         user_label=_user_label(user_id),
         mode="private", when_utc=utc, when_local=ist,
         total=total, attempted=correct + wrong, correct=correct, incorrect=wrong,
         unanswered=unanswered, skipped=skipped, score=score, max_score=total,
         percentage=pct, questions=rows,
-        stopped=(attempt.get("status") == "stopped"))
+        stopped=(attempt.get("status") == "stopped")), attempt.get("negative_mark"))
 
 
 def report_for_group(session: dict, user_id: int) -> Report:
@@ -928,16 +1007,16 @@ def report_for_group(session: dict, user_id: int) -> Report:
         rows.append(ReportQuestion(
             number=_number_of(q), text=q["question"], options=list(q["options"]),
             chosen=chosen, correct=cs, status=status, explanation=q.get("explanation") or "",
-            section=q.get("section_label") or "", pre_text=q.get("pre_text") or ""))
+            section=q.get("section") or q.get("section_label") or "", pre_text=q.get("pre_text") or ""))
     total = len(rows)
-    return Report(
+    return _apply_negative(Report(
         quiz_title=quiz.get("title") or "Quiz",
         user_label=_user_label(uid),
         mode="group", when_utc=utc, when_local=ist,
         total=total, attempted=correct + wrong, correct=correct, incorrect=wrong,
         unanswered=total - correct - wrong, skipped=0,
         score=correct, max_score=total, percentage=round(100.0 * correct / total, 2) if total else 0.0,
-        questions=rows, stopped=(session.get("status") == "stopped"))
+        questions=rows, stopped=(session.get("status") == "stopped")), session.get("negative_mark"))
 
 
 # --------------------------------------------------------------------- render
@@ -962,8 +1041,8 @@ def render_report(rep: Report) -> tuple[bytes, int]:
     cv.new_page()
     cv.page.draw_rect(fitz.Rect(0, 0, PAGE_W, 96), color=C_BLUE, fill=C_BLUE, width=0)
     cv._draw_runs(MARGIN_L, 32, "Complete Quiz Review" if rep.mode == "private" else "Quiz Review (Group)",
-                  18, (1, 1, 1), bold=True)
-    cv._draw_runs(MARGIN_L, 52, cv._short(rep.quiz_title, 180, 11.2), 11.2, (0.86, 0.90, 0.97))
+                  TITLE_PT, (1, 1, 1), bold=True)
+    cv._draw_runs(MARGIN_L, 52, cv._short(rep.quiz_title, 180, 13.5), 13.5, (0.86, 0.90, 0.97))
     cv._draw_runs(MARGIN_L, 70, f"{OWNER_LINE_OWNER}  ·  {OWNER_LINE_USER}", 8.4, (0.92, 0.95, 1.0), bold=True)
     hdr_grp_x0 = MARGIN_L + fb.width("Official Telegram Group: ", 8.4, True)
     hdr_grp_x1 = cv._draw_runs(MARGIN_L, 84, OWNER_LINE_GROUP, 8.4, (1, 1, 1), bold=True)
@@ -975,7 +1054,7 @@ def render_report(rep: Report) -> tuple[bytes, int]:
     cv.y = 110
 
     # ---------------------------------------------------------- summary
-    cv.line("परिणाम सारांश · Result Summary", 13, C_BLUE, bold=True, gap=3)
+    cv.line("परिणाम सारांश · Result Summary", SECTION_PT, C_BLUE, bold=True, gap=3)
     rows = [
         ("Quiz", rep.quiz_title),
         ("User / उपयोगकर्ता", rep.user_label),
@@ -989,29 +1068,51 @@ def render_report(rep: Report) -> tuple[bytes, int]:
         ("Maximum marks / पूर्णांक", f"{rep.max_score}"),
         ("Percentage / प्रतिशत", f"{rep.percentage:.2f}%"),
         ("Negative marking / ऋणात्मक अंकन", rep.negative),
+    ]
+    if rep.net_score is not None:
+        import quiz_modes
+        rows.append(("Net score / ऋणात्मक अंकन के बाद अंक",
+                     f"{quiz_modes.format_score(rep.net_score)} / {rep.max_score}"))
+    rows += [
         ("Final result / अंतिम परिणाम",
          f"सही {rep.correct} + गलत {rep.incorrect} + अनुत्तरित {rep.unanswered} = कुल {rep.total} ({rep.percentage:.2f}%)"),
     ]
     if rep.skipped:
         rows.append(("Skipped or timed out / छोड़े गए", str(rep.skipped)))
     for k, v in rows:
-        v_lines = _wrap(str(v), 10.2, CONTENT_W - 190) or [""]
-        cv.ensure(15 * len(v_lines))
-        cv._draw_runs(MARGIN_L, cv.y + 10, k, 9.6, C_GREY)
-        for vi, vln in enumerate(v_lines):
-            cv._draw_runs(MARGIN_L + 190, cv.y + 10, vln, 10.2, C_DARK)
-            cv.y += 15.5 if vi == len(v_lines) - 1 else 14.0
+        # Full-width stacked fields stay readable on narrow Android screens.
+        row_height = (len(_wrap(k, BODY_PT, CONTENT_W)) +
+                      len(_wrap(str(v), BODY_PT, CONTENT_W))) * BODY_PT * LINE_SPACING + 5
+        if row_height <= PAGE_H - MARGIN_TOP - MARGIN_BOTTOM - 22:
+            cv.ensure(row_height)
+        cv.line(k, BODY_PT, C_GREY, bold=True)
+        cv.line(str(v), BODY_PT, C_DARK, gap=5)
     cv.space(4)
     verdict = ("सभी प्रश्नों की संख्या = सही + गलत + अनुत्तरित ✓"
                if rep.consistent else "⚠ गणना में अंतर — कृपया जाँचें")
-    cv.line(verdict, 9.2, C_GREEN if rep.consistent else C_RED, gap=6)
+    cv.line(verdict, BODY_PT, C_GREEN if rep.consistent else C_RED, gap=6)
     if rep.stopped:
         cv.box(["यह quiz पूरा होने से पहले रोका गया था — बाकी प्रश्न NOT ATTEMPTED दिखाए गए हैं।"],
-              size=9.2, color=C_RED, bg=C_RED_BG, gap=6)
+              size=BODY_PT, color=C_RED, bg=C_RED_BG, gap=6)
     cv.box(["संकेत / Legend:  ✓ सही उत्तर या आपका सही उत्तर · ✗ आपका गलत उत्तर · "
             "— प्रयास नहीं किया गया। हर प्रश्न पर लिखा label (CORRECT / INCORRECT / "
             "NOT ATTEMPTED) भी देखें — रंग उपलब्ध न हो तो भी PDF पढ़ा जा सकता है।"],
-           size=8.8, color=C_GREY, gap=10)
+           size=BODY_PT, color=C_GREY, gap=10)
+
+    if any(q.section for q in rep.questions):
+        import quiz_modes
+        cv.ensure(90)
+        cv.line("Section-wise Score / खंडवार अंक", SECTION_PT, C_BLUE, bold=True, gap=6)
+        sections: dict[str, list[ReportQuestion]] = {}
+        for rq in rep.questions:
+            sections.setdefault(rq.section or "General", []).append(rq)
+        for section, items in sections.items():
+            right = sum(q.status == STATUS_CORRECT for q in items)
+            wrong = sum(q.status == STATUS_WRONG for q in items)
+            net = quiz_modes.compute_net_score(right, wrong, rep.negative_mark)
+            cv.line(f"{section}: Correct {right} · Wrong {wrong} · "
+                    f"Unanswered {len(items) - right - wrong} · "
+                    f"Score {quiz_modes.format_score(net)} / {len(items)}", BODY_PT, gap=5)
 
     # ---------------------------------------------------------- questions
     last_section = None
@@ -1020,10 +1121,10 @@ def render_report(rep: Report) -> tuple[bytes, int]:
     for idx, q in enumerate(rep.questions, 1):
         if q.section and q.section != last_section:
             cv.ensure(120)                     # never leave a heading alone at the page foot
-            cv.line(f"▌ {q.section}", 11, C_BLUE, bold=True, gap=4)
+            cv.line(f"▌ {q.section}", SECTION_PT, C_BLUE, bold=True, gap=4)
             last_section = q.section
         if q.pre_text and q.pre_text != last_pre:
-            cv.box(["📖 " + ln for ln in q.pre_text.split("\n")], size=8.8, color=C_GREY, gap=6)
+            cv.box(["📖 " + ln for ln in q.pre_text.split("\n")], size=BODY_PT, color=C_GREY, gap=6)
         last_pre = q.pre_text or None
         if idx > 1:
             cv.rule(gap_before=2, gap_after=8)
@@ -1031,12 +1132,20 @@ def render_report(rep: Report) -> tuple[bytes, int]:
         color, label = _status_style(q.status)
         bg = C_GREEN_BG if q.status == STATUS_CORRECT else (
             C_RED_BG if q.status == STATUS_WRONG else C_GREY_BG)
-        cv.ensure(40)
+        # Keep a normal question + all options together when it fits on a
+        # fresh page. Long passages/explanations flow, without any font scaling.
+        estimated = 24 + len(_wrap(q.text, QUESTION_PT, CONTENT_W)) * QUESTION_PT * LINE_SPACING + 5
+        for opt in q.options:
+            estimated += len(_wrap(opt, BODY_PT, CONTENT_W - 55)) * BODY_PT * LINE_SPACING + 18
+        if q.explanation:
+            estimated += len(_wrap("व्याख्या / Explanation: " + q.explanation,
+                                   BODY_PT, CONTENT_W - 14)) * BODY_PT * 1.4 + 24
+        cv.ensure(estimated if estimated <= PAGE_H - MARGIN_TOP - MARGIN_BOTTOM - 22 else 80)
         head_y = cv.y
-        cv._draw_runs(MARGIN_L, head_y + 12, f"प्रश्न {q.number}", 12, C_DARK, bold=True)
-        cv.chip(PAGE_W - MARGIN_R, label, size=8.6, color=color, bg=bg)
-        cv.y += 20
-        cv.line(q.text, 10.4, C_DARK, gap=5, leading=14.6)
+        cv._draw_runs(MARGIN_L, head_y + 12, f"प्रश्न {q.number}", QUESTION_PT, C_DARK, bold=True)
+        cv.chip(PAGE_W - MARGIN_R, label, size=10.0, color=color, bg=bg)
+        cv.y += 24
+        cv.line(q.text, QUESTION_PT, C_DARK, gap=6, leading=QUESTION_PT * LINE_SPACING)
 
         correct_set = list(q.correct or [])
         chosen_set = _chosen_set(q.chosen)
@@ -1052,36 +1161,38 @@ def render_report(rep: Report) -> tuple[bytes, int]:
             else:
                 mark, suffix, oc = " ", "", C_DARK
             prefix = f"{mark} {_label(i)} "
-            width = CONTENT_W - 14 - fb.width(prefix, 10.2, False)
-            lines = _wrap(opt, 10.2, width)
+            width = CONTENT_W - 14 - fb.width(prefix, BODY_PT, False)
+            lines = _wrap(opt, BODY_PT, width)
+            option_height = (len(lines) + bool(suffix)) * BODY_PT * LINE_SPACING
+            if option_height <= PAGE_H - MARGIN_TOP - MARGIN_BOTTOM - 22:
+                cv.ensure(option_height)
             for j, ln in enumerate(lines):
-                cv.ensure(13.6)
+                cv.ensure(BODY_PT * LINE_SPACING)
                 if j == 0:
                     cv._draw_runs(
-                        MARGIN_L + 14, cv.y + 10, prefix + ln, 10.2, oc,
+                        MARGIN_L + 14, cv.y + BODY_PT, prefix + ln, BODY_PT, oc,
                         bold=False, bold_prefix=len(prefix) if (is_correct or is_chosen) else 0,
                     )
                 else:
-                    cv._draw_runs(MARGIN_L + 14 + fb.width(prefix, 10.2), cv.y + 10, ln, 10.2, oc)
-                cv.y += 13.4
+                    cv._draw_runs(MARGIN_L + 14 + fb.width(prefix, BODY_PT), cv.y + BODY_PT, ln, BODY_PT, oc)
+                cv.y += BODY_PT * LINE_SPACING
             if suffix:
-                cv.ensure(12)
-                cv._draw_runs(MARGIN_L + 14, cv.y + 9, suffix.strip(), 8.8, oc)
-                cv.y += 12.5
+                cv.line(suffix.strip(), BODY_PT, oc, indent=14)
         cv.space(1)
         if not correct_set:                      # answer missing in the source — say so
-            cv.line("— सही उत्तर सत्यापित नहीं · CORRECT ANSWER NOT VERIFIED", 9.2, C_GREY, gap=3)
+            cv.line("— सही उत्तर सत्यापित नहीं", BODY_PT, C_GREY)
+            cv.line("CORRECT ANSWER NOT VERIFIED", BODY_PT, C_GREY, gap=3)
         if q.status == STATUS_UNANSWERED:
             note = ("छोड़ा गया / timed out" if q.skipped else "प्रयास नहीं किया")
-            cv.line(f"— NOT ATTEMPTED · अनुत्तरित ({note})", 9.2, C_GREY, gap=3)
+            cv.line(f"— NOT ATTEMPTED · अनुत्तरित ({note})", BODY_PT, C_GREY, gap=3)
         if q.explanation:
-            cv.box(["व्याख्या / Explanation: " + ln for ln in q.explanation.split("\n")],
-                   size=9.0, color=C_GREY, gap=6)
+            cv.box(["व्याख्या / Explanation:", *q.explanation.split("\n")],
+                   size=BODY_PT, color=C_DARK, gap=6)
         else:
             cv.space(6)
 
     if not rep.questions:
-        cv.line("इस quiz में कोई प्रश्न नहीं है।", 10, C_RED)
+        cv.line("इस quiz में कोई प्रश्न नहीं है।", BODY_PT, C_RED)
 
     pdf = cv.save(footer_left=f"Quiz review · {rep.quiz_title}")
     return pdf, cv.pages or 1
@@ -1138,7 +1249,8 @@ def pdf_font_status() -> tuple[bool, str]:
                 f"missing={missing} has_dev_font={has_dev_font} "
                 f"links_ok={links_ok} wm_ok={wm_ok} fonts={font_names}"
             )
-        return True, f"dev={fb.dev_name} lat={fb.lat_name} embedded={sorted(set(font_names))}"
+        return True, (f"dev={fb.dev_name} lat={fb.lat_name} source={fb.source} "
+                      f"embedded={sorted(set(font_names))}")
     except Exception as exc:                            # noqa: BLE001
         return False, f"error: {exc}"
 
@@ -1163,6 +1275,10 @@ def summary_caption(rep: Report) -> str:
              f"📝 प्रश्न: {rep.total} · ✅ सही: {rep.correct} · ❌ गलत: {rep.incorrect} · "
              f"— अनुत्तरित: {rep.unanswered}",
              f"🏆 Score: {rep.score}/{rep.max_score} · {rep.percentage:.2f}%"]
+    if rep.net_score is not None:
+        import quiz_modes
+        lines.append(f"➖ Negative marking -{quiz_modes.negative_label(rep.negative_mark)} · "
+                     f"Net Score: {quiz_modes.format_score(rep.net_score)}/{rep.max_score}")
     text = "\n".join(lines)
     return text[:1020]
 

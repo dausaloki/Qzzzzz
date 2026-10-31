@@ -48,8 +48,15 @@ create quizzes step by step, import them from **PDF / text / HTML**, play them
 | Persistence | Everything lives in SQLite: users, quizzes, quiz_settings, questions, attempts (including live session state), answers, and the wizard state. Answers to polls sent before a restart are still counted, and timers are re-armed on startup. |
 
 ### Commands
-`/start` `/newquiz` `/myquizzes` `/import` `/share [id]` `/stats` `/settings` `/done` `/undo` `/skip` `/stop` `/cancel` `/help` `/quiz <id>` `/review`
+`/start` `/newquiz` `/myquizzes` (alias `/my`) `/import` `/share [id]` `/stats` `/settings` `/done` `/undo` `/skip` `/stop` `/cancel` `/help` `/quiz <id>` `/review`
 `/backup [now|verify|sync|restore]` — backup status (admins only, see **🗄️ Automatic backup**)
+`/review` — re-sends the Review PDF of your last finished quiz (private chat)
+`/htmlreport [quiz_id|latest]` (alias `/report`) — your own interactive HTML result report (private chat; only your own attempts)
+`/aiquiz [topic] [count]` — optional AI-generated MCQs (1–50, default 5) that go through the normal import review; needs `OPENROUTER_API_KEY`. Per user: one request at a time, `AI_QUIZ_COOLDOWN_SECONDS` between requests, `AI_QUIZ_DAILY_LIMIT` per 24 h (owner/admins exempt)
+`/quizmode <quiz_id> [standard|practice|exam|sectional]` — quiz owner: `standard` (default, native quiz polls) · `practice` (feedback + explanation after every question) · `exam` (answers hidden until the end) · `sectional` (per-section timers and section-wise scores)
+`/section <quiz_id> <Section Name>=<timer>` — quiz owner: timer for one section (used by `sectional` mode), e.g. `/section abc1234567 भाग-अ=45s`
+`/access <quiz_id> [free|batch|private] [batch_name]`, `/batch`, `/authchat` — who may play a quiz (see **🔓 Access**)
+`/admin` — owner/admin dashboard · `/broadcast <message>` (or reply to a message) — owner/admin announcement to all registered users
 
 `/skip` skips the optional step while creating (description / explanation) and skips the current question while playing.
 
@@ -81,6 +88,7 @@ membership.py     join gate: getChatMember verification, cache, chat_member revo
 keyboards.py      inline keyboards and help text
 stats.py          statistics formatting
 fonts/            NotoSansDevanagari-Regular + DejaVuSans(+Bold) — embedded into the review PDF
+                  (found as fonts/ or Fonts/; the build log shows `PDF_FONTS: True … source=bundled`)
 assets/           group_dp_watermark.jpg — official Telegram group DP watermark embedded on every PDF page
 Dockerfile        python:3.11-slim + pinned Hindi/English OCR models (sha256-checked) — used by Railway
 scripts/          fetch_tessdata.py: downloads the exact OCR models (image build + local tests)
@@ -128,11 +136,15 @@ The `Procfile` (`worker: python bot.py`) is kept for other hosts. If you deploy 
 | `DATA_DIR` | no | Railway volume path, or `./data` | Folder for `quiz.db` and the lock file |
 | `DB_PATH` | no | `$DATA_DIR/quiz.db` | Explicit SQLite file path |
 | `DROP_PENDING_UPDATES` | no | `false` | `true` ignores updates that queued up while the bot was offline |
+| `DEFAULT_TIMER` | no | `45` | Seconds per question for new and imported quizzes (users can change it per quiz) |
+| `TIMER_GRACE` | no | `1.0` | Extra seconds after the question timer before the bot records a timeout and moves on (private and group) |
 | `NEXT_QUESTION_DELAY` | no | `1.5` | Seconds between an answer and the next question |
 | `SESSION_EXPIRY_HOURS` | no | `24` | Unfinished sessions older than this are expired on startup |
 | `OCR_LANGUAGES` | no | `eng+hin` | Tesseract languages for scanned pages |
 | `OCR_VERIFY` | no | `1` | Second English-only OCR pass that checks option labels and answer letters; disagreements become review items |
 | `OCR_DPI` | no | `300` | Render resolution for OCR |
+| `OCR_VERIFY_DPI` | no | `OCR_DPI` × 4/3 | Render resolution of the verification passes |
+| `OCR_JOIN_GAP` | no | `0.08` | Two OCR'd Devanagari pieces closer than this fraction of the font size are joined into one word (Tesseract splits like “रा जस्था न”) |
 | `OCR_VERIFY_HINDI` | no | `1` | Third, Hindi-only OCR pass (at `OCR_VERIFY_DPI`, default 4/3 × `OCR_DPI`); Devanagari words the passes read differently are shown as **Verification Required — प्रश्न X (पेज N)** — never auto-corrected |
 | `CUSTOM_TIMER_MIN` / `CUSTOM_TIMER_MAX` | no | `5` / `3600` | Allowed range (seconds) for ✏️ Custom Time |
 | `QUESTIONS_PER_PART` | no | `500` | Questions per quiz **part** (not a total limit). Imports of 456 → 1 quiz, 501 → 2 parts, 2378 → 5 parts |
@@ -146,13 +158,16 @@ The `Procfile` (`worker: python bot.py`) is kept for other hosts. If you deploy 
 | `REVIEW_PDF_GROUP_AUTO` | no | `1` | `1` automatically sends every group participant their personal review PDF privately after the leaderboard (`0` = button only) |
 | `REVIEW_PDF_RETRIES` | no | `3` | Retries after a failed delivery (0–3) |
 | `PDF_FONT_DIR` | no | `./fonts` | Folder with the embedded PDF fonts |
+| `WATERMARK_IMAGE_PATH` | no | `assets/group_dp_watermark.jpg` | Official group DP used as the Review-PDF watermark |
+| `WATERMARK_OPACITY` | no | `0.102` | Watermark opacity, always kept within 0.08–0.12 |
+| `SUPPORT_NOTIFY_CHAT` | no | `@DAUSA_123` | Receives the one-time “new user” notification |
 | `TESSDATA_PREFIX` | no | set in Dockerfile | Folder with `*.traineddata` |
 | `TELEGRAM_API_BASE` | no | – | Custom Bot API server URL (for tests / self-hosted Bot API) |
 | `REQUIRED_CHAT` | no | `@kalam_kranti` | Group users must join (`@username` or `-100…` id). **The bot must be a member of this group** (admin for a channel; admin also enables instant revocation via `chat_member`). Empty = gate off |
 | `REQUIRED_CHAT_URL` | no | `https://t.me/<username>` | Link of the 📢 Join Group button (needed for a private group: its invite link) |
 | `MEMBERSHIP_RECHECK_SECONDS` | no | `600` | Re-check interval for verified members |
 | `QUESTION_TAG` | no | `जय श्री श्याम` | Tag at the top of every question sent; empty = no tag |
-| `GROUP_DEFAULT_TIMER` | no | `30` | Seconds per question in groups when the quiz has no timer |
+| `GROUP_DEFAULT_TIMER` | no | `45` | Seconds per question in groups when the quiz has no timer |
 | `GROUP_NEXT_DELAY` | no | `2.0` | Pause between group questions |
 | `BACKUP_ENABLED` | no | `1` | `0` turns the automatic JSON backup off |
 | `BACKUP_PATH` | no | `$DATA_DIR/quiz_backup.json` | Backup file (keep it on the volume) |
@@ -166,6 +181,21 @@ The `Procfile` (`worker: python bot.py`) is kept for other hosts. If you deploy 
 | `GITHUB_REPO` | no | – | `owner/repo` of a **private** repository for the backup copy |
 | `GITHUB_BACKUP_PATH` / `GITHUB_BRANCH` | no | `quiz_backup.json` / default branch | Where the file is committed |
 | `GITHUB_SYNC_INTERVAL` | no | `300` | Minimum seconds between two backup commits |
+| `GITHUB_API` / `GITHUB_TIMEOUT` | no | `https://api.github.com` / `20` | GitHub API endpoint and request timeout (seconds) for the backup copy |
+| `OWNER_ID` | no | – | Telegram user id of the bot owner (owner/admin tools; is also treated as an admin) |
+| `ADMIN_IDS` | no | – | Extra comma-separated admin user ids. Admins = `OWNER_ID` + `ADMIN_IDS` + `BACKUP_ADMIN_IDS` |
+| `REQUIRED_SUB_CHANNEL` | no | – | Fallback join-gate chat, used **only** when `REQUIRED_CHAT` is set to empty. While `REQUIRED_CHAT` has a value (default `@kalam_kranti`) it has no effect |
+| `LOG_GROUP` | no | – | Chat id / `@username` that receives sanitized error alerts (tokens/keys stripped). Empty = off |
+| `BOT_GROUP` / `CHANNEL_ID` | no | – | Display-only references on `/admin`; they change no link, gate or PDF footer |
+| `AUTO_HTML_REPORT` | no | `0` | `1` also sends the interactive HTML report after the review PDF |
+| `OPENROUTER_API_KEY` | no | – | Enables optional AI question generation. Empty = feature reports “not configured” |
+| `OPENROUTER_DEFAULT_KEYS` | no | – | Extra fallback keys, comma-separated, tried after `OPENROUTER_API_KEY` |
+| `AI_QUIZ_COOLDOWN_SECONDS` / `AI_QUIZ_DAILY_LIMIT` | no | `60` / `20` | `/aiquiz` cost guard per user (0 = no limit); owner/admins exempt. Counters reset on restart |
+| `OPENROUTER_MODEL` / `OPENROUTER_BASE_URL` | no | `openai/gpt-4o-mini` / `https://openrouter.ai/api/v1` | AI model and API endpoint |
+
+There are **no payment variables** — nothing named `RAZORPAY_*`, `PREMIUM_*` or
+refund-related is read anywhere, so none needs to be set. `FREE_BOT` is not supported
+either (it is ignored, with a startup warning).
 
 ### "Conflict: terminated by other getUpdates request"
 The code creates exactly **one** `Application` and calls `run_polling()` exactly
@@ -228,6 +258,25 @@ I. कोलू  II. गोगामेड़ी  III. रामदेवरा 
 * Multiple correct answers (`उत्तर: A, C`) are reported, not imported. This bot stores exactly one correct
   answer per question and never picks one itself.
 
+### JSON files (`.json`)
+
+```json
+{"title": "विज्ञान क्विज़",
+ "questions": [
+   {"question": "जल का रासायनिक सूत्र?", "options": ["H2O", "CO2", "NaCl", "O2"],
+    "correct_index": 0, "explanation": "optional", "section": "optional"}
+ ]}
+```
+
+* Also accepted: a bare list of question objects, or `{"quizzes": [{"title": …, "questions": […]}]}`. Only the
+  **first** quiz of a `quizzes` list is imported; the others are named in the import report (send them as separate files).
+* Question text: `question` (or `q` / `stem`). Options: `options` (or `choices`), a list of 2–12 entries.
+* Answer, required (never guessed): `correct_index` (0-based), or `answer_index` / `correct` as a 0-based number, a
+  letter `A`–`F`, `अ/ब/स/द`, or a 1-based number written as text (`"2"` = second option).
+* Blank options are dropped and the answer index is re-mapped to the same option; a blank *correct* option is an error.
+* Every invalid item (missing/out-of-range answer, wrong option count, empty question) is listed in the import report
+  with its number and reason. A partial quiz is only created after you press **Confirm**.
+
 
 ---
 
@@ -247,6 +296,9 @@ database — restoring is a separate, explicit admin tool.
 | `group_sessions[]` | every group run: quiz, chat, starter, status, order, progress, timer, and `polls[]` + `answers[]` (leaderboard: one row per participant per question with chosen option, correctness, score, elapsed, timestamp) |
 | `users[]` | user id, timers/shuffle defaults, membership timestamps (no passwords — there are none) |
 | `pending_states[]` | wizard / import-review state, i.e. **pending review questions** |
+| `review_pdfs[]` | Review-PDF delivery records (dedupe/retry) |
+| `batches[]`, `batch_members[]` | batches and which user id belongs to which batch |
+| `authorized_chats[]` | authorized group/chat ids, title, linked batch |
 | `counts`, `db`, `generated_at`, `generated_ts` | record counts, source database file, backup timestamp |
 
 **When is it written?** After **every committed database transaction**
@@ -299,11 +351,43 @@ python scripts/backup_tool.py restore --file /data/quiz_backup.json --db /data/q
 `quiz.db.before-restore-<timestamp>` (with its `-wal`/`-shm`), then upserts every
 table on its natural key (`users.user_id`, `quizzes.id`, `questions.id`,
 `attempts.id`, `answers.id`, `group_sessions.id`, `group_polls.poll_id`,
-`group_answers.id`, `user_states.user_id`). Existing rows are updated in place,
+`group_answers.id`, `user_states.user_id`, `batches.name`,
+`batch_members.(batch_name, user_id)`, `authorized_chats.chat_id`). Existing rows are updated in place,
 missing rows are inserted, nothing is ever duplicated and rows created after the
 backup (`id` not in the file) are left alone. Restoring the same file twice is a
 no-op the second time. A missing/empty database gets the full schema first.
 Delete a quiz by mistake → run `restore --apply` and it comes back.
+
+Safety rules of a restore:
+
+* If the target database was created by an **older bot version** and the backup
+  holds data it has no column/table for (batches, authorized chats,
+  batch/private quiz access, quiz modes, negative marking …), `--apply`
+  **refuses** and writes nothing — silently dropping `access_tier` would open
+  batch-only and private quizzes to everyone.
+* A backup written by an earlier development build may still contain a
+  `payments` section or `is_premium`/`premium_until` values. That data belongs to
+  the removed payment feature: restore **ignores it and reports it** — it is not
+  written, and nothing already in the database is deleted.
+  Add `--migrate` to run the bot's own migration first (after the safety copy).
+* A file whose rows lack their key, or the redacted GitHub copy, is refused
+  before anything is written.
+
+### Which backup restores what
+
+Measured on simulated databases (`~/audit/compat`), restoring with this version:
+
+| Backup | Restores | Cannot restore |
+|---|---|---|
+| **`quiz_backup.json` on the volume**, its `.prev`, or the **`/backup download`** file (same full file) | everything: quizzes, questions, multi-part links (`series_id`/`part_no`), user ids, chat ids, attempts + answers incl. **timeout counts**, group sessions + leaderboard, pending states, Review-PDF records, batches, batch members, authorized chats, access tiers, negative marks | nothing in the database is left out. Not included: the SQLite file itself, the Review-PDF files that were already sent, environment variables/secrets |
+| **Redacted GitHub copy** (`GITHUB_TOKEN`) | — (refused by `restore`) | user ids, chat ids, owner ids, names and batch-member/chat ids are removed, so it **cannot be restored**. It is a readable off-site copy of the quiz *content* only |
+| **Old-format file** written by an earlier bot version | all of its quizzes, questions, multi-part links, users, attempts, answers, timeouts, groups, states | expansion data it never contained — those fields get safe defaults (every quiz `free`, no negative marking, empty batch tables) |
+| **SQLite copy** (`quiz.db.before-restore-*`, or a copy made with SQLite's backup API) | everything (byte-level copy; open it with the bot, `init_db` migrates it) | — copy only while consistent (backup API or with the bot stopped) |
+
+⚠️ **Do not restore a backup made by this version with an older bot version**
+(e.g. after a code rollback): the old restore code silently drops batches,
+authorized chats, quiz modes and quiz access tiers (batch/private quizzes would
+become open to everyone). Roll back the *code* only; keep the database.
 
 ### Railway: where the files must live
 
@@ -342,8 +426,30 @@ backup simply stays on the Railway volume.
   rebuild the database.
 * ✅ A redeploy/restart losing the container filesystem (files on the volume).
 * ⚠️ It does **not** protect against losing the whole volume (both files live
-  there). For that, enable the GitHub copy or download
-  `quiz_backup.json` regularly. Keep a copy off the server.
+  there). For that, **download `quiz_backup.json` regularly** (`/backup download`)
+  and keep it off the server. The GitHub copy is redacted and **cannot be
+  restored** — it is not a substitute for the full file.
+
+---
+
+## 🔓 Access — every quiz is free (no payments, no premium)
+
+The bot has **no payments, no paid plans and no premium membership**. Every
+quiz is free. The only access rules are:
+
+* **Mandatory join gate** (`REQUIRED_CHAT`, unchanged from the original bot):
+  users must be members of the configured group/channel.
+* **`/access <quiz_id> [free|batch|private] [batch_name]`** — a quiz owner (or
+  admin) decides *who* may play a quiz, never for money:
+  `free` (default, everyone) · `batch` (members of a batch, managed with
+  `/batch`) · `private` (owner and admins only, hidden from inline search).
+  Groups can additionally be limited with `/authchat`.
+* A stored access value the bot does not know (for example `premium`/`paid`
+  left by an earlier development build) is treated as **`free`**; the row itself
+  is not changed.
+
+There are no `RAZORPAY_*`, `PREMIUM_*` or refund settings. If such variables
+still exist in a Railway service they are simply not read (you may delete them).
 
 ---
 
@@ -387,3 +493,30 @@ answer-key letter was lost in the scanned-PDF test.
 * Telegram polls cannot contain media; pre-question photos/videos are sent as separate messages right before the poll.
 * Webhook mode is not used: the bot uses long polling (one instance). If a webhook was set for the token earlier,
   PTB's `run_polling` deletes it at startup.
+
+## Final review: mobile-readable PDFs and safe operations
+
+The final review branch retains all creation/import/editing, private/group polls,
+sharing, rankings, free-access controls, admin tools and backups described above.
+It does not authorize a production deployment.
+
+All completion/review/answer PDF delivery routes now share a mobile portrait
+layout (420 × 842 pt): **22pt title, 16pt headings, 14pt questions, 12pt options
+and explanations, 9pt footer/page numbers**, with comfortable line spacing and
+additional pages instead of tiny text. The bundled Hindi font, exact watermark,
+owner branding and clickable Telegram footer remain. Section scores are included.
+Generate original-content samples without a bot token or database:
+
+```bash
+python scripts/generate_pdf_samples.py /tmp/quiz_pdf_samples
+```
+
+Private attempts snapshot mode and negative marking before the first poll, so
+subsequent quiz settings edits do not change those rules. Defaults remain
+standard mode, a 45-second timer and negative marking disabled.
+
+See [the review operations guide](docs/OPERATIONS_REVIEW.md) for the feature
+inventory, interface boundaries, secure branch-only publication, Android-friendly
+fallback instructions, full vs redacted backup distinctions, tested restore
+commands, future deployment checks and rollback caveats. No production command
+in that guide should be executed without separate approval.

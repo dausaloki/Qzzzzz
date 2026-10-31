@@ -1,11 +1,11 @@
 """Regression tests for the TXT question-import bug fix.
 
 Clearly distinguishes:
-1. Tests on the user's actual uploaded file ``Topic_02_Varnamala_evam_Lipi_Full.txt``
+1. Tests on the original self-written fixture ``Topic_02_Varnamala_evam_Lipi_Full.txt``
    (50 Hindi MCQs using ``[प्रश्न 1]`` .. ``[प्रश्न 50]`` headers, section dividers,
    numbered points inside explanations, and ``[परीक्षा: ...]`` tags).
 2. Tests on the Part-2 slice (``[प्रश्न 26]`` .. ``[प्रश्न 50]``) derived from the
-   uploaded file.
+   original fixture.
 3. Synthetic regression tests covering all supported question-number formats,
    option-label formats (including ``(अ)``–``(द)``), encodings/BOM/CRLF, answer
    mapping, missing-answer/missing-option error reporting, and zero-question
@@ -28,7 +28,7 @@ FIXTURE_FULL_TXT = (
 
 
 # ---------------------------------------------------------------------------
-# 1. Actual uploaded TXT file tests
+# 1. Original TXT fixture tests
 # ---------------------------------------------------------------------------
 def test_actual_uploaded_topic02_full_txt_parses_all_50_questions():
     assert FIXTURE_FULL_TXT.exists(), "Fixture Topic_02_Varnamala_evam_Lipi_Full.txt missing"
@@ -56,33 +56,33 @@ def test_actual_uploaded_topic02_full_txt_parses_all_50_questions():
     # Verify first, second, middle, and last questions preserve exact Hindi wording, options, and answers
     q1 = res.questions[0]
     assert q1.number == 1
-    assert q1.question == "हिन्दी वर्णमाला में स्वरों की संख्या कितनी मानी गई है?"
-    assert q1.options == ["10", "11", "13", "14"]
+    assert q1.question == "अक्षर अभ्यास 1: लिखे हुए शब्द «कमल» का पहला अक्षर चुनिए।"
+    assert q1.options == ["न", "क", "ग", "प"]
     assert q1.correct_index == 1  # (B)
     assert q1.answer_source == "inline"
-    assert "[परीक्षा: CET / REET / Patwar / LDC]" in q1.explanation
+    assert "[परीक्षा: मौलिक परीक्षण अभ्यास]" in q1.explanation
 
-    # Explanation in Q4 contains "1. ह्रस्व स्वर ...", "2. दीर्घ स्वर ...", "3. प्लुत स्वर ..."
-    # and "[परीक्षा: RPSC LDC / VDO 2021]" — must stay inside Q4's explanation, never split as MCQs
+    # Explanation in Q4 contains "1. शब्द देखें। ...", "2. पहला अक्षर पढ़ें। ...", "3. विकल्प मिलाएँ। ..."
+    # and "[परीक्षा: मौलिक परीक्षण अभ्यास]" — must stay inside Q4's explanation, never split as MCQs
     q4 = res.questions[3]
     assert q4.number == 4
-    assert "1. ह्रस्व स्वर" in q4.explanation
-    assert "2. दीर्घ स्वर" in q4.explanation
-    assert "3. प्लुत स्वर" in q4.explanation
-    assert "[परीक्षा: RPSC LDC / VDO 2021]" in q4.explanation
+    assert "1. शब्द देखें।" in q4.explanation
+    assert "2. पहला अक्षर पढ़ें।" in q4.explanation
+    assert "3. विकल्प मिलाएँ।" in q4.explanation
+    assert "[परीक्षा: मौलिक परीक्षण अभ्यास]" in q4.explanation
 
     q26 = res.questions[25]
     assert q26.number == 26
-    assert q26.question == "'र' व्यंजन किस प्रकार का ध्वनि भेद है?"
-    assert q26.options == ["प्रकंपी / लुंठित", "पार्श्विक", "संघर्षहीन", "उत्क्षिप्त"]
-    assert q26.correct_index == 0  # (A) प्रकंपी / लुंठित
+    assert q26.question == "अक्षर अभ्यास 26: लिखे हुए शब्द «महल» का पहला अक्षर चुनिए।"
+    assert q26.options == ["क", "न", "म", "ग"]
+    assert q26.correct_index == 2  # (C) म
 
     q50 = res.questions[49]
     assert q50.number == 50
-    assert q50.question == "वर्ण किसे कहते हैं?"
-    assert q50.options[1] == "वह मूल ध्वनि जिसके खंड न हो सकें"
-    assert q50.correct_index == 1  # (B) वह मूल ध्वनि जिसके खंड न हो सकें
-    assert "[परीक्षा: Police Constable 2020 / REET]" in q50.explanation
+    assert q50.question == "अक्षर अभ्यास 50: लिखे हुए शब्द «फल» का पहला अक्षर चुनिए।"
+    assert q50.options[2] == "फ"
+    assert q50.correct_index == 2  # (C) फ
+    assert "[परीक्षा: मौलिक परीक्षण अभ्यास]" in q50.explanation
 
     # Every question must have 4 options and an inline-mapped answer in 0..3
     for idx, q in enumerate(res.questions, start=1):
@@ -128,9 +128,9 @@ def test_actual_uploaded_topic02_full_txt_bot_upload_creates_50_question_quiz():
             assert quizzes[0]["title"] == "Topic_02_Varnamala_evam_Lipi_Full"
             qs = db.get_questions(quizzes[0]["id"])
             assert len(qs) == 50
-            assert qs[0]["question"] == "हिन्दी वर्णमाला में स्वरों की संख्या कितनी मानी गई है?"
-            assert qs[0]["options"] == ["10", "11", "13", "14"]
-            assert qs[49]["question"] == "वर्ण किसे कहते हैं?"
+            assert qs[0]["question"] == "अक्षर अभ्यास 1: लिखे हुए शब्द «कमल» का पहला अक्षर चुनिए।"
+            assert qs[0]["options"] == ["न", "क", "ग", "प"]
+            assert qs[49]["question"] == "अक्षर अभ्यास 50: लिखे हुए शब्द «फल» का पहला अक्षर चुनिए।"
 
     run(t())
 

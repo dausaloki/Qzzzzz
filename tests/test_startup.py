@@ -1,4 +1,5 @@
 """Railway startup tests: env handling, single-instance lock, polling + Conflict."""
+import asyncio
 import logging
 import os
 import re
@@ -63,12 +64,18 @@ def test_run_polling_survives_conflict(tmp_path, caplog):
     import database as db
 
     db.set_db_path(tmp_path / "poll.db")
+    botmod._last_conflict_log[0] = 0.0   # the warning is throttled per process (60 s): start clean
     api, updates = FakeTelegram(), FakeTelegram()
     updates.conflicts_left = 2
     app = botmod.build_application("123456:TEST", request=api, get_updates_request=updates, rate_limit=False)
     app.job_queue.run_once(lambda ctx: ctx.application.stop_running(), 8)
-    with caplog.at_level(logging.WARNING):
-        app.run_polling(allowed_updates=["message", "callback_query", "poll_answer"], close_loop=False)
+    try:
+        with caplog.at_level(logging.WARNING):
+            app.run_polling(allowed_updates=["message", "callback_query", "poll_answer"], close_loop=True)
+    finally:
+        # PTB closes the loop, but the policy still references it. A repeat must
+        # create a fresh loop instead of selecting that closed one.
+        asyncio.set_event_loop(None)
     db.set_db_path(config.DB_PATH)
     assert updates.get_updates_calls > 3            # kept polling after the conflicts
     assert "Telegram Conflict" in caplog.text

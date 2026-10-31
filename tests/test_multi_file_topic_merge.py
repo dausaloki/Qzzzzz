@@ -3,7 +3,7 @@
 Covers:
 1. Uploading 3 TXT files of the same topic ("Topic_02_Varnamala_evam_Lipi_Full.txt",
    "Topic_02_Varnamala_evam_Lipi_Part2.txt", "Topic_02_Varnamala_evam_Lipi_Part3.txt")
-   derived from the actual Topic 02 Hindi वर्णमाला dataset -> creates ONE combined quiz
+   derived from the original self-written Hindi letter-identification fixture -> creates ONE combined quiz
    preserving every question, option, answer, explanation, and original file/question order.
 2. Explicit multi-file batching via the "➕ इसी Topic की और File जोड़ें" (i:addmore) button
    and "Finish Upload / Create Combined Quiz" action.
@@ -33,8 +33,8 @@ FIXTURE_FULL_TXT = (
 
 
 def _split_topic02_into_three_files() -> tuple[bytes, bytes, bytes]:
-    """Split the actual 50-question Topic_02_Varnamala_evam_Lipi_Full.txt content into 3
-    distinct files of the same topic (Q1..Q20, Q21..Q35, Q36..Q50) so all 50 real Hindi
+    """Split the original self-written 50-question Topic_02_Varnamala_evam_Lipi_Full.txt content into 3
+    distinct files of the same topic (Q1..Q20, Q21..Q35, Q36..Q50) so all 50 original Hindi
     questions are tested across 3 files in order."""
     full_text = FIXTURE_FULL_TXT.read_text(encoding="utf-8")
     idx21 = full_text.index("[प्रश्न 21]")
@@ -106,13 +106,13 @@ def test_three_txt_files_of_same_topic_combine_into_one_quiz():
             assert len(qs) == 50
             assert [q["position"] for q in qs] == list(range(1, 51))
             assert [q["source_number"] for q in qs] == list(range(1, 51))
-            assert qs[0]["question"] == "हिन्दी वर्णमाला में स्वरों की संख्या कितनी मानी गई है?"
-            assert qs[0]["options"] == ["10", "11", "13", "14"]
+            assert qs[0]["question"] == "अक्षर अभ्यास 1: लिखे हुए शब्द «कमल» का पहला अक्षर चुनिए।"
+            assert qs[0]["options"] == ["न", "क", "ग", "प"]
             assert qs[0]["correct_index"] == 1
             assert qs[20]["source_number"] == 21
             assert qs[35]["source_number"] == 36
-            assert qs[49]["question"] == "वर्ण किसे कहते हैं?"
-            assert qs[49]["correct_index"] == 1
+            assert qs[49]["question"] == "अक्षर अभ्यास 50: लिखे हुए शब्द «फल» का पहला अक्षर चुनिए।"
+            assert qs[49]["correct_index"] == 2
 
     run(t())
 

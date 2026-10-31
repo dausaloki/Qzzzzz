@@ -6,7 +6,20 @@ from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as M
 import database as db
 import keyboards as kb
 import quiz_engine as engine
+import quiz_modes
 from keyboards import esc
+
+
+def _net_suffix(a: dict) -> str:
+    """`` • Net 1.67 (-1/3)`` for attempts that used negative marking, else ``""``.
+
+    Uses the mark stored on the attempt itself, so legacy attempts (stored 0)
+    and quizzes without negative marking look exactly as before."""
+    neg = quiz_modes.negative_of(a)
+    if neg <= 0:
+        return ""
+    net = quiz_modes.compute_net_score(int(a.get("correct") or 0), int(a.get("wrong") or 0), neg)
+    return f" • Net {quiz_modes.format_score(net)} (-{quiz_modes.negative_label(neg)})"
 
 
 def _name(r: dict) -> str:
@@ -52,7 +65,8 @@ def quiz_stats_text(qid: str, viewer_id: int) -> str:
         for i, r in enumerate(leaders):
             m = medals[i] if i < 3 else f"{i + 1}."
             lines.append(f"{m} {esc(_name(r))} — {r['correct']}/{r['total']} "
-                         f"({_pct(r['correct'], r['total'])}) • {engine.format_duration(r['duration_sec'])}")
+                         f"({_pct(r['correct'], r['total'])}){_net_suffix(r)} • "
+                         f"{engine.format_duration(r['duration_sec'])}")
     mine = db.user_history(viewer_id, qid, limit=5)
     if mine:
         lines += ["", "📜 <b>आपके पिछले results</b>"]
@@ -63,13 +77,16 @@ def quiz_stats_text(qid: str, viewer_id: int) -> str:
 def _history_line(a: dict) -> str:
     flag = " (stopped)" if a["status"] == "stopped" else ""
     return (f"• {a['correct']}/{a['total']} ({_pct(a['correct'], a['total'])}) "
-            f"✅{a['correct']} ❌{a['wrong']} ⏭{a['skipped']} ⏰{a.get('timeouts') or 0} • "
+            f"✅{a['correct']} ❌{a['wrong']} ⏭{a['skipped']} ⏰{a.get('timeouts') or 0}{_net_suffix(a)} • "
             f"{engine.format_duration(a['duration_sec'])} • {(a['finished_at'] or '')[:16]}{flag}")
 
 
 def quiz_stats_markup(qid: str) -> M:
-    return M([[B("▶ Start", callback_data=f"q:run:{qid}"), B("⬅️ Quiz", callback_data=f"q:view:{qid}")],
-              kb.home_button()])
+    return M([
+        [B("▶ Start", callback_data=f"q:run:{qid}"), B("⬅️ Quiz", callback_data=f"q:view:{qid}")],
+        [B("🌐 Interactive HTML Report", callback_data=f"q:html:{qid}")],
+        kb.home_button(),
+    ])
 
 
 def user_overview(user_id: int) -> tuple[str, M]:
@@ -84,8 +101,11 @@ def user_overview(user_id: int) -> tuple[str, M]:
         for a in hist:
             flag = " ⏹" if a["status"] == "stopped" else ""
             lines.append(f"• {esc((a.get('title') or 'Deleted quiz')[:35])}: {a['correct']}/{a['total']} "
-                         f"({_pct(a['correct'], a['total'])}) • {(a['finished_at'] or '')[:10]}{flag}")
+                         f"({_pct(a['correct'], a['total'])}){_net_suffix(a)} • "
+                         f"{(a['finished_at'] or '')[:10]}{flag}")
     rows = []
+    if hist:
+        rows.append([B("🌐 Latest Interactive HTML Report", callback_data=f"q:html:{hist[0]['quiz_id']}")])
     for q in db.get_owner_quizzes(user_id, include_drafts=False)[:10]:
         rows.append([B(f"📊 {q['title'][:40]}", callback_data=f"q:stats:{q['id']}")])
     if rows:

@@ -38,15 +38,25 @@ CHECK_FAILED_TEXT = ("⚠️ अभी Telegram से membership verify नह�
 VERIFIED_TEXT = "✅ Group Join verified successfully!"
 
 
+def effective_required_chat() -> str:
+    """Return ``REQUIRED_CHAT`` (or ``REQUIRED_SUB_CHANNEL`` fallback)."""
+    chat = (config.REQUIRED_CHAT or "").strip()
+    if chat:
+        return chat
+    return (getattr(config, "REQUIRED_SUB_CHANNEL", "") or "").strip()
+
+
 def enabled() -> bool:
-    return bool(config.REQUIRED_CHAT)
+    return bool(effective_required_chat())
 
 
 def join_markup(payload: str = "", retry: bool = False) -> M:
     data = "j:check" + (f":{payload}" if payload else "")
     rows = []
-    if config.REQUIRED_CHAT_URL:
-        rows.append([B("📢 Join Group", url=config.REQUIRED_CHAT_URL)])
+    req = effective_required_chat()
+    url = config.REQUIRED_CHAT_URL or (f"https://t.me/{req[1:]}" if req.startswith("@") else "")
+    if url:
+        rows.append([B("📢 Join Group", url=url)])
     rows.append([B("🔄 I've Joined" if retry else "✅ I've Joined", callback_data=data[:64])])
     return M(rows)
 
@@ -65,11 +75,12 @@ def is_active_member(member) -> bool:
 async def fetch_membership(bot, user_id: int) -> tuple[Optional[bool], str]:
     """(True|False, status) from getChatMember, or (None, error) if Telegram
     could not answer (bot not in the group, network error, …)."""
+    req = effective_required_chat()
     try:
-        member = await bot.get_chat_member(config.REQUIRED_CHAT, user_id)
+        member = await bot.get_chat_member(req, user_id)
     except TelegramError as exc:
         log.warning("getChatMember(%s) failed: %s — is the bot a member/admin of the required group?",
-                    config.REQUIRED_CHAT, exc)
+                    req, exc)
         return None, str(exc)
     return is_active_member(member), str(member.status)
 
@@ -108,7 +119,7 @@ async def has_access(bot, user_id: int, *, force: bool = False, allow_unverified
 
 
 def is_required_chat(chat) -> bool:
-    req = config.REQUIRED_CHAT
+    req = effective_required_chat()
     if not req or chat is None:
         return False
     if req.startswith("@"):

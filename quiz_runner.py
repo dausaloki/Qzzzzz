@@ -16,12 +16,15 @@ from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError, TimedOut
 from telegram.ext import Application, ContextTypes
 
+import access_control
 import config
 import database as db
-import review_pdf
 import group_runner
+import html_report
 import keyboards as kb
 import quiz_engine as engine
+import quiz_modes
+import review_pdf
 from keyboards import esc
 
 log = logging.getLogger(__name__)
@@ -78,8 +81,14 @@ def ready_text(quiz: dict) -> str:
               f"🖊 {n} {'question' if n == 1 else 'questions'}",
               f"⏱ {config.timer_label(quiz['timer'])} per question" if quiz.get("timer")
               else "⏱ No time limit",
-              f"🔀 {'Questions and answers shuffled' if quiz['shuffle_questions'] and quiz['shuffle_options'] else 'Questions shuffled' if quiz['shuffle_questions'] else 'Answers shuffled' if quiz['shuffle_options'] else 'No shuffle'}",
-              "",
+              f"🔀 {'Questions and answers shuffled' if quiz['shuffle_questions'] and quiz['shuffle_options'] else 'Questions shuffled' if quiz['shuffle_questions'] else 'Answers shuffled' if quiz['shuffle_options'] else 'No shuffle'}"]
+    mode = quiz_modes.normalize_mode(quiz.get("quiz_mode"))
+    if mode != "standard":
+        lines.append(f"🎯 Mode: {esc(quiz_modes.mode_label(mode))}")
+    neg = quiz_modes.negative_of(quiz)
+    if neg > 0:
+        lines.append(f"➖ Negative Marking: -{quiz_modes.negative_label(neg)} प्रति गलत उत्तर")
+    lines += ["",
               "तैयार होने पर नीचे button दबाएँ। रोकने के लिए /stop, प्रश्न छोड़ने के लिए /skip भेजें।"]
     return "\n".join(lines)
 
@@ -96,6 +105,10 @@ async def send_ready(app: Application, user, chat_id: int, qid: str) -> bool:
         return False
     if not quiz.get("question_count"):
         await bot.send_message(chat_id, "⚠️ इस quiz में अभी कोई प्रश्न नहीं है।", reply_markup=kb.main_menu())
+        return False
+    ok_access, deny_msg = access_control.check_quiz_access(user.id, chat_id, quiz)
+    if not ok_access:
+        await bot.send_message(chat_id, deny_msg, parse_mode=ParseMode.HTML, reply_markup=kb.main_menu())
         return False
     await bot.send_message(chat_id, ready_text(quiz), parse_mode=ParseMode.HTML, reply_markup=kb.ready_markup(qid))
     return True
@@ -122,6 +135,10 @@ async def start_quiz(app: Application, user, chat_id: int, qid: str, chat_type: 
     if quiz.get("status") == "draft" and quiz["owner_id"] != user.id:
         await bot.send_message(chat_id, "⚠️ यह quiz अभी तैयार नहीं हुआ है।")
         return None
+    ok_access, deny_msg = access_control.check_quiz_access(user.id, chat_id, quiz)
+    if not ok_access:
+        await bot.send_message(chat_id, deny_msg, parse_mode=ParseMode.HTML, reply_markup=kb.main_menu())
+        return None
 
     async with user_lock(user.id):
         old = db.get_active_attempt(user.id)
@@ -137,7 +154,8 @@ async def start_quiz(app: Application, user, chat_id: int, qid: str, chat_type: 
             )
         order = engine.build_order([q["id"] for q in questions], bool(quiz["shuffle_questions"]))
         attempt_id = db.create_attempt(qid, user.id, chat_id, order, int(quiz["timer"] or 0),
-                                       bool(quiz["shuffle_options"]), time.time(), start_msg_id)
+                                       bool(quiz["shuffle_options"]), time.time(), start_msg_id,
+                                       snapshot_rules=True)
     try:
         if quiz.get("pre_text"):
             await _send_text(bot, chat_id, quiz["pre_text"])
@@ -188,6 +206,8 @@ async def send_current(app: Application, attempt_id: int) -> None:
         await send_current(app, attempt_id)
         return
     chat_id = att["chat_id"]
+    quiz = db.get_quiz(att["quiz_id"])
+    mode = quiz_modes.normalize_mode(att.get("quiz_mode"))
     perm = engine.make_permutation(len(q["options"]), bool(att["shuffle_options"]))
     try:
         payload = engine.build_poll_payload(q, perm, idx, total)
@@ -195,13 +215,31 @@ async def send_current(app: Application, attempt_id: int) -> None:
         log.exception("payload build failed for question %s", q["id"])
         payload = engine.compact_fallback(q, perm, idx, total)
 
-    timer = int(att.get("timer") or 0)
+    timer = quiz_modes.resolve_question_timer(quiz, q, default_timer=int(att.get("timer") or 0))
+    # Section header notice when entering a new section in sectional mode (or when section timers exist)
+    cur_sec = (q.get("section") or "").strip()
+    if cur_sec and (mode == "sectional" or quiz_modes.get_section_timers(quiz)):
+        prev_sec = ""
+        if idx > 0:
+            prev_q = db.get_question(att["quiz_id"], order[idx - 1])
+            prev_sec = (prev_q.get("section") or "").strip() if prev_q else ""
+        if cur_sec.lower() != prev_sec.lower():
+            try:
+                await bot.send_message(
+                    chat_id,
+                    f"📂 <b>Section: {esc(cur_sec)}</b> (⏱ {config.timer_label(timer)})",
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+
     # Telegram accepts open_period 5..600 s; shorter values are enforced by our job only
     open_period = timer if 5 <= timer <= 600 else None
+    exam_mode = (mode == "exam")
     sent = {"text": False}
     try:
         await _send_pre_media(bot, chat_id, q)
-        msg = await _send_poll(bot, chat_id, payload, open_period, sent)
+        msg = await _send_poll(bot, chat_id, payload, open_period, sent, exam_mode=exam_mode)
     except BadRequest as exc:
         log.warning("send_poll rejected (%s) — using compact fallback", exc)
         had_text = bool(payload.full_text_chunks) and sent["text"]
@@ -209,7 +247,7 @@ async def send_current(app: Application, attempt_id: int) -> None:
         if had_text:          # the identical full question text is already in the chat
             payload.full_text_chunks = []
         try:
-            msg = await _send_poll(bot, chat_id, payload, open_period)
+            msg = await _send_poll(bot, chat_id, payload, open_period, exam_mode=exam_mode)
         except BadRequest as exc2:
             log.error("compact poll also failed for question %s: %s", q["id"], exc2)
             await bot.send_message(chat_id, f"⚠️ प्रश्न {idx + 1} भेजा नहीं जा सका ({exc2.message}). इसे skip किया गया।")
@@ -238,11 +276,23 @@ async def send_current(app: Application, attempt_id: int) -> None:
 
 
 async def _send_poll(bot, chat_id: int, payload: engine.PollPayload, open_period: Optional[int],
-                     sent: Optional[dict] = None):
+                     sent: Optional[dict] = None, *, exam_mode: bool = False):
     for chunk in payload.full_text_chunks:
         await bot.send_message(chat_id, chunk)
     if sent is not None and payload.full_text_chunks:
         sent["text"] = True
+    if exam_mode:
+        # In Exam mode, answers and explanations remain hidden until final submission
+        return await bot.send_poll(
+            chat_id=chat_id,
+            question=payload.question,
+            options=payload.options,
+            type="regular",
+            is_anonymous=False,
+            allows_multiple_answers=False,
+            open_period=open_period,
+            reply_markup=kb.running_markup(),
+        )
     return await bot.send_poll(
         chat_id=chat_id,
         question=payload.question,
@@ -279,10 +329,23 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
             is_correct = chosen == att["cur_correct"]
             elapsed = time.time() - (att.get("cur_sent_ts") or time.time())
             post_expl = att.get("cur_post_explanation") or ""
-            db.record_answer(att["id"], att["cur_question_id"], att["current_index"],
-                             engine.original_choice(perm, chosen), is_correct,
-                             "correct" if is_correct else "wrong", elapsed)
-            if post_expl:
+            orig_choice = engine.original_choice(perm, chosen)
+            status_str = "correct" if is_correct else "wrong"
+            q_id = att["cur_question_id"]
+            db.record_answer(att["id"], q_id, att["current_index"],
+                             orig_choice, is_correct, status_str, elapsed)
+            mode = quiz_modes.normalize_mode(att.get("quiz_mode"))
+            if mode == "exam":
+                pass  # Keep answers/explanations hidden until the exam finishes
+            elif mode == "practice":
+                q_obj = db.get_question(att["quiz_id"], q_id)
+                if q_obj:
+                    fb = quiz_modes.format_practice_feedback(q_obj, chosen_index=orig_choice, status=status_str)
+                    try:
+                        await context.bot.send_message(att["chat_id"], fb, parse_mode=ParseMode.HTML)
+                    except TelegramError as exc:
+                        log.warning("could not send practice feedback: %s", exc)
+            elif post_expl:
                 try:
                     await _send_text(context.bot, att["chat_id"],
                                      ("✅ सही!" if is_correct else "❌ गलत।") + "\n💡 Explanation:\n" + post_expl)
@@ -328,12 +391,23 @@ async def _skip_current_locked(app: Application, att: dict, reason: str, status:
             pass  # already closed by open_period
     elapsed = time.time() - (att.get("cur_sent_ts") or time.time())
     post_expl = att.get("cur_post_explanation") or ""
-    db.record_answer(att["id"], att["cur_question_id"], att["current_index"], None, False, status, elapsed)
+    q_id = att["cur_question_id"]
+    db.record_answer(att["id"], q_id, att["current_index"], None, False, status, elapsed)
+    mode = quiz_modes.normalize_mode(att.get("quiz_mode"))
     text = reason
-    if post_expl:
+    if mode == "exam":
+        pass  # Do not reveal explanation during exam mode
+    elif mode == "practice":
+        q_obj = db.get_question(att["quiz_id"], q_id)
+        if q_obj:
+            text += "\n" + quiz_modes.format_practice_feedback(q_obj, chosen_index=None, status=status)
+    elif post_expl:
         text += "\n💡 Explanation:\n" + post_expl
     try:
-        await _send_text(bot, att["chat_id"], text)
+        if mode == "practice":
+            await bot.send_message(att["chat_id"], text, parse_mode=ParseMode.HTML)
+        else:
+            await _send_text(bot, att["chat_id"], text)
     except Forbidden:
         db.finish_attempt(att["id"], "stopped", time.time() - (att.get("started_ts") or time.time()))
         return
@@ -357,7 +431,10 @@ async def skip_current(app: Application, user_id: int, message_id: Optional[int]
 
 
 # ------------------------------------------------------------ finishing
-def result_text(att: dict, quiz_title: str, stopped: bool) -> str:
+def result_text(att: dict, quiz_title: str, stopped: bool, *,
+                section_scores: Optional[dict] = None,
+                negative_mark: float = 0.0,
+                net_score: Optional[float] = None) -> str:
     r = engine.compute_result(att["total"], att["correct"], att["wrong"], att["skipped"],
                               att.get("duration_sec") or 0, att.get("timeouts") or 0)
     head = "⏹ <b>Quiz stopped</b> — partial result saved" if stopped else "🏁 <b>The quiz has finished!</b>"
@@ -373,6 +450,13 @@ def result_text(att: dict, quiz_title: str, stopped: bool) -> str:
     lines += [f"Score: {r.score}/{r.total}",
               f"Percentage: {r.percentage:.2f}%",
               f"Time: {engine.format_duration(r.duration_sec)}"]
+    if negative_mark > 0 and net_score is not None:
+        penalty = round(float(r.wrong) * float(negative_mark), 2)
+        lines.append(f"Negative Marking: -{quiz_modes.negative_label(negative_mark)} प्रति गलत उत्तर "
+                     f"(−{quiz_modes.format_score(penalty)})")
+        lines.append(f"Net Score: <b>{quiz_modes.format_score(net_score)}/{r.total}</b>")
+    if section_scores:
+        lines += quiz_modes.format_section_breakdown_lines(section_scores)
     if not stopped:
         rank, n = db.user_rank(att["quiz_id"], att["user_id"])
         if rank and n > 1:
@@ -388,9 +472,30 @@ async def _finish_locked(app: Application, att: dict, status: str, *, auto_pdf: 
         return None
     quiz = db.get_quiz(done["quiz_id"])
     title = quiz["title"] if quiz else "Quiz"
+    mode = quiz_modes.normalize_mode(done.get("quiz_mode"))
+    neg_mark = quiz_modes.negative_of(done)
+    questions = db.get_questions(done["quiz_id"])
+    ans_rows = db.get_attempt_answers(done["id"])
+    sec_scores = quiz_modes.compute_section_breakdown(questions, ans_rows, neg_mark)
+    net_val = quiz_modes.compute_net_score(done["correct"], done["wrong"], neg_mark)
     try:
-        await app.bot.send_message(done["chat_id"], result_text(done, title, status == "stopped"),
-                                   parse_mode=ParseMode.HTML, reply_markup=kb.result_markup(done["quiz_id"], db.next_part(done["quiz_id"])))
+        db.update_attempt_metadata(
+            done["id"],
+            quiz_mode=mode,
+            section_scores=sec_scores,
+            negative_mark=neg_mark,
+            net_score=net_val,
+        )
+    except Exception:  # noqa: BLE001
+        log.warning("could not save attempt metadata for attempt %s", done["id"])
+    try:
+        await app.bot.send_message(
+            done["chat_id"],
+            result_text(done, title, status == "stopped", section_scores=sec_scores,
+                        negative_mark=neg_mark, net_score=net_val),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb.result_markup(done["quiz_id"], db.next_part(done["quiz_id"])),
+        )
     except TelegramError as exc:
         log.warning("could not send result: %s", exc)
     # Complete review PDF (every question), sent right after the existing result.
@@ -400,6 +505,18 @@ async def _finish_locked(app: Application, att: dict, status: str, *, auto_pdf: 
             await review_pdf.auto_after_finish(app, done)
         except Exception:                       # noqa: BLE001
             log.exception("review PDF hook failed")
+        if getattr(config, "AUTO_HTML_REPORT", False):
+            try:
+                h_bytes, h_name, _ = html_report.build_html_report_for_attempt(done["id"])
+                await app.bot.send_document(
+                    chat_id=done["chat_id"],
+                    document=h_bytes,
+                    filename=h_name,
+                    caption=f"🌐 <b>Interactive HTML Report</b> — {esc(title)}",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:                   # noqa: BLE001
+                log.exception("auto HTML report failed")
     return done
 
 
