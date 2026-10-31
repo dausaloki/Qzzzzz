@@ -15,6 +15,7 @@ Covers the eight verification points of the requirement:
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -488,7 +489,14 @@ def test_github_sync_redacts_user_data(gh):
     assert backup.sync_github(force=True)["ok"]
     raw = gh.file.decode("utf-8")
     uploaded = gh.uploaded()
-    assert "501" not in raw and "-1001" not in raw          # no user/chat ids
+    # No user/chat ids anywhere in the file.  501 is matched as a whole number only: a
+    # plain substring test also matched digits inside timestamps (e.g. 1793279501.21)
+    # and failed at random.  The temporary database path of this test run (it can
+    # contain ".../pytest-501/..." or "pytest-1001") is environment, not user data,
+    # so only that exact string is left out of the scan.
+    scan = raw.replace(str(db.get_db_path()), "")
+    assert not re.search(r"(?<![0-9A-Za-z.])501(?![0-9A-Za-z])", scan)  # no user ids
+    assert "-1001" not in scan                                         # no chat ids
     assert uploaded["attempts"][0]["user_id"] is None
     assert uploaded["attempts"][0]["chat_id"] is None
     assert uploaded["group_sessions"][0]["chat_id"] is None
