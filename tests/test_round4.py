@@ -392,7 +392,7 @@ def test_inline_query_returns_only_ready_quizzes():
             await h.send(h.f.inline_query(other, ""))                  # other has no quizzes of their own
             assert h.api.inline_answers[-1]["results"] == []
             await h.send(h.f.inline_query(owner, "भूगोल"))
-            assert [r["title"] for r in h.api.inline_answers[-1]["results"]] == ["भूगोल टेस्ट"]
+            assert h.api.inline_answers[-1]["results"] == []  # Requested contract: no title searches/lists.
     run(t())
 
 

@@ -122,7 +122,7 @@ def test_running_exam_keeps_answers_hidden_when_owner_changes_mode(monkeypatch):
             qid = make_quiz(owner=889, n=2, timer=45)
             db.update_quiz(qid, quiz_mode="exam", negative_mark=1 / 3)
             from types import SimpleNamespace
-            aid = await quiz_runner.start_quiz(h.app, SimpleNamespace(**u), 889, qid)
+            aid = await quiz_runner.start_quiz(h.app, SimpleNamespace(**u), 889, qid, pdf_allowed=False)
             att = db.get_attempt(aid)
             first = h.api.sent("sendPoll", 889)[-1]
             assert first["type"] == "regular" and "correct_option_id" not in first

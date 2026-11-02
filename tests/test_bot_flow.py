@@ -28,8 +28,9 @@ class Harness:
     """``pre_verified``: users count as already-verified members of the required
     group (the join gate itself is tested in test_round5.py)."""
 
-    def __init__(self, pre_verified: bool = True):
+    def __init__(self, pre_verified: bool = True, pdf_choice: bool | None = True):
         self.pre_verified = pre_verified
+        self.pdf_choice = pdf_choice  # Legacy flows explicitly allow; None tests the untouched UI.
         self._verified: set[int] = set()
 
     async def __aenter__(self):
@@ -59,15 +60,38 @@ class Harness:
 
     async def cb(self, user, data, chat_id=None, message_id=1):
         await self.send(self.f.callback(user, data, chat_id=chat_id, message_id=message_id))
+        # Drive the NEW consent screen using real callbacks, never monkeypatch policy.
+        # Existing scoring/import/backup tests retain their original assertions.
+        if self.pdf_choice is not None and data.startswith("r:go:") and (chat_id is None or chat_id > 0):
+            with db.connect() as con:
+                row = con.execute("SELECT request_id FROM pdf_start_requests WHERE user_id=? AND consumed=0 ORDER BY created_ts DESC LIMIT 1",
+                                  (user["id"],)).fetchone()
+            if row:
+                await self.send(self.f.callback(user, f"pd:p:{int(self.pdf_choice)}:{row['request_id']}",
+                                                chat_id=chat_id, message_id=message_id))
+        if self.pdf_choice is not None and data.startswith("g:go:") and chat_id and chat_id < 0:
+            session = db.get_active_group_session(chat_id)
+            if session and session["status"] == "pending" and session["started_by"] == user["id"]:
+                await self.send(self.f.callback(user, f"pd:g:{int(self.pdf_choice)}:{session['id']}", chat_id=chat_id))
+                await self.send(self.f.callback(user, f"pd:begin:{session['id']}", chat_id=chat_id))
 
     _go_ids = iter(range(50000, 10 ** 9))
 
     async def start(self, user, qid):
-        """▶️ Start Quiz → ready card → "I'm ready" (each tap is a new ready message)."""
+        """Ready → explicit per-attempt choice (legacy tests opt in, never implicit in bot)."""
         await self.cb(user, f"q:run:{qid}")
         ready = self.api.sent("sendMessage", user["id"])[-1]
-        assert [b["callback_data"] for b in buttons(ready["reply_markup"])] == [f"r:go:{qid}"], ready
-        await self.cb(user, f"r:go:{qid}", message_id=next(self._go_ids))
+        actions = buttons(ready["reply_markup"])
+        if db.pdf_review_enabled():
+            assert len(actions) == 2
+            assert [b["text"] for b in actions] == ["📄 Allow PDF Review", "🚫 Do Not Allow PDF"]
+            assert actions[0]["callback_data"].startswith("pd:p:1:")
+            assert actions[1]["callback_data"].startswith("pd:p:0:")
+            choice = True if self.pdf_choice is None else self.pdf_choice
+            await self.cb(user, actions[0 if choice else 1]["callback_data"], message_id=next(self._go_ids))
+        else:
+            assert [b["callback_data"] for b in actions] == [f"r:go:{qid}"]
+            await self.cb(user, f"r:go:{qid}", message_id=next(self._go_ids))
 
     async def go(self, user, qid):
         await self.cb(user, f"r:go:{qid}", message_id=next(self._go_ids))

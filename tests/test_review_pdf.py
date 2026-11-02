@@ -65,7 +65,7 @@ def _finished_attempt(qid, uid=401, answers=(("correct", 2), ("wrong", 1), ("ski
                                              ("timeout", None))):
     """Answer the first questions as given; the rest stay unanswered."""
     qs = db.get_questions(qid)
-    att = db.create_attempt(qid, uid, uid, [q["id"] for q in qs], 30, False, 1_000_000.0)
+    att = db.create_attempt(qid, uid, uid, [q["id"] for q in qs], 30, False, 1_000_000.0, pdf_allowed=True)
     for i, (status, idx) in enumerate(answers):
         if i >= len(qs):
             break
