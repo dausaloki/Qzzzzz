@@ -23,7 +23,7 @@ create quizzes step by step, import them from **PDF / text / HTML**, play them
 | Question formats | Normal MCQ, statement based, matching, List-I/List-II, assertion-reason, ordering. Multi-line text is saved exactly as typed. You can paste the question and its options together and the bot detects the options. |
 | PDF / Text import | Text PDFs, **scanned/image PDFs (OCR, Hindi + English)**, PDFs in legacy Hindi fonts (Kruti Dev etc. are OCR'd), **two-column** layouts (read column by column), `.txt` files or pasted text (long text can arrive in several messages) |
 | HTML import | Send an `.html` / `.htm` / `.xhtml` quiz file and it goes through the **same preview → confirm → create** flow as PDF/TXT. Question blocks are found by class names (`question`, `mcq`, `quiz-question`…), by radio/checkbox groups (inside a block **or** as flat `<div><input>…</div>` siblings), by table rows (`question | A | B | C | D | answer`) or, when the page has no structure at all, by the normal text parser on the page text. The correct answer is taken only from an explicit signal — `class="correct"`, `checked` radio, `data-correct`, `Answer: B` / `उत्तर: (B)` text, an `(answer)` cell — a colour-only highlight is imported as a **जाँचें / review** item, and a question with **two** marked answers (multi-answer) is reported as an error because the bot's polls are single-answer. Missing answers become `Answer Not Found`; nothing is ever guessed. Text, Devanagari/English wording, numbering, option order, explanations and section headings (`<h2>भाग-अ`) are preserved exactly; `<script>`/`<style>` are ignored (the bot never re-implements the site's JavaScript, timers or scoring). Progress is shown for large files, malformed markup is rejected with a clear message, and the file is capped by `HTML_MAX_BYTES`. |
-| Review PDF | When a private or group quiz finishes, the bot automatically generates and sends each participant a **personal PDF of the complete quiz** to their private chat — every question (correct, incorrect, skipped/timed-out and never-attempted), every option in its original order, your selected option, the verified correct answer, ✓ / ✗ marks, a text label (`CORRECT` / `INCORRECT` / `NOT ATTEMPTED` — readable without colour) and the explanation. The summary page shows quiz name, participant display name + ID, date/time (IST and UTC), total / attempted / correct / incorrect / unanswered / score / max marks / percentage / negative-marking status, with `correct + incorrect + unanswered = total` verified on the page. Every page features the exact owner branding (`Quiz Bot Owner: LOKESH DAUSA`, `Telegram Username: @LOKESH_DAUSA`, `Official Telegram Group: https://t.me/kalam_kranti`), a genuine clickable PDF hyperlink annotation (`https://t.me/kalam_kranti`) in the footer of every page alongside visible page numbers, and the official group DP emblem (`assets/group_dp_watermark.jpg`) centered behind all content at ~10% opacity on every page. Devanagari and Latin text are shaped with HarfBuzz (`fitz.Story`) and embedded with real fonts (`fonts/`, plus automatic extraction of PyMuPDF's compiled-in Devanagari/Latin/Symbol fonts if `fonts/` is absent) paired with an exact Unicode `/ActualText` layer, so Hindi matras/conjuncts render accurately everywhere and the text stays selectable/searchable. Delivery is **private** (never posted in a group), **deduplicated** (`review_pdfs` table; a later `/review` re-sends only when you ask, for both private and group quizzes), retried on transient errors (5 s / 20 s / 60 s, `REVIEW_PDF_RETRIES`) and never affects the saved result. If you never pressed Start in the bot's private chat, Telegram refuses the document — the bot then tells you to press **Start** and offers the PDF again via the **📄 मेरा Review PDF** button. |
+| Review PDF | When a private or group quiz finishes, the bot generates and sends a **personal PDF of the complete quiz** only for a participant who explicitly allowed PDF **before that attempt started**, while the persistent `/admin` PDF switch is ON to their private chat — every question (correct, incorrect, skipped/timed-out and never-attempted), every option in its original order, your selected option, the verified correct answer, ✓ / ✗ marks, a text label (`CORRECT` / `INCORRECT` / `NOT ATTEMPTED` — readable without colour) and the explanation. The summary page shows quiz name, participant display name + ID, date/time (IST and UTC), total / attempted / correct / incorrect / unanswered / score / max marks / percentage / negative-marking status, with `correct + incorrect + unanswered = total` verified on the page. Every page features the exact owner branding (`Quiz Bot Owner: LOKESH DAUSA`, `Telegram Username: @LOKESH_DAUSA`, `Official Telegram Group: https://t.me/kalam_kranti`), a genuine clickable PDF hyperlink annotation (`https://t.me/kalam_kranti`) in the footer of every page alongside visible page numbers, and the official group DP emblem (`assets/group_dp_watermark.jpg`) centered behind all content at ~10% opacity on every page. Devanagari and Latin text are shaped with HarfBuzz (`fitz.Story`) and embedded with real fonts (`fonts/`, plus automatic extraction of PyMuPDF's compiled-in Devanagari/Latin/Symbol fonts if `fonts/` is absent) paired with an exact Unicode `/ActualText` layer, so Hindi matras/conjuncts render accurately everywhere and the text stays selectable/searchable. Delivery is **private** (never posted in a group), **deduplicated** (`review_pdfs` table; a later `/review` re-sends only when you ask, for both private and group quizzes), retried on transient errors (5 s / 20 s / 60 s, `REVIEW_PDF_RETRIES`) and never affects the saved result. If you never pressed Start in the bot's private chat, Telegram refuses the document — the bot then tells you to press **Start** and offers the PDF again via the **📄 मेरा Review PDF** button. |
 | Options | 2–12 options per question (Telegram's limit, Bot API 9.1+). **(E) and later options are never dropped.** |
 | Numbering | Numbering that restarts per section/page (`भाग-अ 1…100, भाग-ब 1…100`) is detected, with or without headings. Section-wise or combined answer keys are matched to the right section. |
 | Parser | Question markers `प्रश्न 1.` `1.` `1)` `Q1` `Q.1` `Question 1:`. It finds the **real** answer choices even when the question body contains A-D data (matching lists, List-I/II, ordering items, assertion (A)/(R), statements `1. 2. 3.`). |
@@ -153,9 +153,9 @@ The `Procfile` (`worker: python bot.py`) is kept for other hosts. If you deploy 
 | `HTML_IMPORT_ADMIN_ONLY` | no | `0` | `1` restricts `.html` import to `BACKUP_ADMIN_IDS` (PDF/TXT import stays open) |
 | `HTML_MAX_BYTES` | no | `12582912` | Largest `.html` file accepted (12 MB) |
 | `HTML_MAX_NODES` | no | `400000` | DOM node cap that stops a pathological file from hanging the worker |
-| `REVIEW_PDF_ENABLED` | no | `1` | `0` turns the review PDF off completely |
-| `REVIEW_PDF_PRIVATE_AUTO` | no | `1` | `0` keeps the PDF available via `/review` but stops the automatic send |
-| `REVIEW_PDF_GROUP_AUTO` | no | `1` | `1` automatically sends every group participant their personal review PDF privately after the leaderboard (`0` = button only) |
+| `REVIEW_PDF_ENABLED` | no | `1` | `0` is the server-side emergency kill switch; `/admin` also provides a persistent global ON/OFF switch |
+| `REVIEW_PDF_PRIVATE_AUTO` | no | `1` | `0` stops automatic sends; `/review` still respects global state and the attempt's pre-start consent |
+| `REVIEW_PDF_GROUP_AUTO` | no | `1` | `1` automatically sends consenting group participants their personal review PDF privately after the leaderboard (`0` = consent-checked button only) |
 | `REVIEW_PDF_RETRIES` | no | `3` | Retries after a failed delivery (0–3) |
 | `PDF_FONT_DIR` | no | `./fonts` | Folder with the embedded PDF fonts |
 | `WATERMARK_IMAGE_PATH` | no | `assets/group_dp_watermark.jpg` | Official group DP used as the Review-PDF watermark |
@@ -520,3 +520,97 @@ inventory, interface boundaries, secure branch-only publication, Android-friendl
 fallback instructions, full vs redacted backup distinctions, tested restore
 commands, future deployment checks and rollback caveats. No production command
 in that guide should be executed without separate approval.
+
+
+## Inline sharing + optional PDF consent update
+
+Inline mode accepts **only** `@Dausa_Quizbot quiz_<QUIZ_ID>` (using the actual bot
+username returned by Telegram). Empty queries, titles, partial IDs and invalid IDs
+return no quiz list. A valid, ready, nonempty quiz returns one access-aware result.
+The sent inline card contains the full preview, actual creator metadata when
+available, existing LOKESH DAUSA branding, and these exact three primary actions:
+
+1. **▶️ Start this quiz** — existing private deep link and existing runner.
+2. **👥 Start quiz in group** — Telegram `startgroup` picker, existing group card,
+   group consent lobby when PDF is ON, then existing native-poll group engine.
+3. **↗️ Share quiz** — native `switch_inline_query=quiz_<same-ID>` chat selection.
+
+The `/share` management screen retains its existing share-URL fallback and
+management controls; the **sent inline result** has exactly the three actions.
+Telegram adds the native `via @Dausa_Quizbot` attribution when the result is sent
+through that bot. The preview also includes visible `via @<actual bot username>`.
+The code cannot rename a different bot account or enable BotFather settings.
+
+**Manual setup, not performed by this update:** enable Inline Mode through
+BotFather `/setinline` for the existing @Dausa_Quizbot account. No token goes into
+source/chat. A current Telegram client must permit inline sharing in the chosen
+chat/channel. Group use also requires the existing bot's normal group/poll posting
+permissions; do not run a second bot instance. The actual picker UI, client
+attribution and production permissions require a live Telegram acceptance test.
+
+### Per-attempt PDF choices
+
+When PDF is globally ON, private ready cards require **📄 Allow PDF Review** or
+**🚫 Do Not Allow PDF**. Selecting one starts that quiz through the existing engine.
+There is no implicit Allow and no persistent per-user default. Try Again, old
+Start buttons, deep links and direct start entry points cannot bypass the choice.
+Choice cards are actor/chat/quiz-bound, single-use, expire after 30 minutes and
+are invalidated by a newer ready card, `/cancel` or `/stop`.
+
+Group starters first open a **pending lobby**. Each participant makes their OWN
+choice in that group; the button answers privately as a Telegram callback alert
+and does not edit anyone else's choice. The starter or group admin chooses their
+own permission and presses **▶️ Begin group quiz** after participants are ready.
+Native group polls cannot prevent late/non-registered voters from answering.
+They can still play, but without pre-start consent they receive **no PDF**. Choices
+cannot be added after the group quiz starts. One user's decisions in two group
+sessions remain independent. Use `/stop` to cancel a lobby; it expires after 30
+minutes and pending lobbies survive ordinary restarts.
+
+`/admin` → **PDF Review ON / PDF Review OFF** persists in SQLite and requires the
+existing owner/admin role. OFF suppresses new permission prompts and blocks
+rendering/delivery/retries/manual PDF requests regardless of individual consent.
+If switched OFF during a lobby, the authorized starter can still Begin without
+PDF. The existing `REVIEW_PDF_ENABLED=0` environment flag remains a hard override;
+`REVIEW_PDF_PRIVATE_AUTO` and `REVIEW_PDF_GROUP_AUTO` remain additional automatic-
+delivery switches (default 1). No deployment variables were changed.
+
+An already-running render cannot be retroactively uncomputed, and an upload
+already in flight to Telegram cannot be recalled. Delivery rechecks the global
+switch after rendering, immediately before issuing a new upload.
+
+Declined NEW attempts cannot bypass consent through `/review` or a group PDF
+button. HTML results, `/htmlreport`, scoring and optional automatic HTML reports
+remain independent. Historical attempts with unknown consent never auto-send;
+an explicit `/review` or legacy group PDF button remains supported for historical
+records only, while the global switch is ON. This is an explicit request, not an
+inferred default. Already-running historical attempts finish normally without an
+automatic PDF.
+
+### Migration / backup compatibility
+
+`database.init_db()` applies additive, idempotent migrations only:
+
+* nullable `attempts.pdf_allowed`: NULL historical/unknown, 0 decline, 1 allow;
+* nullable `group_sessions.pdf_enabled_at_start`: NULL historical, 0 not enabled
+  at activation/new unstarted lobby, 1 enabled at activation;
+* `bot_settings`: global switch and administrator audit metadata;
+* `pdf_start_requests`: single-use private ready cards linked to their eventual
+  attempt ID;
+* `group_pdf_permissions`: `(session_id,user_id)` decision and timestamp, linked
+  to the existing session's quiz, chat, status and mode.
+
+No existing table is dropped/rebuilt, and no old answer/quiz/attempt is erased.
+Private/group context is supplied by the existing attempts/group_sessions tables;
+the unrelated existing `quiz_mode` scoring field is not renamed or repurposed.
+The existing `quiz_backup.json` mechanism now exports and restores all new state,
+validates new records and redacts actor IDs/request identifiers from its GitHub
+copy. JSON restore retains request audit rows but invalidates restored one-use
+private cards to prevent replay: open a new ready card after restore. Ordinary
+restart does not invalidate an unused, unexpired card. Older backups remain
+accepted; absent permission is never auto-Allow. A pre-update restore target that
+would silently lose permission fields is rejected until its schema is upgraded.
+
+Production migration/restore/deployment has **not** been performed. Back up the
+production volume before any separately approved rollout. An older bot version
+does not enforce these new consent fields, so do not roll back to it blindly.

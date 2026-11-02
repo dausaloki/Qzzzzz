@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 import json
+import html
 import logging
 import os
 import signal
@@ -338,6 +339,7 @@ async def done_cmd(update: Update, context) -> None:
 
 async def cancel_cmd(update: Update, context) -> None:
     if is_private(update):
+        db.cancel_pdf_start_requests(update.effective_user.id)
         await creator.cancel(update, context)
 
 
@@ -368,6 +370,7 @@ async def stop_cmd(update: Update, context) -> None:
         if not await group_runner.stop_group_quiz(context.application, chat.id):
             await chat.send_message("ℹ️ इस group में अभी कोई quiz नहीं चल रहा।")
         return
+    db.cancel_pdf_start_requests(update.effective_user.id)
     done = await runner.stop_quiz(context.application, update.effective_user.id)
     if not done:
         await update.effective_chat.send_message("ℹ️ अभी कोई quiz नहीं चल रहा।", reply_markup=kb.main_menu())
@@ -542,13 +545,18 @@ async def review_cmd(update: Update, context) -> None:
     if not target:
         await update.effective_chat.send_message("ℹ️ अभी कोई पूरा हुआ quiz नहीं मिला — पहले एक quiz खेलें।")
         return
+    if not db.pdf_review_enabled():
+        await update.effective_chat.send_message("🚫 PDF Review System globally OFF है। HTML report के लिए /htmlreport भेजें।")
+        return
     status = await update.effective_chat.send_message("⏳ आपका Review PDF बन रहा है…")
     res = await review_pdf.deliver_latest_review(context.bot, user.id, target=target)
     try:
         await status.delete()
     except TelegramError:
         pass
-    if not res.get("ok"):
+    if res.get("skipped") == "consent-required":
+        await update.effective_chat.send_message("🚫 इस attempt में pre-start PDF अनुमति नहीं थी। HTML report के लिए /htmlreport भेजें।")
+    elif not res.get("ok"):
         await update.effective_chat.send_message(
             "❌ Review PDF नहीं भेजा जा सका। कृपया थोड़ी देर बाद /review दोबारा भेजें।")
 
@@ -852,8 +860,10 @@ async def admin_cmd(update: Update, context) -> None:
         await update.effective_chat.send_message("⛔ यह कमांड केवल Owner / Admin के लिए है।")
         return
     await update.effective_chat.send_message(
-        admin_tools.admin_dashboard_text(),
+        admin_tools.admin_dashboard_text() + "\n\n📄 <b>PDF Review System: " +
+        ("ON" if db.pdf_review_enabled() else "OFF") + "</b>",
         parse_mode=ParseMode.HTML,
+        reply_markup=kb.pdf_admin_markup(db.pdf_review_enabled()),
     )
 
 
@@ -1056,43 +1066,43 @@ async def share_quiz(update: Update, context, qid: str) -> None:
 
 
 # ------------------------------------------------------------ inline mode
-async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Inline sharing (works only if inline mode is enabled for the bot in BotFather).
+def inline_quiz_preview(quiz: dict, username: str) -> str:
+    """A single, escaped quiz preview; creator identity comes from existing users."""
+    owner = db.get_user(quiz["owner_id"]) or {}
+    name = " ".join(str(owner.get(k) or "").strip() for k in ("first_name", "last_name")).strip()
+    creator = name or ("@" + owner["username"] if owner.get("username") else "Creator unavailable")
+    if name and owner.get("username"):
+        creator += f" (@{owner['username']})"
+    description = quiz.get("description") or "No description provided."
+    return (f"🎲 <b>{esc(quiz['title'])}</b>\n{esc(description)}\n\n"
+            f"🖊 Questions: {quiz['question_count']}\n"
+            f"⏱ Time per question: {esc(config.timer_label(quiz['timer']))}\n"
+            f"👤 Creator: {esc(creator)}\n"
+            f"🤖 {esc(config.OWNER_NAME)} ({esc(config.OWNER_TELEGRAM)})\n\n"
+            "▶️ Start privately, choose a group, or share this same quiz below.\n"
+            f"via @{esc(username)}")
 
-    ``quiz_<id>`` → that quiz's card; any other query → the user's own quizzes
-    whose title matches.  The card contains a Start button (deep link) — every
-    user who taps it gets an independent private session."""
+
+async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Only a complete quiz_<ID> returns ONE result. Never list/search quizzes."""
     iq = update.inline_query
     if iq is None:
         return
-    username = await bot_username(context)
-    query = (iq.query or "").strip()
-    quizzes = []
-    if query.startswith("quiz_"):
-        quiz = db.get_quiz(query[5:])
-        if quiz and quiz.get("status") == "ready" and quiz.get("question_count") and access_control.can_share_inline(iq.from_user.id, quiz):
-            quizzes = [quiz]
-    else:
-        needle = query.lower()
-        quizzes = [db.get_quiz(q["id"]) for q in db.get_owner_quizzes(iq.from_user.id, include_drafts=False)
-                   if q.get("question_count") and needle in q["title"].lower()][:20]
-        quizzes = [q for q in quizzes if q and access_control.can_share_inline(iq.from_user.id, q)]
+    qid = engine.parse_start_payload((iq.query or "").strip())
+    quiz = db.get_quiz(qid) if qid else None
     results = []
-    for quiz in quizzes:
-        link = engine.deep_link(username, quiz["id"])
-        n = quiz["question_count"]
-        t_label = config.timer_label(quiz["timer"])
-        desc = f"\n{esc(quiz['description'])}" if quiz.get("description") else ""
-        text = (f"🎲 <b>{esc(quiz['title'])}</b>{desc}\n"
-                f"🖊 {n} {'question' if n == 1 else 'questions'} · ⏱ {t_label}\n"
-                f"👤 {esc(config.OWNER_NAME)} ({esc(config.OWNER_TELEGRAM)})\n\n"
-                "नीचे button दबाकर private chat में quiz शुरू करें 👇")
-        results.append(InlineQueryResultArticle(
-            id=quiz["id"][:64], title=quiz["title"][:100],
-            description=f"{n} questions · ⏱ {t_label} · {config.OWNER_NAME}",
-            input_message_content=InputTextMessageContent(text, parse_mode=ParseMode.HTML),
-            reply_markup=kb.start_privately(link)))
-    await iq.answer(results, cache_time=5, is_personal=True)
+    if quiz and quiz.get("status") == "ready" and quiz.get("question_count") and access_control.can_share_inline(iq.from_user.id, quiz):
+        username = await bot_username(context)
+        text = inline_quiz_preview(quiz, username)
+        # Legacy DBs may contain descriptions above the creator's current limits.
+        # Never silently cut stored wording or send an invalid >4096-character card.
+        if engine.tg_len(html.unescape(text.replace("<b>", "").replace("</b>", ""))) <= 4096:
+            results.append(InlineQueryResultArticle(
+                id=quiz["id"], title=quiz["title"][:100],
+                description=f"{quiz['question_count']} questions · {config.timer_label(quiz['timer'])} per question · {config.OWNER_NAME}",
+                input_message_content=InputTextMessageContent(text, parse_mode=ParseMode.HTML),
+                reply_markup=kb.inline_quiz_markup(engine.deep_link(username,qid), engine.group_link(username,qid), qid)))
+    await iq.answer(results, cache_time=0, is_personal=True)
 
 
 # ------------------------------------------------------------ callbacks
@@ -1103,6 +1113,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     db.upsert_user(user)
     prefix = data.split(":", 1)[0]
 
+    if prefix == "pd":
+        await pdf_policy_callback(update, context)
+        return
+
     if prefix == "p":
         # 📄 my complete review PDF — always delivered to the *requesting* user's own chat
         parts = data.split(":")
@@ -1112,6 +1126,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                                                         reason="button")
             if res.get("ok"):
                 pass                      # the PDF itself was just delivered with its caption
+            elif res.get("skipped") in ("disabled", "consent-required", "not-completed"):
+                await q.answer("🚫 PDF globally OFF है या इस attempt में pre-start अनुमति नहीं थी / quiz पूरा नहीं हुआ।", show_alert=True)
             elif res.get("blocked"):
                 await q.answer("⚠️ पहले bot को private में /start भेजें, फिर यह 📄 button दोबारा दबाएँ।",
                                show_alert=True)
@@ -1275,6 +1291,57 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await q.answer("⌛ यह button अब valid नहीं है।")
 
 
+async def pdf_policy_callback(update: Update, context) -> None:
+    """Actor-bound PDF choices, group lobby activation and admin switch."""
+    q, user, chat = update.callback_query, update.effective_user, update.effective_chat
+    parts = (q.data or "").split(":")
+    if len(parts) == 3 and parts[1] == "global" and parts[2] in ("0", "1"):
+        if not is_private(update) or not config.is_admin(user.id):
+            await q.answer("⛔ Admin only", show_alert=True)
+            return
+        db.set_pdf_review_enabled(parts[2] == "1", user.id)
+        await q.answer("PDF Review ON" if db.pdf_review_enabled() else "PDF Review OFF")
+        await q.edit_message_reply_markup(reply_markup=kb.pdf_admin_markup(db.pdf_review_enabled()))
+        await chat.send_message("📄 PDF Review System: " + ("ON" if db.pdf_review_enabled() else "OFF") +
+                                (" (server REVIEW_PDF_ENABLED=0)" if not config.REVIEW_PDF_ENABLED else ""))
+        return
+    if len(parts) == 4 and parts[1] == "p" and parts[2] in ("0", "1") and is_private(update):
+        request = db.get_pdf_start_request(parts[3], user.id, chat.id)
+        if not request:
+            await q.answer("⌛ Choice expired / already used. Quiz दोबारा खोलें।", show_alert=True)
+            return
+        await q.answer("📄 PDF allowed" if parts[2] == "1" and db.pdf_review_enabled() else "🚫 No PDF")
+        await runner.start_quiz(context.application, user, chat.id, request["quiz_id"],
+            start_msg_id=request.get("start_msg_id") or (q.message.message_id if q.message else None),
+            pdf_allowed=parts[2] == "1", pdf_request_token=parts[3])
+        return
+    if len(parts) == 4 and parts[1] == "g" and parts[2] in ("0", "1") and parts[3].isdigit() and chat and chat.id < 0:
+        if not db.pdf_review_enabled():
+            await q.answer("PDF Review globally OFF. Starter Begin दबा सकते हैं।", show_alert=True)
+            return
+        ok = db.set_group_pdf_permission(int(parts[3]), user.id, chat.id, parts[2] == "1")
+        await q.answer(("📄 आपकी PDF अनुमति save हुई।" if parts[2] == "1" else "🚫 आपके लिए PDF नहीं बनेगा।")
+                       if ok else "⌛ Quiz शुरू/बंद हो चुका है; choice पहले करनी थी।", show_alert=True)
+        return
+    if len(parts) == 3 and parts[1] == "begin" and parts[2].isdigit() and chat and chat.id < 0:
+        session = db.get_group_session(int(parts[2]))
+        if not session or session["chat_id"] != chat.id:
+            await q.answer("⌛ Invalid session", show_alert=True)
+            return
+        if user.id != session["started_by"] and not await is_group_admin(context.bot, chat.id, user.id):
+            await q.answer("⛔ केवल starter / group admin शुरू कर सकते हैं।", show_alert=True)
+            return
+        if not await membership.has_access(context.bot, user.id, allow_unverified=True):
+            await q.answer("🔒 पहले required group Join करें।", show_alert=True)
+            return
+        res = await group_runner.begin_pending_quiz(context.application, session["id"], chat.id, user)
+        await q.answer({"ok": "🚀 Quiz शुरू!", "choose": "पहले अपनी PDF choice चुनें।",
+                        "denied": "⛔ Access denied", "expired": "⌛ Session expired / already started"}.get(res,res),
+                       show_alert=res != "ok")
+        return
+    await q.answer("⌛ Invalid PDF action", show_alert=True)
+
+
 async def group_go(update: Update, context, qid: str) -> None:
     """▶️ Start Quiz in this Group — one session per group at a time."""
     q = update.callback_query
@@ -1284,6 +1351,9 @@ async def group_go(update: Update, context, qid: str) -> None:
         await q.answer(f"🔒 Quiz शुरू करने के लिए पहले {req_chat} Join करें।", show_alert=True)
         return
     res = await group_runner.start_group_quiz(context.application, update.effective_chat.id, qid, user)
+    if res == "pending":
+        await q.answer("📄 पहले हर participant PDF choice चुने, फिर Begin दबाएँ।")
+        return
     if res == "ok":
         await q.answer("🚀 Quiz शुरू!")
         return

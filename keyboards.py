@@ -349,5 +349,35 @@ HELP_TEXT = (
     "Quiz के 📤 Share से “👥 Group में Quiz चलाएँ” चुनें (या group में <code>/quiz ID</code>), फिर "
     "“▶️ Start Quiz in this Group”. Group में native quiz polls एक-एक करके आते हैं, हर member का उत्तर "
     "अलग save होता है और अंत में leaderboard आता है। /stop — quiz शुरू करने वाला या group admin रोक सकता है। "
-    "'👤 Start Privately' से अपना अलग private session भी चला सकते हैं।"
+    "'👤 Start Privately' से अपना अलग private session भी चला सकते हैं।\n\n"
+    "<b>Optional PDF Review</b>\n"
+    "PDF globally ON होने पर हर नए private attempt से पहले Allow PDF / Do Not Allow PDF चुनें। "
+    "Group में हर participant lobby में अपनी choice चुने, फिर starter/admin Begin दबाए। "
+    "बिना pre-start अनुमति PDF नहीं भेजा जाता; /htmlreport अलग से उपलब्ध रहता है। "
+    "Owner/admin: /admin → PDF Review ON/OFF।\n\n"
+    "<b>Inline sharing</b>\n"
+    "केवल <code>@YourBot quiz_QUIZ_ID</code> से उसी quiz का card आएगा; खाली query / search से list नहीं आती।"
 )
+
+
+# The inline preview has EXACTLY these three primary actions, no management buttons.
+def inline_quiz_markup(link: str, group_url: str, qid: str) -> M:
+    return M([[B("▶️ Start this quiz", url=link)],
+              [B("👥 Start quiz in group", url=group_url)],
+              [B("↗️ Share quiz", switch_inline_query=f"quiz_{qid}")]])
+
+
+def pdf_permission_markup(token: str) -> M:
+    return M([[B("📄 Allow PDF Review", callback_data=f"pd:p:1:{token}")],
+              [B("🚫 Do Not Allow PDF", callback_data=f"pd:p:0:{token}")]])
+
+
+def group_pdf_lobby_markup(session_id: int) -> M:
+    return M([[B("📄 Allow PDF Review", callback_data=f"pd:g:1:{session_id}")],
+              [B("🚫 Do Not Allow PDF", callback_data=f"pd:g:0:{session_id}")],
+              [B("▶️ Begin group quiz", callback_data=f"pd:begin:{session_id}")]])
+
+
+def pdf_admin_markup(enabled: bool) -> M:
+    return M([[B(("✅ " if enabled else "") + "PDF Review ON", callback_data="pd:global:1"),
+               B(("✅ " if not enabled else "") + "PDF Review OFF", callback_data="pd:global:0")]])

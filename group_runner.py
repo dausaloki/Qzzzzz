@@ -101,24 +101,68 @@ async def start_group_quiz(app: Application, chat_id: int, qid: str, user) -> st
         return "denied"
     order = engine.build_order([q["id"] for q in questions], bool(quiz["shuffle_questions"]))
     async with chat_lock(chat_id):
+        pending = db.pdf_review_enabled()
+        old = db.get_active_group_session(chat_id)
+        if old and old["status"] == "pending" and time.time() - old["started_ts"] > 1800:
+            db.finish_group_session(old["id"], "expired", time.time())
         sid = db.create_group_session(qid, chat_id, user.id, order, group_timer(quiz),
                                       bool(quiz["shuffle_options"]), time.time(),
-                                      negative_mark=quiz_modes.negative_of(quiz))
+                                      negative_mark=quiz_modes.negative_of(quiz), pending=pending,
+                                      pdf_enabled_at_start=False)
         if sid is None:
             return "busy"
-        try:
-            await app.bot.send_message(
-                chat_id, f"🏁 <b>{esc(quiz['title'])}</b> — quiz शुरू!\n"
-                         f"📝 {len(order)} प्रश्न · ⏱ {config.timer_label(group_timer(quiz))} प्रति प्रश्न",
-                parse_mode=ParseMode.HTML)
-            if quiz.get("pre_text"):
-                for chunk in engine.split_message(quiz["pre_text"]):
-                    await app.bot.send_message(chat_id, chunk)
-        except Forbidden:
-            db.finish_group_session(sid, "stopped", time.time())
-            return "missing"
-        await _send_current(app, sid)
+        if pending:
+            try:
+                await app.bot.send_message(
+                    chat_id, f"📄 <b>PDF Review — {esc(quiz['title'])}</b>\n\n"
+                    "हर participant नीचे अपनी PDF अनुमति चुनें; यह केवल इस session के लिए है।\n"
+                    "Starter / group admin: choices के बाद ▶️ Begin group quiz दबाएँ।\n"
+                    "बिना pre-start अनुमति वाले late voters खेल सकते हैं, लेकिन उन्हें PDF नहीं मिलेगा।\n"
+                    "PDF private chat में आता है; पहले bot को private में /start भेजें।\n/stop — cancel lobby",
+                    parse_mode=ParseMode.HTML, reply_markup=kb.group_pdf_lobby_markup(sid))
+            except TelegramError:
+                db.finish_group_session(sid, "stopped", time.time())
+                return "missing"
+            return "pending"
+        await _begin_locked(app, db.get_group_session(sid), quiz)
     return "ok"
+
+
+async def _begin_locked(app: Application, session: dict, quiz: dict) -> None:
+    """Shared activation path: no second quiz engine or poll loop."""
+    sid, chat_id, order = session["id"], session["chat_id"], session["order"]
+    try:
+        await app.bot.send_message(
+            chat_id, f"🏁 <b>{esc(quiz['title'])}</b> — quiz शुरू!\n"
+                     f"📝 {len(order)} प्रश्न · ⏱ {config.timer_label(group_timer(quiz))} प्रति प्रश्न",
+            parse_mode=ParseMode.HTML)
+        if quiz.get("pre_text"):
+            for chunk in engine.split_message(quiz["pre_text"]):
+                await app.bot.send_message(chat_id, chunk)
+    except Forbidden:
+        db.finish_group_session(sid, "stopped", time.time())
+        return
+    await _send_current(app, sid)
+
+
+async def begin_pending_quiz(app: Application, session_id: int, chat_id: int, user) -> str:
+    async with chat_lock(chat_id):
+        session = db.get_group_session(session_id)
+        if not session or session["chat_id"] != chat_id or session["status"] != "pending":
+            return "expired"
+        if time.time() - session["started_ts"] > 1800:
+            db.finish_group_session(session_id, "expired", time.time())
+            return "expired"
+        quiz = db.get_quiz(session["quiz_id"])
+        if not quiz or quiz.get("status") != "ready" or not access_control.check_quiz_access(user.id, chat_id, quiz)[0]:
+            return "denied"
+        enabled = db.pdf_review_enabled()
+        if enabled and db.group_pdf_permission(session_id, user.id) is None:
+            return "choose"
+        if not db.activate_group_session(session_id, enabled):
+            return "expired"
+        await _begin_locked(app, db.get_group_session(session_id), quiz)
+        return "ok"
 
 
 async def _send_pre(bot, chat_id: int, q: dict) -> None:
@@ -323,7 +367,7 @@ async def _finish_locked(app: Application, s: dict, status: str) -> Optional[dic
         for i, chunk in enumerate(chunks):
             await app.bot.send_message(
                 done["chat_id"], chunk, parse_mode=ParseMode.HTML,
-                reply_markup=kb.group_review_markup(done["id"]) if i == len(chunks) - 1 else None)
+                reply_markup=kb.group_review_markup(done["id"]) if i == len(chunks) - 1 and db.pdf_review_enabled() else None)
     except TelegramError as exc:
         log.warning("could not send group result: %s", exc)
     try:
@@ -349,6 +393,11 @@ async def stop_group_quiz(app: Application, chat_id: int) -> Optional[dict]:
 async def recover_group_sessions(app: Application) -> dict:
     stats = {"expired": 0, "timers": 0, "resent": 0}
     now = time.time()
+    # Pending lobbies survive restart but expire after 30 minutes without any polls.
+    for s in db.list_pending_group_sessions():
+        if now - s["started_ts"] > 1800:
+            db.finish_group_session(s["id"], "expired", now)
+            stats["expired"] += 1
     for s in db.list_active_group_sessions():
         if s.get("started_ts") and now - s["started_ts"] > config.SESSION_EXPIRY_HOURS * 3600:
             db.finish_group_session(s["id"], "expired", now)

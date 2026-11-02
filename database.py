@@ -178,7 +178,8 @@ CREATE TABLE IF NOT EXISTS attempts (
     cur_correct INTEGER,
     cur_sent_ts REAL,
     cur_post_explanation TEXT DEFAULT '',
-    start_msg_id INTEGER
+    start_msg_id INTEGER,
+    pdf_allowed INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS answers (
@@ -215,7 +216,8 @@ CREATE TABLE IF NOT EXISTS group_sessions (
     cur_question_id INTEGER,
     cur_sent_ts REAL,
     cur_post_explanation TEXT DEFAULT '',
-    negative_mark REAL DEFAULT 0
+    negative_mark REAL DEFAULT 0,
+    pdf_enabled_at_start INTEGER
 );
 
 -- every poll sent in a group session (answers can be mapped back even later)
@@ -275,6 +277,33 @@ CREATE TABLE IF NOT EXISTS review_pdfs (
     error TEXT DEFAULT '',
     created_ts REAL DEFAULT 0,
     sent_ts REAL
+);
+
+-- Attempt-bound consent; NULL on migrated historical attempts means unknown, never auto-allow.
+CREATE TABLE IF NOT EXISTS bot_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_by INTEGER,
+    updated_ts REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pdf_start_requests (
+    request_id TEXT PRIMARY KEY,
+    quiz_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    start_msg_id INTEGER,
+    created_ts REAL NOT NULL,
+    consumed INTEGER NOT NULL DEFAULT 0,
+    attempt_id INTEGER,
+    FOREIGN KEY(quiz_id) REFERENCES quizzes(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS group_pdf_permissions (
+    session_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    allowed INTEGER NOT NULL CHECK(allowed IN (0,1)),
+    decided_ts REAL NOT NULL,
+    PRIMARY KEY(session_id,user_id),
+    FOREIGN KEY(session_id) REFERENCES group_sessions(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS batches (
@@ -360,6 +389,7 @@ _MIGRATION_COLUMNS = {
         "created_at": "TEXT",
     },
     "attempts": {
+        "pdf_allowed": "INTEGER",
         "timeouts": "INTEGER DEFAULT 0",
         "status": "TEXT DEFAULT 'active'",
         "order_json": "TEXT DEFAULT '[]'",
@@ -388,6 +418,7 @@ _MIGRATION_COLUMNS = {
     },
     # negative mark snapshot taken when a group quiz starts (0 = disabled, the default)
     "group_sessions": {
+        "pdf_enabled_at_start": "INTEGER",
         "negative_mark": "REAL DEFAULT 0",
     },
 }
@@ -852,14 +883,27 @@ def delete_question(question_id: int, qid: str) -> bool:
 # --------------------------------------------------------------- attempts
 def create_attempt(qid: str, user_id: int, chat_id: int, order: list[int],
                    timer: int, shuffle_options: bool, started_ts: float,
-                   start_msg_id: Optional[int] = None, *, snapshot_rules: bool = False) -> int:
+                   start_msg_id: Optional[int] = None, *, snapshot_rules: bool = False,
+                   pdf_allowed: Optional[bool] = None, pdf_request_token: Optional[str] = None) -> int:
     with connect() as con:
+        if pdf_request_token:
+            con.execute("BEGIN IMMEDIATE")
+            request = con.execute("""SELECT * FROM pdf_start_requests WHERE request_id=? AND user_id=?
+                AND chat_id=? AND quiz_id=? AND consumed=0 AND created_ts>=?""",
+                (pdf_request_token, user_id, chat_id, qid, time.time() - 1800)).fetchone()
+            if not request:
+                raise ValueError("expired-pdf-request")
         cur = con.execute("""
             INSERT INTO attempts(quiz_id,user_id,chat_id,status,order_json,current_index,total,
                                  timer,shuffle_options,started_ts,start_msg_id)
             VALUES(?,?,?,'active',?,0,?,?,?,?,?)
         """, (qid, user_id, chat_id, json.dumps(order), len(order), int(timer or 0),
               int(bool(shuffle_options)), started_ts, start_msg_id))
+        con.execute("UPDATE attempts SET pdf_allowed=? WHERE id=?",
+                    (None if pdf_allowed is None else int(bool(pdf_allowed)), cur.lastrowid))
+        if pdf_request_token:
+            con.execute("UPDATE pdf_start_requests SET consumed=1,attempt_id=? WHERE request_id=?",
+                        (cur.lastrowid, pdf_request_token))
         if snapshot_rules:
             # Snapshot mode and scoring before the first poll, in the same transaction.
             # Later quiz edits must not change a running or completed attempt's rules.
@@ -1085,23 +1129,26 @@ def _gs_row(row) -> Optional[dict]:
 
 def create_group_session(qid: str, chat_id: int, started_by: int, order: list[int], timer: int,
                          shuffle_options: bool, started_ts: float,
-                         negative_mark: float = 0.0) -> Optional[int]:
+                         negative_mark: float = 0.0, *, pending: bool = False,
+                         pdf_enabled_at_start: Optional[bool] = None) -> Optional[int]:
     """New session for this group; None if the group already runs a quiz.
 
     ``negative_mark`` is a snapshot of the quiz setting at start time (0 = disabled,
     the default), so later edits to the quiz never change a finished session's score."""
     with connect() as con:
         con.execute("BEGIN IMMEDIATE")
-        busy = con.execute("SELECT id FROM group_sessions WHERE chat_id=? AND status='active'",
+        busy = con.execute("SELECT id FROM group_sessions WHERE chat_id=? AND status IN ('active','pending')",
                            (chat_id,)).fetchone()
         if busy:
             return None
         cur = con.execute("""
             INSERT INTO group_sessions(quiz_id,chat_id,started_by,status,order_json,current_index,total,
                                        timer,shuffle_options,started_ts,negative_mark)
-            VALUES(?,?,?,'active',?,0,?,?,?,?,?)
-        """, (qid, chat_id, started_by, json.dumps(order), len(order), int(timer),
+            VALUES(?,?,?,?,?,0,?,?,?,?,?)
+        """, (qid, chat_id, started_by, "pending" if pending else "active", json.dumps(order), len(order), int(timer),
               int(bool(shuffle_options)), started_ts, max(0.0, float(negative_mark or 0.0))))
+        con.execute("UPDATE group_sessions SET pdf_enabled_at_start=? WHERE id=?",
+                    (None if pdf_enabled_at_start is None else int(bool(pdf_enabled_at_start)), cur.lastrowid))
         return cur.lastrowid
 
 
@@ -1112,7 +1159,7 @@ def get_group_session(session_id: int) -> Optional[dict]:
 
 def get_active_group_session(chat_id: int) -> Optional[dict]:
     with connect() as con:
-        return _gs_row(con.execute("SELECT * FROM group_sessions WHERE chat_id=? AND status='active' "
+        return _gs_row(con.execute("SELECT * FROM group_sessions WHERE chat_id=? AND status IN ('active','pending') "
                                    "ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone())
 
 
@@ -1177,7 +1224,7 @@ def finish_group_session(session_id: int, status: str, ts: float) -> Optional[di
     """Mark finished/stopped exactly once; returns the session or None if already done."""
     with connect() as con:
         cur = con.execute("""UPDATE group_sessions SET status=?, finished_ts=?, cur_poll_id=NULL
-                             WHERE id=? AND status='active'""", (status, ts, session_id))
+                             WHERE id=? AND status IN ('active','pending')""", (status, ts, session_id))
         if cur.rowcount == 0:
             return None
         return _gs_row(con.execute("SELECT * FROM group_sessions WHERE id=?", (session_id,)).fetchone())
@@ -1533,3 +1580,81 @@ def list_all_user_ids() -> list[int]:
         rows = con.execute("SELECT user_id FROM users WHERE COALESCE(is_banned, 0)=0 ORDER BY user_id").fetchall()
     return [int(r["user_id"]) for r in rows]
 
+
+
+# ---------------------------------------------------------- PDF policy / consent
+
+def pdf_review_enabled() -> bool:
+    """Persistent admin switch plus the existing environment emergency kill switch."""
+    if not config.REVIEW_PDF_ENABLED:
+        return False
+    with connect() as con:
+        row = con.execute("SELECT value FROM bot_settings WHERE key='pdf_review_enabled'").fetchone()
+    return row is None or row["value"] == "1"
+
+
+def set_pdf_review_enabled(enabled: bool, actor_id: int) -> None:
+    if not config.is_admin(actor_id):
+        raise PermissionError("Admin only")
+    with connect() as con:
+        con.execute("""INSERT INTO bot_settings(key,value,updated_by,updated_ts)
+            VALUES('pdf_review_enabled',?,?,?) ON CONFLICT(key) DO UPDATE SET
+            value=excluded.value,updated_by=excluded.updated_by,updated_ts=excluded.updated_ts""",
+            (str(int(bool(enabled))), actor_id, time.time()))
+
+
+def new_pdf_start_request(qid: str, user_id: int, chat_id: int,
+                          start_msg_id: Optional[int] = None) -> str:
+    """Single-use card, bound to one actor/chat/quiz; newer cards invalidate old ones."""
+    request_id = uuid.uuid4().hex[:24]
+    with connect() as con:
+        con.execute("UPDATE pdf_start_requests SET consumed=1 WHERE user_id=? AND chat_id=? AND consumed=0",
+                    (user_id, chat_id))
+        con.execute("""INSERT INTO pdf_start_requests(request_id,quiz_id,user_id,chat_id,start_msg_id,created_ts)
+            VALUES(?,?,?,?,?,?)""", (request_id, qid, user_id, chat_id, start_msg_id, time.time()))
+    return request_id
+
+
+def get_pdf_start_request(request_id: str, user_id: int, chat_id: int) -> Optional[dict]:
+    with connect() as con:
+        row = con.execute("""SELECT * FROM pdf_start_requests WHERE request_id=? AND user_id=? AND chat_id=?
+            AND consumed=0 AND created_ts>=?""", (request_id, user_id, chat_id, time.time()-1800)).fetchone()
+    return dict(row) if row else None
+
+
+def set_group_pdf_permission(session_id: int, user_id: int, chat_id: int, allowed: bool) -> bool:
+    """Only before the first group question; one independent row per participant."""
+    with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        session = con.execute("SELECT status,chat_id,started_ts FROM group_sessions WHERE id=?", (session_id,)).fetchone()
+        if not session or session["status"] != "pending" or session["chat_id"] != chat_id or time.time()-session["started_ts"] > 1800:
+            return False
+        con.execute("""INSERT INTO group_pdf_permissions(session_id,user_id,allowed,decided_ts)
+            VALUES(?,?,?,?) ON CONFLICT(session_id,user_id) DO UPDATE SET
+            allowed=excluded.allowed,decided_ts=excluded.decided_ts""",
+            (session_id, user_id, int(bool(allowed)), time.time()))
+        return True
+
+
+def group_pdf_permission(session_id: int, user_id: int) -> Optional[dict]:
+    with connect() as con:
+        row = con.execute("SELECT * FROM group_pdf_permissions WHERE session_id=? AND user_id=?",
+                          (session_id,user_id)).fetchone()
+    return dict(row) if row else None
+
+
+def activate_group_session(session_id: int, pdf_enabled: bool) -> bool:
+    with connect() as con:
+        cur = con.execute("""UPDATE group_sessions SET status='active',started_ts=?,pdf_enabled_at_start=?
+            WHERE id=? AND status='pending'""", (time.time(), int(bool(pdf_enabled)), session_id))
+        return bool(cur.rowcount)
+
+
+def list_pending_group_sessions() -> list[dict]:
+    with connect() as con:
+        return [_gs_row(r) for r in con.execute("SELECT * FROM group_sessions WHERE status='pending'")]
+
+
+def cancel_pdf_start_requests(user_id: int) -> None:
+    with connect() as con:
+        con.execute("UPDATE pdf_start_requests SET consumed=1 WHERE user_id=? AND consumed=0", (user_id,))

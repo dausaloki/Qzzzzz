@@ -190,11 +190,11 @@ HTML_MAX_BYTES = env_int("HTML_MAX_BYTES", str(12 * 1024 * 1024))
 HTML_MAX_NODES = env_int("HTML_MAX_NODES", "400000")
 
 # ---------------------------------------------------------------- review PDF
-# Automatic "complete quiz review" PDF sent to the user's private chat after a
-# finished/stopped private or group quiz (every question, every option, ticks/crosses).
+# Complete review PDF: persistent /admin switch + explicit pre-start per-attempt
+# consent. Existing environment flags remain additional delivery/kill switches.
 REVIEW_PDF_ENABLED = os.getenv("REVIEW_PDF_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 REVIEW_PDF_PRIVATE_AUTO = os.getenv("REVIEW_PDF_PRIVATE_AUTO", "1").strip().lower() not in ("0", "false", "no")
-# Group quizzes: automatically send each participant their personalized review PDF
+# Group quizzes: send only pre-start consenting participants their personalized PDF
 # privately after the quiz finishes (and also offer the "📄 मेरा Review PDF" button).
 REVIEW_PDF_GROUP_AUTO = os.getenv("REVIEW_PDF_GROUP_AUTO", "1").strip().lower() not in ("0", "false", "no")
 REVIEW_PDF_RETRIES = max(0, env_int("REVIEW_PDF_RETRIES", "3"))

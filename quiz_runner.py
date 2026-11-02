@@ -93,8 +93,9 @@ def ready_text(quiz: dict) -> str:
     return "\n".join(lines)
 
 
-async def send_ready(app: Application, user, chat_id: int, qid: str) -> bool:
-    """Show the ready card; the quiz itself starts on the r:go button."""
+async def send_ready(app: Application, user, chat_id: int, qid: str,
+                     start_msg_id: Optional[int] = None) -> bool:
+    """Ready card: explicit PDF choice when enabled, legacy Start when disabled."""
     bot = app.bot
     quiz = db.get_quiz(qid)
     if not quiz:
@@ -110,12 +111,20 @@ async def send_ready(app: Application, user, chat_id: int, qid: str) -> bool:
     if not ok_access:
         await bot.send_message(chat_id, deny_msg, parse_mode=ParseMode.HTML, reply_markup=kb.main_menu())
         return False
-    await bot.send_message(chat_id, ready_text(quiz), parse_mode=ParseMode.HTML, reply_markup=kb.ready_markup(qid))
+    markup = kb.ready_markup(qid)
+    text = ready_text(quiz)
+    if db.pdf_review_enabled():
+        token = db.new_pdf_start_request(qid, user.id, chat_id, start_msg_id)
+        markup = kb.pdf_permission_markup(token)
+        text += "\n\n📄 इस attempt के लिए PDF Review चुनें। कोई default अनुमति नहीं है।\n" \
+                "Allow / Do Not Allow चुनते ही quiz शुरू होगा।"
+    await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
     return True
 
 
 async def start_quiz(app: Application, user, chat_id: int, qid: str, chat_type: str = ChatType.PRIVATE,
-                     start_msg_id: Optional[int] = None) -> Optional[int]:
+                     start_msg_id: Optional[int] = None, *, pdf_allowed: Optional[bool] = None,
+                     pdf_request_token: Optional[str] = None) -> Optional[int]:
     """Start a new attempt for ``user``. Returns attempt id or None.
 
     ``start_msg_id`` is the message whose button started the quiz: a second
@@ -145,6 +154,12 @@ async def start_quiz(app: Application, user, chat_id: int, qid: str, chat_type: 
         if old and start_msg_id is not None and old.get("start_msg_id") == start_msg_id \
                 and old["quiz_id"] == qid:
             return None                      # double tap on the same Start button
+        if db.pdf_review_enabled() and pdf_allowed is None:
+            await send_ready(app, user, chat_id, qid, start_msg_id)
+            return None
+        if pdf_request_token and not db.get_pdf_start_request(pdf_request_token, user.id, chat_id):
+            await bot.send_message(chat_id, "⌛ यह PDF choice पहले इस्तेमाल हो चुकी है या expire हो गई। Quiz दोबारा खोलें।")
+            return None
         if old:
             had_answers = bool((old.get("correct") or 0) + (old.get("wrong") or 0) > 0)
             await _stop_locked(
@@ -155,7 +170,9 @@ async def start_quiz(app: Application, user, chat_id: int, qid: str, chat_type: 
         order = engine.build_order([q["id"] for q in questions], bool(quiz["shuffle_questions"]))
         attempt_id = db.create_attempt(qid, user.id, chat_id, order, int(quiz["timer"] or 0),
                                        bool(quiz["shuffle_options"]), time.time(), start_msg_id,
-                                       snapshot_rules=True)
+                                       snapshot_rules=True,
+                                       pdf_allowed=bool(pdf_allowed) and db.pdf_review_enabled(),
+                                       pdf_request_token=pdf_request_token)
     try:
         if quiz.get("pre_text"):
             await _send_text(bot, chat_id, quiz["pre_text"])
@@ -498,7 +515,7 @@ async def _finish_locked(app: Application, att: dict, status: str, *, auto_pdf: 
         )
     except TelegramError as exc:
         log.warning("could not send result: %s", exc)
-    # Complete review PDF (every question), sent right after the existing result.
+    # Existing renderer; delivery policy rechecks per-attempt consent and global state.
     # Guarded: a PDF problem can never affect the result that was already saved.
     if auto_pdf:
         try:

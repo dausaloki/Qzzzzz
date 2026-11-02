@@ -70,10 +70,14 @@ _TABLES: dict[str, str] = {
     "batches": "ORDER BY name",
     "batch_members": "ORDER BY batch_name, user_id",
     "authorized_chats": "ORDER BY chat_id",
+    "bot_settings": "ORDER BY key",
+    "pdf_start_requests": "ORDER BY request_id",
+    "group_pdf_permissions": "ORDER BY session_id,user_id",
 }
 # Sections added to the backup by the feature expansion.  Older backup files do
 # not have them; they are then treated as empty (nothing is deleted on restore).
-_EXPANSION_SECTIONS = ("batches", "batch_members", "authorized_chats")
+_EXPANSION_SECTIONS = ("batches", "batch_members", "authorized_chats", "bot_settings",
+                       "pdf_start_requests", "group_pdf_permissions")
 # Sections/columns written only by an unreleased development build that had
 # payments / premium membership (removed again).  The production bot never had
 # them.  A backup that still contains them restores normally; this data is
@@ -82,12 +86,14 @@ _REMOVED_SECTIONS = ("payments",)
 _REMOVED_COLUMNS: dict[str, tuple[str, ...]] = {"users": ("is_premium", "premium_until")}
 _RESTORE_ORDER = ["users", "quizzes", "quiz_settings", "questions", "attempts",
                   "answers", "group_sessions", "group_polls", "group_answers", "user_states",
-                  "review_pdfs", "batches", "batch_members", "authorized_chats"]
+                  "review_pdfs", "batches", "batch_members", "authorized_chats", "bot_settings",
+                  "pdf_start_requests", "group_pdf_permissions"]
 # Natural key used to upsert each table (default: "id").
 _PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "users": ("user_id",), "user_states": ("user_id",), "quiz_settings": ("quiz_id",),
     "group_polls": ("poll_id",), "batches": ("name",), "batch_members": ("batch_name", "user_id"),
-    "authorized_chats": ("chat_id",),
+    "authorized_chats": ("chat_id",), "bot_settings": ("key",),
+    "pdf_start_requests": ("request_id",), "group_pdf_permissions": ("session_id", "user_id"),
 }
 # Never exported, whatever happens (secrets / credentials).
 _FORBIDDEN_KEYS = {"token", "bot_token", "password", "secret", "api_key", "api_hash", "github_token"}
@@ -299,6 +305,9 @@ def build_payload(now: Optional[float] = None) -> dict:
         "batches": tables["batches"],
         "batch_members": tables["batch_members"],
         "authorized_chats": tables["authorized_chats"],
+        "bot_settings": tables["bot_settings"],
+        "pdf_start_requests": tables["pdf_start_requests"],
+        "group_pdf_permissions": tables["group_pdf_permissions"],
     }
 
 
@@ -484,6 +493,25 @@ def _validate_expansion_sections(data: dict) -> list[str]:
             problems.append(f"authorized_chats[{i}]: duplicate chat {cid}")
         else:
             chats.add(cid)
+    sessions = {r.get("id") for r in data.get("group_sessions") or [] if isinstance(r,dict)}
+    quiz_ids = {r.get("id") for r in data.get("quizzes") or [] if isinstance(r,dict)}
+    for i,r in enumerate(rows("group_pdf_permissions")):
+        if (not isinstance(r,dict) or not isinstance(r.get("user_id"),int)
+                or r.get("session_id") not in sessions or r.get("allowed") not in (0,1)
+                or not isinstance(r.get("decided_ts"),(int,float))):
+            problems.append(f"group_pdf_permissions[{i}]: invalid participant/session/decision")
+    for i,r in enumerate(rows("pdf_start_requests")):
+        if (not isinstance(r,dict) or not isinstance(r.get("request_id"),str)
+                or not isinstance(r.get("user_id"),int) or not isinstance(r.get("chat_id"),int)
+                or r.get("quiz_id") not in quiz_ids or r.get("consumed") not in (0,1)
+                or not isinstance(r.get("created_ts"),(int,float))):
+            problems.append(f"pdf_start_requests[{i}]: invalid actor-bound request")
+    for i,r in enumerate(rows("bot_settings")):
+        if (not isinstance(r,dict) or not isinstance(r.get("key"),str)
+                or not isinstance(r.get("value"),str)
+                or not isinstance(r.get("updated_ts"),(int,float))
+                or (r.get("key")=="pdf_review_enabled" and r.get("value") not in ("0","1"))):
+            problems.append(f"bot_settings[{i}]: invalid setting")
     return problems
 
 
@@ -700,6 +728,14 @@ def github_payload(data: dict) -> dict:
         row.update(created_by=None)
     for row in out.get("authorized_chats") or []:
         row.update(chat_id=None, title=None, added_by=None, redacted=True)
+    for row in out.get("review_pdfs") or []:
+        row.update(user_id=None, chat_id=None, redacted=True)
+    for row in out.get("bot_settings") or []:
+        row.update(updated_by=None)
+    for row in out.get("pdf_start_requests") or []:
+        row.update(user_id=None, chat_id=None, request_id=None, consumed=1, redacted=True)
+    for row in out.get("group_pdf_permissions") or []:
+        row.update(user_id=None, redacted=True)
     return out
 
 
@@ -908,6 +944,9 @@ def restore_payload(data: dict, db_file: Optional[Path] = None, apply: bool = Fa
         rows["review_pdfs"] = list(data.get("review_pdfs") or [])
         for key in _EXPANSION_SECTIONS:               # absent in older backups -> empty
             rows[key] = list(data.get(key) or [])
+        # A restore is not a normal restart: don't revive consumed/cancelled buttons
+        # from an older snapshot. Keep their records; users open a fresh ready card.
+        rows["pdf_start_requests"] = [dict(r,consumed=1) for r in rows["pdf_start_requests"]]
         # data of the removed payments / premium feature (development builds only):
         # reported, never written; the live database is not touched for it
         ignored: dict[str, int] = {}
@@ -1052,6 +1091,10 @@ def _missing_for_expansion(con: sqlite3.Connection, rows: dict) -> list[str]:
     for t in ("attempts", "group_sessions"):
         if nonzero(t, "negative_mark"):
             need.append((t, "negative_mark"))
+    # Even an explicit NO (0) must not be silently dropped on an older target.
+    for t, col in (("attempts", "pdf_allowed"), ("group_sessions", "pdf_enabled_at_start")):
+        if any(r.get(col) is not None for r in rows.get(t) or []):
+            need.append((t,col))
     missing: list[str] = []
     for t, col in need:
         cols = _columns(con, t)

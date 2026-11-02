@@ -1297,8 +1297,18 @@ def _too_big(pdf: bytes) -> bool:
 async def deliver_attempt(bot, attempt: dict, *, force: bool = False, reason: str = "auto") -> dict:
     """Generate + send one private attempt's PDF. Never raises."""
     out: dict = {"ok": False, "skipped": "", "reason": reason, "attempt_id": attempt.get("id")}
-    if not config.REVIEW_PDF_ENABLED:
+    if not db.pdf_review_enabled():
         out["skipped"] = "disabled"
+        return out
+    # Reload persisted consent, not a caller-supplied/stale dictionary.
+    attempt = db.get_attempt(int(attempt["id"]))
+    if not attempt or attempt["status"] not in ("finished", "stopped"):
+        out["skipped"] = "not-completed"
+        return out
+    allowed = attempt.get("pdf_allowed")
+    legacy_manual = allowed is None and force and reason in ("command", "button")
+    if allowed != 1 and not legacy_manual:
+        out["skipped"] = "consent-required"
         return out
     aid = int(attempt["id"])
     record = db.review_pdf_get(attempt_id=aid)
@@ -1310,20 +1320,23 @@ async def deliver_attempt(bot, attempt: dict, *, force: bool = False, reason: st
         pdf, pages = await asyncio.to_thread(render_report, rep)
     except Exception as exc:                            # noqa: BLE001
         log.exception("review PDF generation failed for attempt %s", aid)
-        db.review_pdf_save(attempt_id=aid, user_id=attempt["user_id"], chat_id=attempt["chat_id"],
+        db.review_pdf_save(attempt_id=aid, user_id=attempt["user_id"], chat_id=attempt["user_id"],
                            quiz_id=attempt["quiz_id"], status="failed", error=f"render: {exc}",
                            bump=True)
         out["error"] = f"render: {exc}"
         return out
     if _too_big(pdf):
-        db.review_pdf_save(attempt_id=aid, user_id=attempt["user_id"], chat_id=attempt["chat_id"],
+        db.review_pdf_save(attempt_id=aid, user_id=attempt["user_id"], chat_id=attempt["user_id"],
                            quiz_id=attempt["quiz_id"], status="failed",
                            error=f"PDF too large ({len(pdf)} bytes)", bump=True)
         out["error"] = "too-large"
         return out
+    if not db.pdf_review_enabled():
+        out["skipped"] = "disabled"
+        return out
     try:
-        msg = await _send(bot, attempt["chat_id"], pdf, pdf_filename(rep), summary_caption(rep))
-        db.review_pdf_save(attempt_id=aid, user_id=attempt["user_id"], chat_id=attempt["chat_id"],
+        msg = await _send(bot, attempt["user_id"], pdf, pdf_filename(rep), summary_caption(rep))
+        db.review_pdf_save(attempt_id=aid, user_id=attempt["user_id"], chat_id=attempt["user_id"],
                            quiz_id=attempt["quiz_id"], status="sent", bytes_=len(pdf), pages=pages,
                            message_id=getattr(msg, "message_id", None), error="", bump=True)
         out.update(ok=True, bytes=len(pdf), pages=pages)
@@ -1333,7 +1346,7 @@ async def deliver_attempt(bot, attempt: dict, *, force: bool = False, reason: st
         name = type(exc).__name__
         blocked = name == "Forbidden"
         log.warning("review PDF delivery failed for attempt %s (%s): %s", aid, name, exc)
-        db.review_pdf_save(attempt_id=aid, user_id=attempt["user_id"], chat_id=attempt["chat_id"],
+        db.review_pdf_save(attempt_id=aid, user_id=attempt["user_id"], chat_id=attempt["user_id"],
                            quiz_id=attempt["quiz_id"], status="blocked" if blocked else "failed",
                            error=f"{name}: {exc}", bump=True)
         out.update(error=f"{name}: {exc}", blocked=blocked)
@@ -1344,12 +1357,22 @@ async def deliver_group_member(bot, session_id: int, user_id: int, *, force: boo
                                reason: str = "button") -> dict:
     """One group participant's own PDF → their private chat. Never raises."""
     out: dict = {"ok": False, "skipped": "", "reason": reason, "session_id": session_id}
-    if not config.REVIEW_PDF_ENABLED:
+    if not db.pdf_review_enabled():
         out["skipped"] = "disabled"
         return out
     session = db.get_group_session(int(session_id))
     if not session:
         out["error"] = "session-missing"
+        return out
+    if session["status"] not in ("finished", "stopped"):
+        out["skipped"] = "not-completed"
+        return out
+    consent = db.group_pdf_permission(int(session_id), int(user_id))
+    legacy_manual = session.get("pdf_enabled_at_start") is None and consent is None and force and reason in ("command", "button")
+    permitted = (session.get("pdf_enabled_at_start") == 1 and consent and consent["allowed"] == 1
+                 and consent["decided_ts"] <= session["started_ts"])
+    if not permitted and not legacy_manual:
+        out["skipped"] = "consent-required"
         return out
     rec = db.review_pdf_get(session_id=int(session_id), user_id=int(user_id))
     if rec and rec.get("status") == "sent" and not force:
@@ -1368,6 +1391,9 @@ async def deliver_group_member(bot, session_id: int, user_id: int, *, force: boo
         out["error"] = "too-large"
         db.review_pdf_save(session_id=int(session_id), user_id=int(user_id), chat_id=int(user_id),
                            quiz_id=session["quiz_id"], status="failed", error="PDF too large", bump=True)
+        return out
+    if not db.pdf_review_enabled():
+        out["skipped"] = "disabled"
         return out
     try:
         msg = await _send(bot, int(user_id), pdf, pdf_filename(rep, f"_s{session_id}"),
@@ -1424,7 +1450,7 @@ def schedule_retry(app, *, kind: str, attempt_id: Optional[int] = None, session_
 
 async def auto_after_finish(app, attempt: dict) -> dict:
     """Hook called by quiz_runner after the result message. Never raises."""
-    if not config.REVIEW_PDF_ENABLED or not config.REVIEW_PDF_PRIVATE_AUTO:
+    if not db.pdf_review_enabled() or not config.REVIEW_PDF_PRIVATE_AUTO:
         return {"skipped": "auto-off"}
     try:
         res = await deliver_attempt(app.bot, attempt, reason="auto")
@@ -1440,7 +1466,7 @@ async def auto_after_finish(app, attempt: dict) -> dict:
 
 async def auto_group_after_finish(app, session: dict) -> dict:
     """Automatically send every group quiz participant their personalized review PDF privately."""
-    if not (config.REVIEW_PDF_ENABLED and config.REVIEW_PDF_GROUP_AUTO):
+    if not (db.pdf_review_enabled() and config.REVIEW_PDF_GROUP_AUTO):
         return {"skipped": "group-auto-off"}
     sent = blocked = 0
     try:
@@ -1506,4 +1532,7 @@ async def deliver_latest_review(bot, user_id: int, *, target: Optional[dict] = N
     if tgt.get("kind") == "group":
         sess = tgt["session"]
         return await deliver_group_member(bot, int(sess["id"]), int(user_id), force=True, reason="command")
-    return await deliver_attempt(bot, tgt["attempt"], force=True, reason="command")
+    canonical = db.get_attempt(int(tgt["attempt"]["id"]))
+    if not canonical or int(canonical["user_id"]) != int(user_id):
+        return {"ok": False, "error": "wrong-user"}
+    return await deliver_attempt(bot, canonical, force=True, reason="command")
