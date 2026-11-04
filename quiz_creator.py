@@ -1543,6 +1543,8 @@ async def handle_import_document(update: Update, context) -> None:
         else:
             text = pdf_parser.decode_text_bytes(raw)
             res = await asyncio.to_thread(parse_txt_for_user, user.id, text)
+            if getattr(res,"txt_import_route_note",None):
+                hnotes.append(res.txt_import_route_note)
     except pdf_parser.SourceError as exc:
         await status.edit_text(f"❌ {exc}")
         return
@@ -1739,6 +1741,9 @@ async def _parse_and_review(update: Update, user_id: int, text: str, default_tit
         except Exception as exc:  # parser must never take the bot down
             log.exception("parser crashed")
             res = pdf_parser.ParseResult(errors=[pdf_parser.ParseError(None, f"Parser error: {exc}")])
+    notes = list(notes or [])
+    if getattr(res,"txt_import_route_note",None):
+        notes.append(res.txt_import_route_note)
     questions = [q.to_dict() for q in res.questions]
     report = pdf_parser.import_report(res)
     data = {"buffer": text if parts else "", "parts": parts, "default_title": default_title,
@@ -2236,7 +2241,31 @@ def parse_txt_with_format(text: str, format_id: str):
 
 
 def parse_txt_for_user(user_id: int, text: str):
-    return parse_txt_with_format(text,db.effective_import_format(user_id))
+    selected = db.effective_import_format(user_id)
+    legacy_error = None
+    try:
+        result = parse_txt_with_format(text,selected)
+    except ValueError as exc:
+        if selected not in (db.BUILTIN_DEFAULT_FORMAT,db.BUILTIN_CHECKED_FORMAT):
+            raise
+        legacy_error = exc
+        result = None
+    # Preserve successful legacy results and explicit custom-format choices.
+    # A failed legacy parser must not report four merged blocks for a source
+    # containing 113 structurally complete no-explanation cards.
+    if (selected in (db.BUILTIN_DEFAULT_FORMAT,db.BUILTIN_CHECKED_FORMAT) and (result is None or result.errors)
+            and not any(engine._CHECK_TXT_EXPL_RE.match(line) for line in text.splitlines())):
+        candidate = engine.parse_unnumbered_checked_txt(text)
+        if (candidate.detected_blocks > (len(result.questions) if result is not None else 0)
+                and candidate.complete_option_blocks == candidate.detected_blocks):
+            candidate.txt_import_route_note = (
+                "TXT parser used: Unnumbered ✅ TXT (A)–D) / A.–D.; no Ex). "
+                "Selected legacy parser failed; complete separate option sequences were recognized. "
+                "Saved default/selection unchanged. Missing/conflicting marks remain review errors.")
+            return candidate
+    if legacy_error is not None:
+        raise legacy_error
+    return result
 
 
 def is_txt_document(doc) -> bool:

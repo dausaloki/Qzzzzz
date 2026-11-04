@@ -820,7 +820,7 @@ def parse_custom_txt_source(text: str, settings: dict):
 
 # ------------------------------------------------ independent unnumbered, no-explanation TXT format
 _PLAIN_CHECKED_OPTION_RE = re.compile(
-    r"^[ \t]*(?P<before>✅\ufe0f?[ \t]*)?(?P<label>[ABCD])\)[ \t]*(?P<body>.*)$")
+    r"^[^\S\r\n]*(?P<before>✅\ufe0f?[^\S\r\n]*)?(?P<label>[ABCD])[.)][^\S\r\n]*(?P<body>.*)$")
 _PLAIN_CHECKED_MARK_RE = re.compile(r"✅\ufe0f?")
 _PLAIN_CHECKED_PROMO_RE = re.compile(
     r"(?:[ \t]+|^)(?:JUST CRACK IT!!|𝐉𝐔𝐒𝐓 𝐂𝐑𝐀𝐂𝐊 𝐈𝐓!!)(?:[ \t]*📚)?[ \t]*$"
@@ -828,83 +828,87 @@ _PLAIN_CHECKED_PROMO_RE = re.compile(
 
 
 def parse_unnumbered_checked_txt(text: str):
-    """Independent A)–D) / ✅ format; no numbering or Ex: delimiters required.
+    """Stream independent A)–D) / A.–D. cards; commit immediately on D.
 
-    A following option run closes its preceding question stem. D) is a
-    single-line option in this format: following text belongs to the next
-    stem, so blank lines, numbered statements and table rows never create
-    question boundaries. Only the two explicit promotional suffix spellings
-    above are removed, only from stem lines. No Unicode normalization occurs.
-    The original Default/Ex-card parsers are not called or modified.
+    No numbering/blank-line/answer-key inference. D is single-line in this
+    no-explanation grammar; following text starts the next question stem.
     """
-    lines = text.splitlines()
-    headers = [(pos,match) for pos,line in enumerate(lines)
-               if (match := _PLAIN_CHECKED_OPTION_RE.match(line))]
     result = pdf_parser.ParseResult()
     result.detected_blocks = 0
+    result.complete_option_blocks = 0
+    pending,active,stem = [],[],[]
 
-    def flag(number: int, reason: str) -> None:
-        message = "TXT प्रश्न " + str(number) + ": " + reason + " — स्रोत TXT जाँचें; उत्तर नहीं अनुमानित किया गया।"
-        result.errors.append(pdf_parser.ParseError(number,message))
-        result.review.append(message)
+    def trim(rows):
+        rows=list(rows)
+        while rows and not rows[0].strip():
+            rows.pop(0)
+        while rows and not rows[-1].strip():
+            rows.pop()
+        return rows
 
-    def trim_separators(rows):
-        start,end = 0,len(rows)
-        while start<end and not rows[start].strip():
-            start += 1
-        while end>start and not rows[end-1].strip():
-            end -= 1
-        return rows[start:end]
-
-    cursor,stem_start = 0,0
-    while cursor < len(headers):
-        end = cursor+1
-        while end < len(headers) and headers[end][1].group("label") != "A":
-            end += 1
-        run = headers[cursor:end]
-        result.detected_blocks += 1
-        number = result.detected_blocks
-        result.detected_numbers.append(number)
-        stem = trim_separators(lines[stem_start:run[0][0]])
-        cleaned_stem = []
-        for line in stem:
-            suffix = _PLAIN_CHECKED_PROMO_RE.search(line)
+    def clean_stem(rows):
+        cleaned=[]
+        for line in trim(rows):
+            suffix=_PLAIN_CHECKED_PROMO_RE.search(line)
             if suffix:
                 result.removed.append(("promotion",suffix.group()))
-                line = line[:suffix.start()]
-            cleaned_stem.append(line)
-        question = "\n".join(trim_separators(cleaned_stem))
-        labels = [match.group("label") for _,match in run]
-        options,mark_count,correct = [],0,None
-        interior_marker = False
-        for index,(pos,match) in enumerate(run):
-            # A–C may span continuation lines; D closes on its own line.
-            stop = run[index+1][0] if index+1<len(run) else pos+1
-            value = "\n".join(trim_separators([match.group("body")]+lines[pos+1:stop]))
-            markers = len(_PLAIN_CHECKED_MARK_RE.findall(value)) + bool(match.group("before"))
-            if markers:
-                mark_count += markers
-                correct = index
-                # Strip only answer-token delimiters, not option wording/Unicode.
-                value = re.sub(r"^✅\ufe0f?[ \t]*", "", value)
-                value = re.sub(r"[ \t]*✅\ufe0f?[ \t]*$", "", value)
-                if "✅" in value:
-                    interior_marker = True
-            options.append(value)
-        stem_start = run[-1][0]+1
-        cursor = end
-        if labels != list("ABCD") or not question.strip() or not all(value.strip() for value in options):
-            flag(number,"पूरा प्रश्न और A), B), C), D) क्रम में चार भरे हुए विकल्प आवश्यक हैं")
-        elif mark_count != 1 or interior_marker:
-            flag(number,"एक ही विकल्प के किनारे ठीक एक ✅ चाहिए (missing/multiple/conflicting marker)")
-        else:
-            result.questions.append(pdf_parser.ParsedQuestion(
-                number=number,question=question,options=options,correct_index=correct,
-                explanation="",qtype=detect_qtype(question),answer_source="inline"))
-    trailing = trim_separators(lines[stem_start:])
-    if any(_PLAIN_CHECKED_PROMO_RE.sub("",line).strip() for line in trailing):
+                line=line[:suffix.start()]
+            cleaned.append(line)
+        return "\n".join(trim(cleaned))
+
+    def emit(rows,entries):
         result.detected_blocks += 1
-        result.detected_numbers.append(result.detected_blocks)
-        flag(result.detected_blocks,"प्रश्न पाठ मिला लेकिन पूरा A)–D) option block नहीं मिला")
-    result.mapped_answers = len(result.questions)
+        number=result.detected_blocks
+        result.detected_numbers.append(number)
+        question=clean_stem(rows)
+        labels=[entry[0] for entry in entries]
+        options=[];marked=[];interior=False
+        for i,(_,body,before) in enumerate(entries):
+            value="\n".join(trim(body))
+            count=len(_PLAIN_CHECKED_MARK_RE.findall(value))+bool(before)
+            if count:
+                marked.extend([i]*count)
+                value=re.sub(r"^✅\ufe0f?[^\S\r\n]*","",value)
+                value=re.sub(r"[^\S\r\n]*✅\ufe0f?[^\S\r\n]*$","",value)
+                interior=interior or "✅" in value
+            options.append(value)
+        reason=None
+        if labels!=list("ABCD") or not question.strip() or not all(o.strip() for o in options):
+            reason="पूरा प्रश्न और क्रम में चार भरे हुए A/B/C/D विकल्प आवश्यक हैं"
+        else:
+            result.complete_option_blocks += 1
+            if len(marked)!=1 or interior:
+                reason="ठीक एक विकल्प के किनारे एक ✅ चाहिए; missing/multiple/conflicting marker"
+        if reason:
+            message=f"TXT प्रश्न {number}: {reason} — स्रोत TXT जाँचें; उत्तर नहीं अनुमानित किया गया।"
+            result.errors.append(pdf_parser.ParseError(number,message))
+            result.review.append(message)
+        else:
+            result.questions.append(pdf_parser.ParsedQuestion(number=number,question=question,
+                options=options,correct_index=marked[0],explanation="",
+                qtype=detect_qtype(question),answer_source="inline"))
+
+    for line in text.splitlines():
+        match=_PLAIN_CHECKED_OPTION_RE.match(line)
+        if not match:
+            if active:
+                active[-1][1].append(line)
+            else:
+                pending.append(line)
+            continue
+        label=match.group("label")
+        if label=="A" and active:
+            emit(stem,active)  # Incomplete previous card: never borrow a new card's options.
+            active=[];stem=[]
+        if not active:
+            stem=pending;pending=[]
+        active.append((label,[match.group("body")],match.group("before")))
+        if label=="D":
+            emit(stem,active)  # Complete sequence closes NOW, not at the next A or blank line.
+            active=[];stem=[]
+    if active:
+        emit(stem,active)
+    if any(_PLAIN_CHECKED_PROMO_RE.sub("",line).strip() for line in pending):
+        emit(pending,[])
+    result.mapped_answers=len(result.questions)
     return result
