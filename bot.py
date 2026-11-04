@@ -1659,6 +1659,8 @@ def _format_info(kind: str, format_id: str):
         return {"id":format_id,"kind":kind,"name":name,"builtin":True,"settings_json":None}
     if kind == "import" and format_id == db.BUILTIN_CHECKED_FORMAT:
         return {"id":format_id,"kind":kind,"name":"Checked TXT — ✅ / Ex cards","builtin":True,"settings_json":None}
+    if kind == "import" and format_id == db.BUILTIN_UNNUMBERED_CHECKED_FORMAT:
+        return {"id":format_id,"kind":kind,"name":"Unnumbered ✅ TXT — no Ex / JUST CRACK IT","builtin":True,"settings_json":None}
     return db.get_quiz_format(format_id,kind)
 
 
@@ -1683,7 +1685,7 @@ def _format_leave_state(uid: int) -> None:
 
 async def _formats_list(update: Update, kind: str, page: int = 0) -> None:
     uid = update.effective_user.id
-    builtin = [db.BUILTIN_DEFAULT_FORMAT]+([db.BUILTIN_CHECKED_FORMAT] if kind == "import" else [])
+    builtin = [db.BUILTIN_DEFAULT_FORMAT]+([db.BUILTIN_CHECKED_FORMAT,db.BUILTIN_UNNUMBERED_CHECKED_FORMAT] if kind == "import" else [])
     profiles = [_format_info(kind,x) for x in builtin]+db.list_quiz_formats(kind)
     page = min(max(0,page),max(0,(len(profiles)-1)//8))
     default = db.get_default_format(kind)

@@ -1695,6 +1695,7 @@ def cancel_pdf_start_requests(user_id: int) -> None:
 # ---------------------------------------------------- independent named formats
 BUILTIN_DEFAULT_FORMAT = "builtin_default"
 BUILTIN_CHECKED_FORMAT = "builtin_checked"
+BUILTIN_UNNUMBERED_CHECKED_FORMAT = "builtin_checked_plain"
 
 
 def _format_default_in(con, kind: str) -> str:
@@ -1716,7 +1717,7 @@ def get_quiz_format(format_id: str, kind: str) -> Optional[dict]:
 def get_default_format(kind: str) -> str:
     with connect() as con:
         value = _format_default_in(con,kind)
-    if value in (BUILTIN_DEFAULT_FORMAT, BUILTIN_CHECKED_FORMAT if kind == "import" else BUILTIN_DEFAULT_FORMAT):
+    if value in ((BUILTIN_DEFAULT_FORMAT, BUILTIN_CHECKED_FORMAT, BUILTIN_UNNUMBERED_CHECKED_FORMAT) if kind == "import" else (BUILTIN_DEFAULT_FORMAT,)):
         return value
     return value if get_quiz_format(value,kind) else BUILTIN_DEFAULT_FORMAT
 
@@ -1742,7 +1743,7 @@ def save_quiz_format(kind: str, name: str, settings: dict, actor_id: int, format
 def set_default_format(kind: str, format_id: str, actor_id: int) -> None:
     if not config.is_admin(actor_id):
         raise PermissionError("Admin only")
-    builtins = (BUILTIN_DEFAULT_FORMAT,BUILTIN_CHECKED_FORMAT) if kind == "import" else (BUILTIN_DEFAULT_FORMAT,)
+    builtins = (BUILTIN_DEFAULT_FORMAT,BUILTIN_CHECKED_FORMAT,BUILTIN_UNNUMBERED_CHECKED_FORMAT) if kind == "import" else (BUILTIN_DEFAULT_FORMAT,)
     if kind not in ("presentation","import") or (format_id not in builtins and not get_quiz_format(format_id,kind)):
         raise ValueError("Unknown format")
     with connect() as con:
@@ -1767,7 +1768,7 @@ def delete_quiz_format(format_id: str, kind: str, actor_id: int) -> None:
 def effective_import_format(user_id: int) -> str:
     user = get_user(user_id) or {}
     selected = user.get("txt_import_format_id")
-    if selected in (BUILTIN_DEFAULT_FORMAT,BUILTIN_CHECKED_FORMAT) or (selected and get_quiz_format(selected,"import")):
+    if selected in (BUILTIN_DEFAULT_FORMAT,BUILTIN_CHECKED_FORMAT,BUILTIN_UNNUMBERED_CHECKED_FORMAT) or (selected and get_quiz_format(selected,"import")):
         return selected
     return get_default_format("import")
 

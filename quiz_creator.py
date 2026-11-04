@@ -2223,6 +2223,8 @@ async def _create_imported(update: Update, user_id: int, data: dict, title: str)
 # ------------------------------------------------ named TXT parsing / nonblocking support copy
 
 def parse_txt_with_format(text: str, format_id: str):
+    if format_id == db.BUILTIN_UNNUMBERED_CHECKED_FORMAT:
+        return engine.parse_unnumbered_checked_txt(text)
     if format_id == db.BUILTIN_CHECKED_FORMAT:
         result = engine._parse_checked_txt_blocks(text)
         # Retain earlier checked TXT variants, including numbered/no-Ex sources.
