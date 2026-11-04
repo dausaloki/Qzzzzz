@@ -282,6 +282,83 @@ _CHECK_TXT_MARK_RE = re.compile(
 _CHECK_TXT_EXPL_RE = re.compile(r"^[ \t]*(?:Ex|Explanation)[ \t]*:[ \t]*(.*)$", re.I)
 
 
+def _parse_checked_txt_blocks(text: str):
+    """Lossless Ex:-terminated cards, including unnumbered/matching questions."""
+    lines = text.splitlines()
+    records, run = [], []
+    for pos, line in enumerate(lines):
+        if _CHECK_TXT_EXPL_RE.match(line):
+            if len(run) != 4:
+                return None  # Not this additional format; keep the original paths.
+            records.append((list(run), pos))
+            run.clear()
+            continue
+        match = _CHECK_TXT_OPTION_RE.match(line)
+        if match:
+            index = ord(match.group(3).upper()) - ord("A")
+            if index == 0:
+                run.clear()
+            if index != len(run) or index > 3:
+                run.clear()
+            else:
+                run.append(pos)
+    if not records or run:
+        return None
+    starts = []
+    for index, (options, _) in enumerate(records):
+        if index == 0:
+            start = next((i for i in range(options[0]) if lines[i].strip()), None)
+        else:
+            previous = records[index - 1][1]
+            candidates = [i for i in range(previous + 2, options[0])
+                          if lines[i].strip() and not lines[i - 1].strip()]
+            # Explanatory bullets and table/statement rows are not new headings.
+            headings = [i for i in candidates if not re.match(
+                r"[ \t]*(?:[-*•|]|[0-9]+[.)][ \t]+[A-Da-d][.])", lines[i])]
+            start = next(iter(headings or candidates), None)
+        if start is None:
+            return None  # Without a separator, leave disambiguation to the old parser.
+        starts.append(start)
+    result = pdf_parser.ParseResult()
+    result.detected_blocks = len(records)
+    for index, (positions, expl_pos) in enumerate(records):
+        question_lines = lines[starts[index]:positions[0]]
+        while question_lines and not question_lines[-1].strip():
+            question_lines.pop()
+        number = index + 1
+        numbered = (pdf_parser.STRONG_Q_RE.match(question_lines[0])
+                    or pdf_parser.WEAK_Q_RE.match(question_lines[0]))
+        if numbered and numbered.group("rest").strip():
+            label = re.search(r"\d+", question_lines[0][:numbered.start("rest")])
+            number = int(label.group()) if label else number
+            question_lines[0] = numbered.group("rest")
+        elif question_lines[0].strip().isdigit():
+            number = int(question_lines.pop(0).strip())
+        options, checked = [], []
+        for option, start in enumerate(positions):
+            end = positions[option + 1] if option < 3 else expl_pos
+            match = _CHECK_TXT_OPTION_RE.match(lines[start])
+            value = "\n".join([match.group(4)] + lines[start + 1:end]).strip()
+            clean = _CHECK_TXT_MARK_RE.sub("", value)
+            if match.group(2) or clean != value:
+                checked.append(option)
+            options.append(clean)
+        if len(checked) != 1 or not all(options) or not any(ln.strip() for ln in question_lines):
+            result.errors.append(pdf_parser.ParseError(number,
+                "TXT: हर प्रश्न में चार भरे हुए options और एक ही ✅ / ☑️ / ✔️ सही उत्तर चाहिए।"))
+            continue
+        end = starts[index + 1] if index + 1 < len(starts) else len(lines)
+        explanation = "\n".join([_CHECK_TXT_EXPL_RE.match(lines[expl_pos]).group(1)]
+                                 + lines[expl_pos + 1:end]).strip("\n")
+        question = "\n".join(question_lines)
+        result.questions.append(pdf_parser.ParsedQuestion(
+            number=number, question=question, options=options,
+            correct_index=checked[0], explanation=explanation,
+            qtype=detect_qtype(question), answer_source="inline"))
+    result.mapped_answers = len(result.questions)
+    return result
+
+
 def parse_txt_source(text: str):
     """Adapt checked A)–D) TXT options to the existing import parser.
 
@@ -292,6 +369,10 @@ def parse_txt_source(text: str):
     original = pdf_parser.parse_source(text)
     if original.questions and not original.errors:
         return original  # Every previously valid format keeps its original result.
+    if re.search(r"[✅☑✔]", text):
+        cards = _parse_checked_txt_blocks(text)
+        if cards is not None:
+            return cards
     lines = text.splitlines()
     edits, answers, run = {}, {}, []
     first = next((i for i, ln in enumerate(lines) if ln.strip()), None)
