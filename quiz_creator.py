@@ -1537,7 +1537,7 @@ async def handle_import_document(update: Update, context) -> None:
             text = ""
         else:
             text = pdf_parser.decode_text_bytes(raw)
-            res = await asyncio.to_thread(pdf_parser.parse_source, text)
+            res = await asyncio.to_thread(engine.parse_txt_source, text)
     except pdf_parser.SourceError as exc:
         await status.edit_text(f"❌ {exc}")
         return
@@ -1730,7 +1730,7 @@ async def _parse_and_review(update: Update, user_id: int, text: str, default_tit
                             notes: Optional[list] = None, source: str = "import") -> None:
     if res is None:
         try:
-            res = await asyncio.to_thread(pdf_parser.parse_source, text)
+            res = await asyncio.to_thread(engine.parse_txt_source, text)
         except Exception as exc:  # parser must never take the bot down
             log.exception("parser crashed")
             res = pdf_parser.ParseResult(errors=[pdf_parser.ParseError(None, f"Parser error: {exc}")])

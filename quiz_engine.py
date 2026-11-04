@@ -274,6 +274,86 @@ def detect_embedded_options(text: str) -> Optional[tuple[str, list[str]]]:
     return pdf_parser.split_question_and_options(text)
 
 
+# Additional TXT syntax only; PDF and the original parsers are unchanged.
+_CHECK_TXT_OPTION_RE = re.compile(
+    r"^([ \t]*)([✅☑✔]\ufe0f?[ \t]*)?([A-La-l])\)(.*)$")
+_CHECK_TXT_MARK_RE = re.compile(
+    r"^(?:[ \t]*[✅☑✔]\ufe0f?)+[ \t]*|(?:[ \t]*[✅☑✔]\ufe0f?)+[ \t]*$")
+_CHECK_TXT_EXPL_RE = re.compile(r"^[ \t]*(?:Ex|Explanation)[ \t]*:[ \t]*(.*)$", re.I)
+
+
+def parse_txt_source(text: str):
+    """Adapt checked A)–D) TXT options to the existing import parser.
+
+    Only complete, checked option runs are adapted. Numbered statements and
+    matching rows before those options are untouched; the original parser
+    still determines question boundaries and preserves source order.
+    """
+    original = pdf_parser.parse_source(text)
+    if original.questions and not original.errors:
+        return original  # Every previously valid format keeps its original result.
+    lines = text.splitlines()
+    edits, answers, run = {}, {}, []
+    first = next((i for i, ln in enumerate(lines) if ln.strip()), None)
+    bare_headers = [first] if first is not None and lines[first].strip().isdigit() else []
+
+    def flush(end):
+        converted = False
+        if len(run) == 4:
+            checked = [i for i, (_, _, marked) in enumerate(run) if marked]
+            # Existing explicit-answer formats take their original path unchanged.
+            explicit = any(pdf_parser.ANSWER_LETTER_RE.match(ln)
+                           for ln in lines[run[0][0]:end])
+            if checked and not explicit:
+                if len(checked) != 1:
+                    raise ValueError("TXT: A)–D) में एक ही सही option पर ✅ / ☑️ / ✔️ लगाएँ।")
+                for pos, clean, _ in run:
+                    edits[pos] = clean
+                answers[end] = "Answer: " + LABELS[checked[0]]
+                converted = True
+        run.clear()
+        return converted
+
+    for pos, line in enumerate(lines):
+        expl = _CHECK_TXT_EXPL_RE.match(line)
+        if len(run) == 4 and (expl or line.strip().isdigit()
+                             or pdf_parser.STRONG_Q_RE.match(line) or pdf_parser.WEAK_Q_RE.match(line)):
+            if line.strip().isdigit():
+                bare_headers.append(pos)
+            if flush(pos) and expl:
+                edits[pos] = "Explanation: " + expl.group(1)
+        match = _CHECK_TXT_OPTION_RE.match(line)
+        if not match:
+            continue
+        index = ord(match.group(3).upper()) - ord("A")
+        if index == 0:
+            flush(pos)
+        if index != len(run) or index > 3:
+            run.clear()
+            continue
+        body = match.group(4)
+        clean = _CHECK_TXT_MARK_RE.sub("", body)
+        separator = "" if clean.startswith((" ", "\t")) else " "
+        run.append((pos, match.group(1) + match.group(3) + ")" + separator + clean,
+                    bool(match.group(2)) or clean != body))
+    flush(len(lines))
+    if not edits:
+        return original
+    for pos in bare_headers:
+        body = next((i for i in range(pos + 1, len(lines)) if lines[i].strip()), None)
+        if body is not None:
+            edits[pos] = lines[pos].strip() + ". " + lines[body]
+            edits[body] = ""
+    adapted = []
+    for pos, line in enumerate(lines):
+        if pos in answers:
+            adapted.append(answers[pos])
+        adapted.append(edits.get(pos, line))
+    if len(lines) in answers:
+        adapted.append(answers[len(lines)])
+    return pdf_parser.parse_source("\n".join(adapted))
+
+
 _PAREN_OPTION_RE = re.compile(r"^\s*\(\s*[A-La-l]\s*\)\s*\S")
 
 
