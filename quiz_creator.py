@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+from datetime import timezone
 import re
 import logging
 import time
@@ -22,7 +24,7 @@ from typing import Optional
 
 from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as M, InputFile, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
 from telegram.ext import ContextTypes
 
 import config
@@ -1253,7 +1255,8 @@ async def begin_import(update: Update, context) -> None:
     db.upsert_user(update.effective_user)
     db.set_state(update.effective_user.id, "imp_wait", {"buffer": ""})
     await update.effective_chat.send_message(IMPORT_HELP, parse_mode=ParseMode.HTML,
-                                             reply_markup=M([[B("❌ Cancel", callback_data="i:cancel")]]))
+                                             reply_markup=M([[B("📄 TXT Import Format", callback_data="fm:list:import")],
+                                                             [B("❌ Cancel", callback_data="i:cancel")]]))
 
 
 def is_import_document(doc) -> bool:
@@ -1491,6 +1494,8 @@ async def handle_import_document(update: Update, context) -> None:
     try:
         tg_file = await doc.get_file()
         raw = bytes(await tg_file.download_as_bytearray())
+        if not (is_pdf or is_json or is_html) and is_txt_document(doc):
+            await forward_txt_upload(update, context, raw, name)
         if is_json:
             import ai_gen
             jtitle, jquestions, jrejected = ai_gen.parse_json_quiz_report(pdf_parser.decode_text_bytes(raw))
@@ -1537,7 +1542,7 @@ async def handle_import_document(update: Update, context) -> None:
             text = ""
         else:
             text = pdf_parser.decode_text_bytes(raw)
-            res = await asyncio.to_thread(engine.parse_txt_source, text)
+            res = await asyncio.to_thread(parse_txt_for_user, user.id, text)
     except pdf_parser.SourceError as exc:
         await status.edit_text(f"❌ {exc}")
         return
@@ -1730,7 +1735,7 @@ async def _parse_and_review(update: Update, user_id: int, text: str, default_tit
                             notes: Optional[list] = None, source: str = "import") -> None:
     if res is None:
         try:
-            res = await asyncio.to_thread(engine.parse_txt_source, text)
+            res = await asyncio.to_thread(parse_txt_for_user, user_id, text)
         except Exception as exc:  # parser must never take the bot down
             log.exception("parser crashed")
             res = pdf_parser.ParseResult(errors=[pdf_parser.ParseError(None, f"Parser error: {exc}")])
@@ -2213,3 +2218,123 @@ async def _create_imported(update: Update, user_id: int, data: dict, title: str)
         await chat.send_message(
             f"✅ <b>Import successful!</b>\n\n{quiz_summary(quiz, link)}",
             parse_mode=ParseMode.HTML, reply_markup=kb.quiz_card(qid, True), disable_web_page_preview=True)
+
+
+# ------------------------------------------------ named TXT parsing / nonblocking support copy
+
+def parse_txt_with_format(text: str, format_id: str):
+    if format_id == db.BUILTIN_CHECKED_FORMAT:
+        result = engine._parse_checked_txt_blocks(text)
+        # Retain earlier checked TXT variants, including numbered/no-Ex sources.
+        return result if result is not None else engine.parse_txt_source(text)
+    profile = db.get_quiz_format(format_id,"import")
+    if profile:
+        return engine.parse_custom_txt_source(text,json.loads(profile["settings_json"]))
+    return engine.parse_txt_source(text)
+
+
+def parse_txt_for_user(user_id: int, text: str):
+    return parse_txt_with_format(text,db.effective_import_format(user_id))
+
+
+def is_txt_document(doc) -> bool:
+    name = (doc.file_name or "").lower()
+    mime = (doc.mime_type or "").lower()
+    return (name.endswith(".txt") or mime == "text/plain") and not (
+        name.endswith((".pdf",".json",".html",".htm",".xhtml")) or
+        mime in ("application/pdf","application/json","text/html","application/xhtml+xml"))
+
+
+async def resolve_support_group(bot, reference) -> dict:
+    """Resolve real Telegram metadata; never fabricate IDs or private invite links."""
+    reference = str(reference).strip()
+    if reference.startswith("https://t.me/"):
+        reference = reference[len("https://t.me/"):].strip("/")
+        if reference.startswith(("+","joinchat/")) or "/" in reference or "?" in reference:
+            raise ValueError("Private invite links cannot resolve a chat. Use its real numeric Chat ID.")
+        reference = "@"+reference.lstrip("@")
+    if reference.lstrip("-").isdigit():
+        reference = int(reference)
+    elif not re.fullmatch(r"@[A-Za-z0-9_]{5,32}",reference):
+        raise ValueError("Send @group_username, its https://t.me/username URL, or its real numeric Chat ID.")
+    chat = await bot.get_chat(reference)
+    if chat.type not in ("group","supergroup"):
+        raise ValueError("Support target must be a Telegram group/supergroup, not a channel or user.")
+    member = await bot.get_chat_member(chat.id,bot.id)
+    status = member.status
+    if status not in ("creator","administrator","member","restricted") or (status == "restricted" and not getattr(member,"is_member",False)):
+        raise ValueError("Bot is not a member of this group.")
+    if status not in ("creator","administrator"):
+        if status == "restricted":
+            can_message = getattr(member,"can_send_messages",False)
+            can_document = getattr(member,"can_send_documents",None)
+            if can_document is None:
+                can_document = getattr(member,"can_send_media_messages",False)
+        else:
+            permissions = getattr(chat,"permissions",None)
+            can_message = getattr(permissions,"can_send_messages",False)
+            can_document = getattr(permissions,"can_send_documents",None)
+            if can_document is None:
+                can_document = getattr(permissions,"can_send_media_messages",False)
+        if not can_message or not can_document:
+            raise ValueError("Bot needs permission to send messages and documents in the support group.")
+    username = getattr(chat,"username",None)
+    url = "https://t.me/"+username if username else getattr(chat,"invite_link",None)
+    if not url or not url.startswith("https://t.me/"):
+        raise ValueError("No usable group URL returned by Telegram. Make the group public or give the bot access to its real invite_link.")
+    return {"ref":"@"+username if username else str(chat.id),"chat_id":chat.id,"url":url}
+
+
+async def forward_txt_upload(update: Update, context, raw: bytes, name: str) -> bool:
+    """Best effort original bytes, with durable at-most-one send attempt per upload/content.
+
+    An ambiguous network outcome remains 'uncertain' (and a crashed in-flight
+    send remains 'sending'); neither is retried automatically. Definite API
+    rejection may be retried only by a separate later upload.
+    """
+    event_key = None
+    claimed = False
+    try:
+        msg,user = update.effective_message,update.effective_user
+        target = db.support_group_config()
+        if not target.get("ref"):
+            return False
+        # Recheck membership/permissions every upload; cache only real API data.
+        resolved = await asyncio.wait_for(resolve_support_group(context.bot,target["ref"]),timeout=12)
+        if not db.cache_support_group(resolved,target["ref"]):
+            return False  # An admin changed/removed the target during resolution.
+        event_key = f"{update.effective_chat.id}:{msg.message_id}:{resolved['chat_id']}"
+        digest = hashlib.sha256(raw).hexdigest()
+        claimed = db.claim_txt_forward(event_key,user.id,digest,resolved["chat_id"])
+        if not claimed:
+            return False
+        uploaded = msg.date.astimezone(timezone.utc).isoformat(timespec="seconds")
+        username = "@"+user.username if user.username else "(not set)"
+        base = f"TXT upload\nTelegram ID: {user.id}\nUsername: {username}\nUploaded: {uploaded} (UTC)"
+        caption = base + "\nOriginal filename: " + name
+        if engine.tg_len(caption)>1024:
+            caption = base + "\nOriginal filename: see attached document filename."
+        try:
+            sent = await asyncio.wait_for(context.bot.send_document(
+                chat_id=resolved["chat_id"],document=InputFile(raw,filename=name),caption=caption,parse_mode=None),timeout=25)
+        except (BadRequest,Forbidden,RetryAfter):
+            db.finish_txt_forward(event_key,"failed")
+            return False
+        except (NetworkError,asyncio.TimeoutError):
+            db.finish_txt_forward(event_key,"uncertain")
+            return False
+        except Exception:
+            db.finish_txt_forward(event_key,"uncertain")
+            return False
+        db.finish_txt_forward(event_key,"sent",sent.message_id)
+        return True
+    except Exception as exc:
+        # Resolution, SQLite, permissions and delivery failures must never block import.
+        # Do not log exception strings: private group URLs/document data may be present.
+        log.warning("TXT support copy unavailable (%s); import continues",type(exc).__name__)
+        if claimed and event_key:
+            try:
+                db.finish_txt_forward(event_key,"uncertain")
+            except Exception:
+                pass
+        return False

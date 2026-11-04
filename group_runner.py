@@ -210,12 +210,13 @@ async def _send_current(app: Application, sid: int) -> None:
         db.close_group_question(sid, None)
         await _send_current(app, sid)
         return
+    quiz = db.get_quiz(s["quiz_id"])
     perm = engine.make_permutation(len(q["options"]), bool(s["shuffle_options"]))
     try:
-        payload = engine.build_poll_payload(q, perm, idx, total)
+        payload = engine.build_poll_payload(q, perm, idx, total, presentation=engine.presentation_from(s), quiz_title=(quiz or {}).get("title", ""))
     except Exception:  # noqa: BLE001 — one bad question never stops the quiz
         log.exception("group payload failed for question %s", q["id"])
-        payload = engine.compact_fallback(q, perm, idx, total)
+        payload = engine.compact_fallback(q, perm, idx, total, presentation=engine.presentation_from(s), quiz_title=(quiz or {}).get("title", ""))
     timer = int(s["timer"] or config.GROUP_DEFAULT_TIMER)
     open_period = timer if 5 <= timer <= 600 else None
     try:
@@ -223,7 +224,7 @@ async def _send_current(app: Application, sid: int) -> None:
         msg = await _send_poll(bot, chat_id, payload, open_period)
     except BadRequest as exc:
         log.warning("group poll rejected (%s) — compact fallback", exc)
-        payload = engine.compact_fallback(q, perm, idx, total)
+        payload = engine.compact_fallback(q, perm, idx, total, presentation=engine.presentation_from(s), quiz_title=(quiz or {}).get("title", ""))
         try:
             msg = await _send_poll(bot, chat_id, payload, open_period)
         except BadRequest as exc2:

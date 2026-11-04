@@ -865,6 +865,11 @@ async def admin_cmd(update: Update, context) -> None:
         parse_mode=ParseMode.HTML,
         reply_markup=kb.pdf_admin_markup(db.pdf_review_enabled()),
     )
+    await update.effective_chat.send_message("🎨 Separate format systems / Support Group", reply_markup=M([
+        [B("🎨 Quiz Presentations",callback_data="fm:list:presentation")],
+        [B("📄 TXT Import Formats",callback_data="fm:list:import")],
+        [B("👥 Support Group",callback_data="fm:support")],
+    ]))
 
 
 async def batch_cmd(update: Update, context) -> None:
@@ -1005,7 +1010,7 @@ async def show_settings(update: Update, edit: bool = True) -> None:
     user = db.ensure_user_row(update.effective_user.id)
     await creator.respond(update, "⚙️ <b>Settings</b>\n\nये defaults आपके <b>नए</b> quizzes पर लागू होंगे। "
                                   "किसी मौजूदा quiz की settings: My Quizzes → Quiz → ⚙️ Settings.",
-                          kb.settings_menu(user), edit=edit)
+                          kb.settings_menu(user, db.support_group_config().get("url")), edit=edit)
 
 
 async def share_cmd(update: Update, context) -> None:
@@ -1112,6 +1117,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
     db.upsert_user(user)
     prefix = data.split(":", 1)[0]
+
+    if prefix == "fm":
+        await format_settings_callback(update, context)
+        return
 
     if prefix == "pd":
         await pdf_policy_callback(update, context)
@@ -1372,7 +1381,21 @@ async def private_message_router(update: Update, context: ContextTypes.DEFAULT_T
         return
     db.upsert_user(user)
     state, data = db.get_state(user.id)
+    # TXT sent during a non-import wizard still follows the upload-copy policy,
+    # without changing that wizard's existing handling or downloading other files.
+    if (state and not state.startswith("imp_") and state != "fmt_preview" and msg.document
+            and creator.is_txt_document(msg.document)
+            and (not msg.document.file_size or msg.document.file_size <= config.MAX_DOWNLOAD_BYTES)):
+        try:
+            file = await msg.document.get_file()
+            raw = bytes(await file.download_as_bytearray())
+            await creator.forward_txt_upload(update,context,raw,msg.document.file_name or "source.txt")
+        except Exception:
+            log.warning("TXT copy download unavailable; existing wizard continues")
     if state:
+        if state.startswith("fmt_"):
+            await format_settings_message(update, context, state, data)
+            return
         if state.startswith("c_"):
             await creator.handle_creator_message(update, context, state, data)
             return
@@ -1624,6 +1647,287 @@ def _stop_if_signalled(where: str) -> bool:
     except Exception as exc:  # noqa: BLE001 — shutdown must never fail
         log.error("Shutdown backup failed: %s", exc)
     return True
+
+
+
+# ------------------------------------------------ independent format management (private settings)
+def _format_info(kind: str, format_id: str):
+    if kind not in ("presentation","import"):
+        return None
+    if format_id == db.BUILTIN_DEFAULT_FORMAT:
+        name = "Default Quiz Presentation (unchanged)" if kind == "presentation" else "Default TXT (original + auto checked)"
+        return {"id":format_id,"kind":kind,"name":name,"builtin":True,"settings_json":None}
+    if kind == "import" and format_id == db.BUILTIN_CHECKED_FORMAT:
+        return {"id":format_id,"kind":kind,"name":"Checked TXT — ✅ / Ex cards","builtin":True,"settings_json":None}
+    return db.get_quiz_format(format_id,kind)
+
+
+def _format_enter_state(uid: int, state: str, data: dict) -> None:
+    previous, payload = db.get_state(uid)
+    if previous and previous.startswith("fmt_"):
+        resume = payload.get("resume",{})
+    else:
+        resume = {"state":previous,"data":payload}
+    db.set_state(uid,state,{**data,"resume":resume})
+
+
+def _format_leave_state(uid: int) -> None:
+    state,data = db.get_state(uid)
+    if state and state.startswith("fmt_"):
+        resume = data.get("resume",{})
+        if resume.get("state"):
+            db.set_state(uid,resume["state"],resume.get("data") or {})
+        else:
+            db.clear_state(uid)
+
+
+async def _formats_list(update: Update, kind: str, page: int = 0) -> None:
+    uid = update.effective_user.id
+    builtin = [db.BUILTIN_DEFAULT_FORMAT]+([db.BUILTIN_CHECKED_FORMAT] if kind == "import" else [])
+    profiles = [_format_info(kind,x) for x in builtin]+db.list_quiz_formats(kind)
+    page = min(max(0,page),max(0,(len(profiles)-1)//8))
+    default = db.get_default_format(kind)
+    selected = db.effective_import_format(uid) if kind == "import" else default
+    rows = [[B(("✅ " if p["id"]==selected else "")+p["name"],callback_data=f"fm:view:{kind}:{p['id']}")]
+            for p in profiles[page*8:(page+1)*8]]
+    nav = []
+    if page:
+        nav.append(B("◀",callback_data=f"fm:list:{kind}:{page-1}"))
+    if (page+1)*8<len(profiles):
+        nav.append(B("▶",callback_data=f"fm:list:{kind}:{page+1}"))
+    if nav:
+        rows.append(nav)
+    if config.is_admin(uid):
+        rows.append([B("➕ Create named format",callback_data=f"fm:new:{kind}")])
+    if kind == "import":
+        rows += [[B("Follow global TXT default",callback_data="fm:follow")],
+                 [B("📥 Return to Import",callback_data="fm:import")]]
+    rows.append([B("⚙️ Settings",callback_data="m:set")])
+    default_name = _format_info(kind,default)["name"]
+    title = "Quiz Presentations" if kind == "presentation" else "TXT Import Formats"
+    text = f"<b>{title}</b>\nGlobal default: {esc(default_name)}\n\n"
+    text += ("Display only. Built-in Default and existing quiz snapshots never change. No timer/shuffle/scoring presets."
+             if kind == "presentation" else
+             "Parsing only — independent of quiz display. ✅ marks your current TXT selection. Old built-ins are read-only. Changing this does not reparse already imported questions.")
+    text += "\n\nPasted TXT is parsed only; uploaded TXT files are also copied to the configured support group (if enabled/available)."
+    await creator.respond(update,text,M(rows))
+
+
+async def _format_view(update: Update, kind: str, format_id: str) -> None:
+    profile = _format_info(kind,format_id)
+    if not profile:
+        raise ValueError("Format no longer exists")
+    rows = [[B("👁 Preview using your sample TXT",callback_data=f"fm:preview:{kind}:{format_id}")]]
+    if kind == "import":
+        rows.append([B("Use for my TXT imports",callback_data=f"fm:use:{kind}:{format_id}")])
+    if config.is_admin(update.effective_user.id):
+        rows.append([B("Set global default (new quizzes/imports only)",callback_data=f"fm:default:{kind}:{format_id}")])
+        if not profile.get("builtin"):
+            rows += [[B("✏️ Edit settings / rename",callback_data=f"fm:edit:{kind}:{format_id}")],
+                     [B("🗑 Delete",callback_data=f"fm:delete:{kind}:{format_id}")]]
+    rows.append([B("◀ Formats",callback_data=f"fm:list:{kind}")])
+    text = "<b>"+esc(profile["name"])+"</b>\n"+("🔒 Built-in: cannot edit, rename or delete." if profile.get("builtin") else
+          "Settings are declarative JSON, never executable code. Editing/deleting cannot change existing quiz/attempt snapshots.")
+    if profile.get("settings_json"):
+        text += "\n<pre>"+esc(json.dumps(json.loads(profile["settings_json"]),ensure_ascii=False,indent=2))+"</pre>"
+    # Profiles can contain long headers/footers; split losslessly rather than exceed Telegram limits.
+    if engine.tg_len(text)>3800:
+        await creator.respond(update,"<b>"+esc(profile["name"])+"</b>\nSettings attached below.",M(rows))
+        await update.effective_chat.send_document(document=profile["settings_json"].encode("utf-8"),filename="format_settings.json")
+    else:
+        await creator.respond(update,text,M(rows))
+
+
+async def _support_menu(update: Update) -> None:
+    target = db.support_group_config()
+    state = "Disabled" if not target.get("ref") else f"{target['ref']} | Chat ID: {target.get('chat_id') or 'not yet resolved'}"
+    rows = [[B("✏️ Set / validate real group",callback_data="fm:support_edit")],
+            [B("🗑 Remove / disable forwarding",callback_data="fm:support_remove")],
+            [B("⚙️ Settings",callback_data="m:set")]]
+    if target.get("url"):
+        rows.insert(0,[B("👥 Open Support Group",url=target["url"])])
+    await creator.respond(update,"<b>Support Group</b>\n"+esc(state)+
+        "\n\nTXT uploads only: original bytes + uploader ID, optional username, filename and upload datetime. "
+        "No pasted text, PDF, HTML or JSON copies. Bot membership and document-send permission are checked. "
+        "Failures never prevent import. Duplicate successful/in-flight/uncertain sends are suppressed; a network timeout cannot guarantee delivery. "
+        "New target settings are saved only after successful Telegram resolution.",M(rows))
+
+
+async def format_settings_callback(update: Update, context) -> None:
+    q,uid = update.callback_query,update.effective_user.id
+    if not is_private(update):
+        await q.answer("Use private Settings.",show_alert=True)
+        return
+    parts = (q.data or "").split(":")
+    action = parts[1] if len(parts)>1 else ""
+    kind = parts[2] if len(parts)>2 else None
+    fid = parts[3] if len(parts)>3 else None
+    public = action in ("follow","import") or (kind == "import" and action in ("list","view","use","preview"))
+    if not public and not config.is_admin(uid):
+        await q.answer("⛔ Admin only",show_alert=True)
+        return
+    await q.answer()
+    try:
+        if action == "list":
+            _format_leave_state(uid)
+            await _formats_list(update,kind,int(fid or 0))
+        elif action == "view":
+            await _format_view(update,kind,fid)
+        elif action == "follow":
+            db.update_user_settings(uid,txt_import_format_id=None)
+            _format_leave_state(uid)
+            await _formats_list(update,"import")
+        elif action == "import":
+            _format_leave_state(uid)
+            state,_ = db.get_state(uid)
+            if state and state.startswith("imp_"):
+                await creator.respond(update,"📥 TXT format selected. Continue your pending import by sending TXT/file or using its review buttons.",kb.back_home())
+            else:
+                await creator.begin_import(update,context)
+        elif action in ("new","edit"):
+            if kind not in ("presentation","import"):
+                raise ValueError("Unknown format kind")
+            profile = _format_info(kind,fid) if action == "edit" else None
+            if action == "edit" and (not profile or profile.get("builtin")):
+                raise ValueError("Built-in/missing formats cannot be edited")
+            sample = {"name":profile["name"] if profile else "My "+kind+" format",
+                      "settings":json.loads(profile["settings_json"]) if profile else engine.default_format_settings(kind)}
+            _format_enter_state(uid,"fmt_save",{"kind":kind,"id":fid if action=="edit" else None})
+            prompt = ("Send one JSON object (paste or .json upload) with name + settings. "
+                "Edit/rename any fields. Presentation changes display only. numbering: decimal / roman / none. "
+                "Import fields are literal prefixes, not regex/code; every configured option label must appear once per question, in order. "
+                "A correct marker on an option boundary or an explicit answer must identify exactly one answer. "
+                "Preview before setting a global default.\n"
+                "Presentation tokens: {number}, {total}, {quiz_title}, {quiz_id}.\n\n")
+            example = json.dumps(sample,ensure_ascii=False,indent=2)
+            buttons = M([[B("Cancel",callback_data=f"fm:list:{kind}")]])
+            if engine.tg_len(prompt+example)>3500:
+                await creator.respond(update,esc(prompt)+"Current editable JSON is attached below.",buttons)
+                await update.effective_chat.send_document(document=example.encode("utf-8"),filename="named_format.json")
+            else:
+                await creator.respond(update,esc(prompt)+"<pre>"+esc(example)+"</pre>",buttons)
+
+        elif action == "use":
+            if not _format_info("import",fid):
+                raise ValueError("Format no longer exists")
+            db.update_user_settings(uid,txt_import_format_id=fid)
+            await _format_view(update,"import",fid)
+        elif action == "default":
+            db.set_default_format(kind,fid,uid)
+            await _formats_list(update,kind)
+        elif action == "delete":
+            profile = _format_info(kind,fid)
+            if not profile or profile.get("builtin"):
+                raise ValueError("Built-in/missing formats cannot be deleted")
+            await creator.respond(update,"Delete "+esc(profile["name"])+"? Existing quiz snapshots/questions will be retained.",M([
+                [B("Confirm delete",callback_data=f"fm:confirm_delete:{kind}:{fid}")],
+                [B("Cancel",callback_data=f"fm:view:{kind}:{fid}")]]))
+        elif action == "confirm_delete":
+            db.delete_quiz_format(fid,kind,uid)
+            _format_leave_state(uid)
+            await _formats_list(update,kind)
+        elif action == "preview":
+            profile = _format_info(kind,fid)
+            if not profile:
+                raise ValueError("Format no longer exists")
+            _format_enter_state(uid,"fmt_preview",{"kind":kind,"id":fid})
+            await creator.respond(update,"Send sample TXT as text or a .txt file. Preview does not save a quiz or change timers/scoring. "
+                "Presentation previews use your currently selected TXT parser. TXT files (not pasted text) follow the support-copy policy. "
+                "The complete parsed preview is returned as a file, with the first question's display shown below.",
+                M([[B("Cancel",callback_data=f"fm:list:{kind}")]]))
+        elif action == "support":
+            _format_leave_state(uid)
+            await _support_menu(update)
+        elif action == "support_edit":
+            _format_enter_state(uid,"fmt_support",{})
+            await creator.respond(update,"Send @group_username, https://t.me/username or the group's REAL numeric Chat ID. "
+                "The bot must already be a member and allowed to send documents. A private group must expose its actual invite_link to the bot; no links/IDs are invented.",
+                M([[B("Cancel",callback_data="fm:support")]]))
+        elif action == "support_remove":
+            await creator.respond(update,"Disable the Support Group button and all future TXT forwarding? Existing delivery records are retained.",M([
+                [B("Confirm disable",callback_data="fm:support_disable")], [B("Cancel",callback_data="fm:support")]]))
+        elif action == "support_disable":
+            db.set_support_group({"ref":None,"chat_id":None,"url":None},uid)
+            _format_leave_state(uid)
+            await _support_menu(update)
+        else:
+            raise ValueError("Unknown format action")
+    except (ValueError,TypeError,db.DatabaseError) as exc:
+        await update.effective_message.reply_text("⚠️ "+str(exc),parse_mode=None)
+
+
+async def format_settings_message(update: Update, context, state: str, data: dict) -> None:
+    uid,msg = update.effective_user.id,update.effective_message
+    # Recheck on every message, including a persisted wizard resumed after restart.
+    if not config.is_admin(uid) and not (state == "fmt_preview" and data.get("kind")=="import"):
+        _format_leave_state(uid)
+        await msg.reply_text("⛔ Admin only")
+        return
+    try:
+        if state == "fmt_support":
+            resolved = await asyncio.wait_for(creator.resolve_support_group(context.bot,msg.text or ""),timeout=15)
+            db.set_support_group(resolved,uid)
+            _format_leave_state(uid)
+            await msg.reply_text("✅ Support Group resolved and saved. Real Chat ID: "+str(resolved["chat_id"]))
+            await _support_menu(update)
+        elif state == "fmt_save":
+            raw_json = msg.text or ""
+            if msg.document:
+                if not (msg.document.file_name or "").lower().endswith(".json") or (msg.document.file_size and msg.document.file_size>65536):
+                    raise ValueError("Settings upload must be a .json file up to 64 KiB")
+                file = await msg.document.get_file()
+                raw = bytes(await file.download_as_bytearray())
+                if len(raw)>65536:
+                    raise ValueError("Settings file too large")
+                raw_json = pdf_parser.decode_text_bytes(raw)
+            obj = json.loads(raw_json)
+            if not isinstance(obj,dict) or set(obj)!={"name","settings"}:
+                raise ValueError('Expected {"name":"...","settings":{...}}')
+            fid = db.save_quiz_format(data["kind"],obj["name"],obj["settings"],uid,data.get("id"))
+            _format_leave_state(uid)
+            await msg.reply_text("✅ Named format saved. Existing quizzes remain unchanged.")
+            await _format_view(update,data["kind"],fid)
+        elif state == "fmt_preview":
+            profile = _format_info(data["kind"],data["id"])
+            if not profile:
+                raise ValueError("Format no longer exists")
+            if msg.document:
+                if not creator.is_txt_document(msg.document):
+                    raise ValueError("Preview accepts pasted text or TXT documents only")
+                if msg.document.file_size and msg.document.file_size>config.MAX_DOWNLOAD_BYTES:
+                    raise ValueError("File exceeds download limit")
+                tgfile = await msg.document.get_file()
+                raw = bytes(await tgfile.download_as_bytearray())
+                await creator.forward_txt_upload(update,context,raw,msg.document.file_name or "sample.txt")
+                text = pdf_parser.decode_text_bytes(raw)
+            else:
+                text = msg.text or ""
+            if data["kind"] == "import":
+                res = await asyncio.to_thread(creator.parse_txt_with_format,text,data["id"])
+            else:
+                res = await asyncio.to_thread(creator.parse_txt_for_user,uid,text)
+            if not res.questions:
+                why = "; ".join(str(e) for e in res.errors)
+                raise ValueError("No valid questions. "+why)
+            questions = [q.to_dict() for q in res.questions]
+            preview = creator.full_preview_text(questions,[str(e) for e in res.errors],[],profile["name"])
+            await update.effective_chat.send_document(document=preview.encode("utf-8"),filename="format_preview.txt",
+                caption=f"Parsed: {len(questions)}; errors: {len(res.errors)}. No quiz saved.")
+            if data["kind"] == "presentation":
+                settings = json.loads(profile["settings_json"]) if profile.get("settings_json") else None
+                payload = engine.build_poll_payload(questions[0],list(range(len(questions[0]["options"]))),0,len(questions),
+                    presentation=settings,quiz_title="Preview")
+                for chunk in payload.full_text_chunks:
+                    await msg.reply_text(chunk,parse_mode=None)
+                poll_text = "Native poll preview (text only; no quiz started):\n"+payload.question+"\n"+"\n".join(payload.options)
+                for chunk in engine.split_message(poll_text):
+                    await msg.reply_text(chunk,parse_mode=None)
+            await msg.reply_text("Send another sample to preview again, or return.",reply_markup=M([[B("◀ Formats",callback_data=f"fm:list:{data['kind']}")]]))
+    except (ValueError,TypeError,KeyError,db.DatabaseError) as exc:
+        for chunk in engine.split_message("⚠️ "+str(exc)):
+            await msg.reply_text(chunk,parse_mode=None)
+    except (TelegramError,asyncio.TimeoutError):
+        await msg.reply_text("⚠️ Telegram resolution/download failed. Configuration was not changed; retry after checking bot membership/permissions.")
 
 
 def main() -> None:

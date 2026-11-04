@@ -71,13 +71,15 @@ _TABLES: dict[str, str] = {
     "batch_members": "ORDER BY batch_name, user_id",
     "authorized_chats": "ORDER BY chat_id",
     "bot_settings": "ORDER BY key",
+    "quiz_formats": "ORDER BY kind,name,id",
+    "txt_upload_deliveries": "ORDER BY event_key",
     "pdf_start_requests": "ORDER BY request_id",
     "group_pdf_permissions": "ORDER BY session_id,user_id",
 }
 # Sections added to the backup by the feature expansion.  Older backup files do
 # not have them; they are then treated as empty (nothing is deleted on restore).
 _EXPANSION_SECTIONS = ("batches", "batch_members", "authorized_chats", "bot_settings",
-                       "pdf_start_requests", "group_pdf_permissions")
+                       "pdf_start_requests", "group_pdf_permissions", "quiz_formats", "txt_upload_deliveries")
 # Sections/columns written only by an unreleased development build that had
 # payments / premium membership (removed again).  The production bot never had
 # them.  A backup that still contains them restores normally; this data is
@@ -87,12 +89,13 @@ _REMOVED_COLUMNS: dict[str, tuple[str, ...]] = {"users": ("is_premium", "premium
 _RESTORE_ORDER = ["users", "quizzes", "quiz_settings", "questions", "attempts",
                   "answers", "group_sessions", "group_polls", "group_answers", "user_states",
                   "review_pdfs", "batches", "batch_members", "authorized_chats", "bot_settings",
-                  "pdf_start_requests", "group_pdf_permissions"]
+                  "pdf_start_requests", "group_pdf_permissions", "quiz_formats", "txt_upload_deliveries"]
 # Natural key used to upsert each table (default: "id").
 _PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "users": ("user_id",), "user_states": ("user_id",), "quiz_settings": ("quiz_id",),
     "group_polls": ("poll_id",), "batches": ("name",), "batch_members": ("batch_name", "user_id"),
     "authorized_chats": ("chat_id",), "bot_settings": ("key",),
+    "txt_upload_deliveries": ("event_key",),
     "pdf_start_requests": ("request_id",), "group_pdf_permissions": ("session_id", "user_id"),
 }
 # Never exported, whatever happens (secrets / credentials).
@@ -306,6 +309,8 @@ def build_payload(now: Optional[float] = None) -> dict:
         "batch_members": tables["batch_members"],
         "authorized_chats": tables["authorized_chats"],
         "bot_settings": tables["bot_settings"],
+        "quiz_formats": tables["quiz_formats"],
+        "txt_upload_deliveries": tables["txt_upload_deliveries"],
         "pdf_start_requests": tables["pdf_start_requests"],
         "group_pdf_permissions": tables["group_pdf_permissions"],
     }
@@ -512,6 +517,34 @@ def _validate_expansion_sections(data: dict) -> list[str]:
                 or not isinstance(r.get("updated_ts"),(int,float))
                 or (r.get("key")=="pdf_review_enabled" and r.get("value") not in ("0","1"))):
             problems.append(f"bot_settings[{i}]: invalid setting")
+    seen_formats = set()
+    for i,r in enumerate(rows("quiz_formats")):
+        try:
+            import quiz_engine
+            if (not isinstance(r,dict) or r.get("kind") not in ("presentation","import")
+                    or not isinstance(r.get("id"),str) or not r["id"] or r["id"].startswith("builtin_")
+                    or not isinstance(r.get("name"),str) or not 1 <= len(r["name"].strip()) <= 60
+                    or not isinstance(r.get("updated_ts"),(int,float))):
+                raise ValueError("Invalid format row")
+            quiz_engine.validate_format_settings(r["kind"],json.loads(r["settings_json"]))
+            identity = (r["kind"],r["name"])
+            if identity in seen_formats:
+                raise ValueError("Duplicate format name")
+            seen_formats.add(identity)
+        except (ValueError,TypeError,KeyError):
+            problems.append(f"quiz_formats[{i}]: invalid format/settings")
+    seen_events = set()
+    for i,r in enumerate(rows("txt_upload_deliveries")):
+        if (not isinstance(r,dict) or not isinstance(r.get("event_key"),str) or not r["event_key"]
+                or not isinstance(r.get("user_id"),int) or not isinstance(r.get("target_chat_id"),int)
+                or not isinstance(r.get("sha256"),str) or len(r["sha256"]) != 64
+                or r.get("status") not in ("sending","sent","failed","uncertain")
+                or not isinstance(r.get("updated_ts"),(int,float))):
+            problems.append(f"txt_upload_deliveries[{i}]: invalid delivery record")
+        elif r["event_key"] in seen_events:
+            problems.append(f"txt_upload_deliveries[{i}]: duplicate event")
+        else:
+            seen_events.add(r["event_key"])
     return problems
 
 
@@ -732,6 +765,14 @@ def github_payload(data: dict) -> dict:
         row.update(user_id=None, chat_id=None, redacted=True)
     for row in out.get("bot_settings") or []:
         row.update(updated_by=None)
+        if row.get("key") == "support_group_config":
+            row["value"] = json.dumps({"ref":None,"chat_id":None,"url":None})
+    for row in out.get("quiz_formats") or []:
+        row.update(created_by=None)
+    # Event keys/content fingerprints/actual target IDs must never go to GitHub.
+    out["txt_upload_deliveries"] = []
+    if "txt_upload_deliveries" in (out.get("counts") or {}):
+        out["counts"]["txt_upload_deliveries"] = 0
     for row in out.get("pdf_start_requests") or []:
         row.update(user_id=None, chat_id=None, request_id=None, consumed=1, redacted=True)
     for row in out.get("group_pdf_permissions") or []:
@@ -1079,6 +1120,11 @@ def _missing_for_expansion(con: sqlite3.Connection, rows: dict) -> list[str]:
             need.append((t, None))
     if nonzero("users", "batches_json"):
         need.append(("users", "batches_json"))
+    if nonzero("users", "txt_import_format_id"):
+        need.append(("users", "txt_import_format_id"))
+    for t in ("quizzes","attempts","group_sessions"):
+        if nonzero(t,"presentation_json"):
+            need.append((t,"presentation_json"))
     if any((r.get("access_tier") or "free") != "free" for r in rows.get("quizzes") or []):
         need.append(("quizzes", "access_tier"))           # dropping it would open batch/private quizzes
     for col in ("batch_name", "allowed_chats_json", "negative_mark", "section_timers_json"):

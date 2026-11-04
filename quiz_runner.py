@@ -227,10 +227,10 @@ async def send_current(app: Application, attempt_id: int) -> None:
     mode = quiz_modes.normalize_mode(att.get("quiz_mode"))
     perm = engine.make_permutation(len(q["options"]), bool(att["shuffle_options"]))
     try:
-        payload = engine.build_poll_payload(q, perm, idx, total)
+        payload = engine.build_poll_payload(q, perm, idx, total, presentation=engine.presentation_from(att), quiz_title=(quiz or {}).get("title", ""))
     except Exception:  # never let one bad question crash the quiz
         log.exception("payload build failed for question %s", q["id"])
-        payload = engine.compact_fallback(q, perm, idx, total)
+        payload = engine.compact_fallback(q, perm, idx, total, presentation=engine.presentation_from(att), quiz_title=(quiz or {}).get("title", ""))
 
     timer = quiz_modes.resolve_question_timer(quiz, q, default_timer=int(att.get("timer") or 0))
     # Section header notice when entering a new section in sectional mode (or when section timers exist)
@@ -260,7 +260,7 @@ async def send_current(app: Application, attempt_id: int) -> None:
     except BadRequest as exc:
         log.warning("send_poll rejected (%s) — using compact fallback", exc)
         had_text = bool(payload.full_text_chunks) and sent["text"]
-        payload = engine.compact_fallback(q, perm, idx, total)
+        payload = engine.compact_fallback(q, perm, idx, total, presentation=engine.presentation_from(att), quiz_title=(quiz or {}).get("title", ""))
         if had_text:          # the identical full question text is already in the chat
             payload.full_text_chunks = []
         try:

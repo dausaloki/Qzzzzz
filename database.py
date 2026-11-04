@@ -280,6 +280,24 @@ CREATE TABLE IF NOT EXISTS review_pdfs (
 );
 
 -- Attempt-bound consent; NULL on migrated historical attempts means unknown, never auto-allow.
+CREATE TABLE IF NOT EXISTS quiz_formats (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind IN ('presentation','import')),
+    name TEXT NOT NULL,
+    settings_json TEXT NOT NULL,
+    created_by INTEGER,
+    updated_ts REAL NOT NULL,
+    UNIQUE(kind,name)
+);
+CREATE TABLE IF NOT EXISTS txt_upload_deliveries (
+    event_key TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    target_chat_id INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    message_id INTEGER,
+    updated_ts REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS bot_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -345,11 +363,13 @@ CREATE INDEX IF NOT EXISTS idx_gsessions_chat ON group_sessions(chat_id, status)
 CREATE INDEX IF NOT EXISTS idx_gpolls_session ON group_polls(session_id);
 CREATE INDEX IF NOT EXISTS idx_ganswers_session ON group_answers(session_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_batch_members_user ON batch_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_txt_delivery_dedupe ON txt_upload_deliveries(user_id,sha256,target_chat_id,status);
 """
 
 # Columns that may be missing in databases created by the previous version.
 _MIGRATION_COLUMNS = {
     "users": {
+        "txt_import_format_id": "TEXT",
         "last_name": "TEXT DEFAULT ''",
         "default_timer": "INTEGER DEFAULT 45",
         "default_shuffle_questions": "INTEGER DEFAULT 0",
@@ -364,6 +384,7 @@ _MIGRATION_COLUMNS = {
         "is_banned": "INTEGER DEFAULT 0",
     },
     "quizzes": {
+        "presentation_json": "TEXT",
         "pre_text": "TEXT DEFAULT ''",
         "status": "TEXT DEFAULT 'ready'",
         "source": "TEXT DEFAULT 'manual'",
@@ -389,6 +410,7 @@ _MIGRATION_COLUMNS = {
         "created_at": "TEXT",
     },
     "attempts": {
+        "presentation_json": "TEXT",
         "pdf_allowed": "INTEGER",
         "timeouts": "INTEGER DEFAULT 0",
         "status": "TEXT DEFAULT 'active'",
@@ -418,6 +440,7 @@ _MIGRATION_COLUMNS = {
     },
     # negative mark snapshot taken when a group quiz starts (0 = disabled, the default)
     "group_sessions": {
+        "presentation_json": "TEXT",
         "pdf_enabled_at_start": "INTEGER",
         "negative_mark": "REAL DEFAULT 0",
     },
@@ -547,7 +570,7 @@ def mark_first_start_notified(user_id: int, ts_str: str = "") -> None:
             con.execute("UPDATE users SET first_start_notified=1 WHERE user_id=?", (user_id,))
 
 
-_USER_SETTING_FIELDS = {"default_timer", "default_shuffle_questions", "default_shuffle_options"}
+_USER_SETTING_FIELDS = {"default_timer", "default_shuffle_questions", "default_shuffle_options", "txt_import_format_id"}
 
 
 def update_user_settings(user_id: int, **fields) -> None:
@@ -582,6 +605,11 @@ def new_quiz(owner_id: int, title: str, description: str = "", *,
             "INSERT INTO quizzes(id,owner_id,title,description,status,source) VALUES(?,?,?,?,?,?)",
             (qid, owner_id, title, description or "", status, source),
         )
+        default = _format_default_in(con, "presentation")
+        profile = con.execute("SELECT * FROM quiz_formats WHERE id=? AND kind='presentation'", (default,)).fetchone()
+        if profile:
+            # Immutable quiz snapshot: later edits/deletion/default changes cannot affect it.
+            con.execute("UPDATE quizzes SET presentation_json=? WHERE id=?", (profile["settings_json"],qid))
         con.execute(
             "INSERT INTO quiz_settings(quiz_id,timer,shuffle_questions,shuffle_options) VALUES(?,?,?,?)",
             (qid, int(timer or 0), int(bool(sq)), int(bool(so))),
@@ -899,6 +927,8 @@ def create_attempt(qid: str, user_id: int, chat_id: int, order: list[int],
             VALUES(?,?,?,'active',?,0,?,?,?,?,?)
         """, (qid, user_id, chat_id, json.dumps(order), len(order), int(timer or 0),
               int(bool(shuffle_options)), started_ts, start_msg_id))
+        con.execute("UPDATE attempts SET presentation_json=(SELECT presentation_json FROM quizzes WHERE id=?) WHERE id=?",
+                    (qid,cur.lastrowid))
         con.execute("UPDATE attempts SET pdf_allowed=? WHERE id=?",
                     (None if pdf_allowed is None else int(bool(pdf_allowed)), cur.lastrowid))
         if pdf_request_token:
@@ -1147,6 +1177,8 @@ def create_group_session(qid: str, chat_id: int, started_by: int, order: list[in
             VALUES(?,?,?,?,?,0,?,?,?,?,?)
         """, (qid, chat_id, started_by, "pending" if pending else "active", json.dumps(order), len(order), int(timer),
               int(bool(shuffle_options)), started_ts, max(0.0, float(negative_mark or 0.0))))
+        con.execute("UPDATE group_sessions SET presentation_json=(SELECT presentation_json FROM quizzes WHERE id=?) WHERE id=?",
+                    (qid,cur.lastrowid))
         con.execute("UPDATE group_sessions SET pdf_enabled_at_start=? WHERE id=?",
                     (None if pdf_enabled_at_start is None else int(bool(pdf_enabled_at_start)), cur.lastrowid))
         return cur.lastrowid
@@ -1658,3 +1690,142 @@ def list_pending_group_sessions() -> list[dict]:
 def cancel_pdf_start_requests(user_id: int) -> None:
     with connect() as con:
         con.execute("UPDATE pdf_start_requests SET consumed=1 WHERE user_id=? AND consumed=0", (user_id,))
+
+
+# ---------------------------------------------------- independent named formats
+BUILTIN_DEFAULT_FORMAT = "builtin_default"
+BUILTIN_CHECKED_FORMAT = "builtin_checked"
+
+
+def _format_default_in(con, kind: str) -> str:
+    row = con.execute("SELECT value FROM bot_settings WHERE key=?", ("default_format_"+kind,)).fetchone()
+    return row["value"] if row else BUILTIN_DEFAULT_FORMAT
+
+
+def list_quiz_formats(kind: str) -> list[dict]:
+    with connect() as con:
+        return [dict(r) for r in con.execute("SELECT * FROM quiz_formats WHERE kind=? ORDER BY name,id", (kind,))]
+
+
+def get_quiz_format(format_id: str, kind: str) -> Optional[dict]:
+    with connect() as con:
+        row = con.execute("SELECT * FROM quiz_formats WHERE id=? AND kind=?", (format_id,kind)).fetchone()
+    return dict(row) if row else None
+
+
+def get_default_format(kind: str) -> str:
+    with connect() as con:
+        value = _format_default_in(con,kind)
+    if value in (BUILTIN_DEFAULT_FORMAT, BUILTIN_CHECKED_FORMAT if kind == "import" else BUILTIN_DEFAULT_FORMAT):
+        return value
+    return value if get_quiz_format(value,kind) else BUILTIN_DEFAULT_FORMAT
+
+
+def save_quiz_format(kind: str, name: str, settings: dict, actor_id: int, format_id: Optional[str] = None) -> str:
+    if not config.is_admin(actor_id):
+        raise PermissionError("Admin only")
+    if kind not in ("presentation","import") or not isinstance(name,str) or not 1 <= len(name.strip()) <= 60:
+        raise ValueError("Format kind/name invalid (name: 1–60 characters)")
+    import quiz_engine
+    settings = quiz_engine.validate_format_settings(kind,settings)
+    if format_id and not get_quiz_format(format_id,kind):
+        raise ValueError("Built-in/missing formats cannot be edited")
+    format_id = format_id or uuid.uuid4().hex[:12]
+    with connect() as con:
+        con.execute("""INSERT INTO quiz_formats(id,kind,name,settings_json,created_by,updated_ts)
+            VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,
+            settings_json=excluded.settings_json,updated_ts=excluded.updated_ts""",
+            (format_id,kind,name.strip(),json.dumps(settings,ensure_ascii=False),actor_id,time.time()))
+    return format_id
+
+
+def set_default_format(kind: str, format_id: str, actor_id: int) -> None:
+    if not config.is_admin(actor_id):
+        raise PermissionError("Admin only")
+    builtins = (BUILTIN_DEFAULT_FORMAT,BUILTIN_CHECKED_FORMAT) if kind == "import" else (BUILTIN_DEFAULT_FORMAT,)
+    if kind not in ("presentation","import") or (format_id not in builtins and not get_quiz_format(format_id,kind)):
+        raise ValueError("Unknown format")
+    with connect() as con:
+        con.execute("""INSERT INTO bot_settings(key,value,updated_by,updated_ts) VALUES(?,?,?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_by=excluded.updated_by,updated_ts=excluded.updated_ts""",
+            ("default_format_"+kind,format_id,actor_id,time.time()))
+
+
+def delete_quiz_format(format_id: str, kind: str, actor_id: int) -> None:
+    if not config.is_admin(actor_id):
+        raise PermissionError("Admin only")
+    if not get_quiz_format(format_id,kind):
+        raise ValueError("Built-in/missing formats cannot be deleted")
+    with connect() as con:
+        con.execute("DELETE FROM quiz_formats WHERE id=? AND kind=?", (format_id,kind))
+        con.execute("UPDATE bot_settings SET value=? WHERE key=? AND value=?",
+                    (BUILTIN_DEFAULT_FORMAT,"default_format_"+kind,format_id))
+        if kind == "import":
+            con.execute("UPDATE users SET txt_import_format_id=NULL WHERE txt_import_format_id=?",(format_id,))
+
+
+def effective_import_format(user_id: int) -> str:
+    user = get_user(user_id) or {}
+    selected = user.get("txt_import_format_id")
+    if selected in (BUILTIN_DEFAULT_FORMAT,BUILTIN_CHECKED_FORMAT) or (selected and get_quiz_format(selected,"import")):
+        return selected
+    return get_default_format("import")
+
+
+def support_group_config() -> dict:
+    with connect() as con:
+        row = con.execute("SELECT value FROM bot_settings WHERE key='support_group_config'").fetchone()
+    if not row:
+        return {"ref":"@Dausa_123","chat_id":None,"url":"https://t.me/Dausa_123"}
+    try:
+        value = json.loads(row["value"])
+        if (not isinstance(value,dict) or (value.get("ref") is not None and not isinstance(value["ref"],str))
+                or (value.get("chat_id") is not None and not isinstance(value["chat_id"],int))
+                or (value.get("url") is not None and (not isinstance(value["url"],str) or not value["url"].startswith("https://t.me/")))):
+            raise ValueError("Invalid support configuration")
+        return value
+    except (ValueError,TypeError):
+        # A damaged persisted value disables forwarding rather than picking a new target.
+        return {"ref":None,"chat_id":None,"url":None}
+
+
+def set_support_group(value: dict, actor_id: int) -> None:
+    if not config.is_admin(actor_id):
+        raise PermissionError("Admin only")
+    with connect() as con:
+        con.execute("""INSERT INTO bot_settings(key,value,updated_by,updated_ts) VALUES('support_group_config',?,?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_by=excluded.updated_by,updated_ts=excluded.updated_ts""",
+            (json.dumps(value,ensure_ascii=False),actor_id,time.time()))
+
+
+def cache_support_group(value: dict, expected_ref: Optional[str] = None) -> bool:
+    with connect() as con:
+        row = con.execute("SELECT value FROM bot_settings WHERE key='support_group_config'").fetchone()
+        current = json.loads(row["value"]) if row else {"ref":"@Dausa_123"}
+        if current.get("ref") != (expected_ref if expected_ref is not None else value.get("ref")):
+            return False
+        con.execute("""INSERT INTO bot_settings(key,value,updated_ts) VALUES('support_group_config',?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_ts=excluded.updated_ts""",
+            (json.dumps(value,ensure_ascii=False),time.time()))
+    return True
+
+
+def claim_txt_forward(event_key: str, user_id: int, digest: str, target_id: int) -> bool:
+    with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        if con.execute("SELECT 1 FROM txt_upload_deliveries WHERE event_key=?",(event_key,)).fetchone():
+            return False
+        if con.execute("""SELECT 1 FROM txt_upload_deliveries WHERE user_id=? AND sha256=? AND target_chat_id=?
+            AND status IN ('sending','sent','uncertain')""",(user_id,digest,target_id)).fetchone():
+            return False
+        con.execute("INSERT INTO txt_upload_deliveries VALUES(?,?,?,?,?,NULL,?)",
+                    (event_key,user_id,digest,target_id,"sending",time.time()))
+    return True
+
+
+def finish_txt_forward(event_key: str, status: str, message_id: Optional[int] = None) -> None:
+    if status not in ("sent","failed","uncertain"):
+        raise ValueError("Invalid delivery state")
+    with connect() as con:
+        con.execute("UPDATE txt_upload_deliveries SET status=?,message_id=?,updated_ts=? WHERE event_key=?",
+                    (status,message_id,time.time(),event_key))

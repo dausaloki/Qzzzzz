@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import random
+import json
+import string
 import re
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
@@ -158,7 +160,8 @@ def full_question_text(question_text: str, options: Sequence[str], index: int, t
     return "\n".join(lines)
 
 
-def build_poll_payload(question: dict, perm: Sequence[int], index: int, total: int) -> PollPayload:
+def build_poll_payload(question: dict, perm: Sequence[int], index: int, total: int, *,
+                       presentation: Optional[dict] = None, quiz_title: str = "") -> PollPayload:
     """Build a payload that can NEVER violate Telegram's poll limits.
 
     * question <= 300 chars and every option <= 100 chars → normal native poll
@@ -216,10 +219,11 @@ def build_poll_payload(question: dict, perm: Sequence[int], index: int, total: i
     assert all(1 <= tg_len(o) <= config.POLL_OPTION_MAX and "\n" not in o for o in payload.options)
     assert config.MIN_OPTIONS <= len(payload.options) <= config.MAX_OPTIONS
     assert payload.explanation is None or tg_len(payload.explanation) <= config.POLL_EXPLANATION_MAX
-    return payload
+    return apply_presentation(payload, question, index, total, presentation, quiz_title) if presentation else payload
 
 
-def compact_fallback(question: dict, perm: Sequence[int], index: int, total: int) -> PollPayload:
+def compact_fallback(question: dict, perm: Sequence[int], index: int, total: int, *,
+                     presentation: Optional[dict] = None, quiz_title: str = "") -> PollPayload:
     """Used if Telegram still rejects a poll: always-safe labels + full text."""
     perm = list(perm)
     shown = [str(question["options"][i]).strip() for i in perm]
@@ -235,7 +239,7 @@ def compact_fallback(question: dict, perm: Sequence[int], index: int, total: int
     expl = str(question.get("explanation") or "").strip()
     if expl:
         p.post_explanation = expl
-    return p
+    return apply_presentation(p, question, index, total, presentation, quiz_title, compact=True) if presentation else p
 
 
 # ----------------------------------------------------- manual input
@@ -639,3 +643,176 @@ def parse_start_payload(arg: str) -> Optional[str]:
 
 def detect_qtype(question: str) -> str:
     return pdf_parser.detect_qtype(question)
+
+
+# ------------------------------------------------ separate presentation/import format settings
+
+def default_format_settings(kind: str) -> dict:
+    if kind == "presentation":
+        return {"header":"", "heading":"Question {number} / {total}", "footer":"",
+                "branding":"", "accompanying_text":"", "numbering":"decimal",
+                "option_labels":list(LABELS)}
+    if kind == "import":
+        return {"question_prefix":"Q:", "option_labels":["A)","B)","C)","D)"],
+                "correct_markers":["✅"], "answer_prefixes":["Answer:"],
+                "explanation_prefixes":["Ex:","Explanation:"]}
+    raise ValueError("Unknown format kind")
+
+
+def validate_format_settings(kind: str, settings: dict) -> dict:
+    defaults = default_format_settings(kind)
+    if not isinstance(settings,dict) or set(settings)-set(defaults):
+        raise ValueError("Use only the fields shown in the settings example")
+    value = {**defaults,**settings}
+    labels = value["option_labels"]
+    if (not isinstance(labels,list) or not 2 <= len(labels) <= 12 or
+            any(not isinstance(x,str) or not x.strip() or len(x)>20 or "\n" in x or "\r" in x for x in labels)
+            or len(set(labels)) != len(labels)):
+        raise ValueError("option_labels: 2–12 distinct, nonempty single-line strings (max 20 chars)")
+    if kind == "presentation":
+        if any(x != x.strip() or "\t" in x for x in labels):
+            raise ValueError("Presentation option labels cannot have leading/trailing whitespace or tabs")
+        if value["numbering"] not in ("decimal","roman","none"):
+            raise ValueError("numbering: decimal, roman or none")
+        for key in ("header","heading","footer","branding","accompanying_text"):
+            if not isinstance(value[key],str) or len(value[key])>800:
+                raise ValueError(key+": text up to 800 characters")
+            for _,field,spec,conversion in string.Formatter().parse(value[key]):
+                if field is not None and (field not in ("number","total","quiz_title","quiz_id") or spec or conversion):
+                    raise ValueError("Only {number}, {total}, {quiz_title}, {quiz_id} placeholders are allowed")
+    else:
+        prefix = value["question_prefix"]
+        if not isinstance(prefix,str) or not prefix.strip() or len(prefix)>40 or "\n" in prefix or "\r" in prefix:
+            raise ValueError("question_prefix: a nonempty literal prefix, e.g. Q: (max 40 chars)")
+        # Ambiguous overlapping labels/prefixes would risk guessing boundaries.
+        if any(a.startswith(b) or b.startswith(a) for i,a in enumerate(labels) for b in labels[i+1:]):
+            raise ValueError("Option labels must not overlap")
+        for key in ("correct_markers","answer_prefixes","explanation_prefixes"):
+            values = value[key]
+            if not isinstance(values,list) or len(values)>12 or any(not isinstance(x,str) or not x.strip() or len(x)>40 or "\n" in x or "\r" in x for x in values):
+                raise ValueError(key+": a list of distinct nonempty single-line strings")
+            if len(set(values)) != len(values):
+                raise ValueError("Duplicate prefixes/markers")
+        if not value["correct_markers"] and not value["answer_prefixes"]:
+            raise ValueError("Provide a correct marker or an explicit answer prefix")
+        prefixes = [prefix]+labels+value["answer_prefixes"]+value["explanation_prefixes"]
+        if any(a.startswith(b) or b.startswith(a) for i,a in enumerate(prefixes) for b in prefixes[i+1:]):
+            raise ValueError("Question/option/answer/explanation prefixes must not overlap")
+    return value
+
+
+def presentation_from(record: dict) -> Optional[dict]:
+    raw = record.get("presentation_json")
+    if not raw:
+        return None  # Existing Default payload path is untouched.
+    try:
+        return validate_format_settings("presentation",json.loads(raw))
+    except (ValueError,TypeError):
+        return None  # A damaged custom snapshot must not stop the quiz.
+
+
+def _presentation_number(number: int, style: str) -> str:
+    if style == "none":
+        return ""
+    if style != "roman" or not 0 < number < 4000:
+        return str(number)
+    out = ""
+    for value,label in ((1000,"M"),(900,"CM"),(500,"D"),(400,"CD"),(100,"C"),(90,"XC"),(50,"L"),(40,"XL"),(10,"X"),(9,"IX"),(5,"V"),(4,"IV"),(1,"I")):
+        while number >= value:
+            out += label
+            number -= value
+    return out
+
+
+def apply_presentation(payload: PollPayload, question: dict, index: int, total: int,
+                       settings: dict, quiz_title: str = "", *, compact: bool = False) -> PollPayload:
+    settings = validate_format_settings("presentation",settings)
+    context = {"number":_presentation_number(index+1,settings["numbering"]),"total":total,
+               "quiz_title":quiz_title,"quiz_id":question.get("quiz_id","")}
+    label = lambda i: settings["option_labels"][i] if i < len(settings["option_labels"]) else LABELS[i]
+    shown = [str(question["options"][i]) for i in payload.perm]
+    heading = settings["heading"].format(**context)
+    parts = [settings[k].format(**context) for k in ("header","branding","heading","accompanying_text")]
+    parts += [str(question["question"]),"\n".join(f"{label(i)} {text}" for i,text in enumerate(shown)),settings["footer"].format(**context)]
+    payload.full_text_chunks = split_message("\n\n".join(part for part in parts if part))
+    full = heading + ("\n" if heading else "") + str(question["question"])
+    if not compact and tg_len(full) <= config.POLL_QUESTION_MAX and full.strip():
+        payload.question = full
+    else:
+        prompt = (heading + "\n" if heading and tg_len(heading)<200 else "") + "ऊपर दिए गए पूरे प्रश्न का सही विकल्प चुनें।"
+        payload.question = prompt
+    opts = [f"{label(i)} {' '.join(text.split())}" for i,text in enumerate(shown)]
+    if compact or any(tg_len(x)>config.POLL_OPTION_MAX for x in opts):
+        payload.options = [label(i) for i in range(len(shown))]
+        payload.compact = True
+    else:
+        payload.options = opts
+    return payload
+
+
+def parse_custom_txt_source(text: str, settings: dict):
+    """Literal, admin-defined import grammar. No regex/code execution or answer guessing."""
+    settings = validate_format_settings("import",settings)
+    lines = text.splitlines()
+    prefix = settings["question_prefix"]
+    starts = [i for i,line in enumerate(lines) if line.lstrip().startswith(prefix)]
+    result = pdf_parser.ParseResult()
+    result.detected_blocks = len(starts)
+    if not starts:
+        result.errors.append(pdf_parser.ParseError(None,"No question_prefix found: "+prefix))
+        return result
+    def starts_with(line, prefixes):
+        return next((p for p in prefixes if line.lstrip().startswith(p)),None)
+    for number,start in enumerate(starts,1):
+        end = starts[number] if number < len(starts) else len(lines)
+        stem = [lines[start].lstrip()[len(prefix):].lstrip()]
+        options, correct, explanation, current, in_explanation = [], set(), [], None, False
+        invalid = ""
+        for line in lines[start+1:end]:
+            stripped = line.lstrip()
+            if in_explanation:
+                explanation.append(line)
+                continue
+            expl = starts_with(line,settings["explanation_prefixes"])
+            ans = starts_with(line,settings["answer_prefixes"])
+            opt = starts_with(line,settings["option_labels"])
+            if expl:
+                in_explanation = True
+                explanation.append(stripped[len(expl):].lstrip())
+            elif ans:
+                token = stripped[len(ans):].strip()
+                matches = {i for i,label in enumerate(settings["option_labels"])
+                           if token in (label,label.rstrip(").: "),str(i+1))}
+                if len(matches) != 1:
+                    invalid = "Explicit answer does not identify one configured option"
+                correct.update(matches)
+            elif opt:
+                index = settings["option_labels"].index(opt)
+                if index != len(options):
+                    invalid = "Option labels missing, duplicated or out of order"
+                options.append([stripped[len(opt):].lstrip()])
+                current = len(options)-1
+            elif current is None:
+                stem.append(line)
+            else:
+                options[current].append(line)
+        values = []
+        for i,rows in enumerate(options):
+            value = "\n".join(rows).strip()
+            for marker in sorted(settings["correct_markers"],key=len,reverse=True):
+                if value.startswith(marker):
+                    value = value[len(marker):].lstrip()
+                    correct.add(i)
+                if value.endswith(marker):
+                    value = value[:-len(marker)].rstrip()
+                    correct.add(i)
+            values.append(value)
+        question = "\n".join(stem).strip("\n")
+        if invalid or len(values) != len(settings["option_labels"]) or not all(values) or not question.strip() or len(correct)!=1 or next(iter(correct),-1) >= len(values):
+            result.errors.append(pdf_parser.ParseError(number,invalid or "Complete options and exactly one explicit correct answer are required"))
+            continue
+        result.questions.append(pdf_parser.ParsedQuestion(number=number,question=question,options=values,
+            correct_index=next(iter(correct)),explanation="\n".join(explanation).strip("\n"),
+            qtype=detect_qtype(question),answer_source="inline"))
+    result.mapped_answers = len(result.questions)
+    return result

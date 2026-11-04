@@ -18,7 +18,7 @@ def main_menu() -> M:
         [B("➕ New Quiz", callback_data="m:new"), B("📚 My Quizzes", callback_data="m:my")],
         [B("📥 Import", callback_data="m:imp"), B("▶️ Start Quiz", callback_data="m:start")],
         [B("📊 Statistics", callback_data="m:stats"), B("⚙️ Settings", callback_data="m:set")],
-        [B("❓ Help", callback_data="m:help")],
+        [B("❓ Help", callback_data="m:help"), B("👤 Owner", url="https://t.me/LOKESH_DAUSA")],
     ])
 
 
@@ -287,16 +287,24 @@ def running_markup() -> M:
     return M([[B("⏭ Skip", callback_data="r:skip"), B("⏹ Stop", callback_data="r:stop")]])
 
 
-def settings_menu(user: dict) -> M:
+def settings_menu(user: dict, support_url: Optional[str] = None) -> M:
     sq = "ON ✅" if user.get("default_shuffle_questions") else "OFF"
     so = "ON ✅" if user.get("default_shuffle_options") else "OFF"
-    return M([
+    rows = [
         [B(f"⏱ Default Timer: {config.timer_label(user.get('default_timer', config.DEFAULT_TIMER))}",
            callback_data="s:timer")],
         [B(f"🔀 Default Shuffle Questions: {sq}", callback_data="s:sq")],
         [B(f"🔀 Default Shuffle Options: {so}", callback_data="s:so")],
-        home_button(),
-    ])
+        [B("📄 TXT Import Formats",callback_data="fm:list:import")],
+        [B("👤 Owner",url="https://t.me/LOKESH_DAUSA")],
+    ]
+    if support_url:
+        rows.append([B("👥 Support Group",url=support_url)])
+    if config.is_admin(user.get("user_id")):
+        rows += [[B("🎨 Quiz Presentations",callback_data="fm:list:presentation")],
+                 [B("👥 Configure Support Group",callback_data="fm:support")]]
+    rows.append(home_button())
+    return M(rows)
 
 
 def esc(text) -> str:
