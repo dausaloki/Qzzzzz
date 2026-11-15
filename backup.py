@@ -31,6 +31,7 @@ Design rules (why this module is safe):
 from __future__ import annotations
 
 import base64
+from contextlib import closing
 import hashlib
 import json
 import logging
@@ -102,6 +103,8 @@ _PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
 _FORBIDDEN_KEYS = {"token", "bot_token", "password", "secret", "api_key", "api_hash", "github_token"}
 
 _EXPORT_LOCK = threading.RLock()             # one writer thread per process
+_dirty_guard = threading.RLock()
+_dirty_version = {"n": 0}
 _dirty = threading.Event()
 _dirty_reason = {"text": ""}
 _dirty_first = {"ts": 0.0}
@@ -202,6 +205,26 @@ def _plain(row: dict) -> dict:
 
 
 # --------------------------------------------------------------------- build
+def _missing_quiz_inventory(data: dict) -> list[dict]:
+    quiz_ids = {q.get("id") for q in data.get("quizzes", [])}
+    missing = {}
+    for section, key in (("attempts", "id"), ("group_sessions", "id")):
+        for row in data.get(section) or []:
+            qid = row.get("quiz_id")
+            if qid not in quiz_ids:
+                item = missing.setdefault(qid, {"quiz_id": qid, "attempts": [], "group_sessions": []})
+                item[section].append(row.get(key))
+    return sorted(missing.values(), key=lambda r: str(r["quiz_id"]))
+
+
+def _declared_missing_ids(data: dict) -> set:
+    declaration = data.get("history_integrity")
+    actual = _missing_quiz_inventory(data)
+    if not isinstance(declaration, dict) or declaration.get("missing_quizzes") != actual:
+        return set()
+    return {r["quiz_id"] for r in actual if isinstance(r["quiz_id"], str) and r["quiz_id"].strip()}
+
+
 def build_payload(now: Optional[float] = None) -> dict:
     """Read the *whole* production database into one JSON-serialisable dict.
 
@@ -209,7 +232,9 @@ def build_payload(now: Optional[float] = None) -> dict:
     snapshot even while the bot writes (WAL mode keeps the bot running).
     """
     now = time.time() if now is None else now
-    with db.connect() as con:
+    with closing(sqlite3.connect(db_path().resolve().as_uri() + "?mode=ro", uri=True, timeout=30)) as con:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA query_only=ON")
         con.execute("BEGIN")
         try:
             tables = {name: [_plain(r) for r in _select(con, name, order)]
@@ -290,7 +315,7 @@ def build_payload(now: Optional[float] = None) -> dict:
     counts["quiz_settings"] = sum(1 for q in quizzes_by_id.values() if q.get("settings"))
     counts["orphans"] = orphans
 
-    return {
+    payload = {
         "format": BACKUP_FORMAT,
         "version": BACKUP_VERSION,
         "generated_at": _iso(now),
@@ -314,6 +339,14 @@ def build_payload(now: Optional[float] = None) -> dict:
         "pdf_start_requests": tables["pdf_start_requests"],
         "group_pdf_permissions": tables["group_pdf_permissions"],
     }
+
+    missing = _missing_quiz_inventory(payload)
+    if missing:
+        payload["history_integrity"] = {
+            "notice": "Original quiz content is missing. Historical records are preserved verbatim; these are not playable replacement quizzes.",
+            "missing_quizzes": missing,
+        }
+    return payload
 
 
 def content_hash(data: dict) -> str:
@@ -404,12 +437,18 @@ def validate_payload(data: dict) -> list[str]:
             if not str(q.get("question") or "").strip():
                 problems.append(f"{qwhere}: empty question text")
 
+    declared_missing = _declared_missing_ids(data)
+    if "history_integrity" in data:
+        declaration = data["history_integrity"]
+        if (not isinstance(declaration, dict) or not declaration.get("notice")
+                or declaration.get("missing_quizzes") != _missing_quiz_inventory(data)):
+            problems.append("history_integrity: missing-parent inventory does not match preserved records")
     for i, att in enumerate(data.get("attempts") or []):
         where = f"attempts[{i}]"
         if not isinstance(att.get("id"), int):
             problems.append(f"{where}: missing attempt id")
             continue
-        if att.get("quiz_id") not in q_ids:
+        if att.get("quiz_id") not in q_ids | declared_missing:
             problems.append(f"{where} (id {att['id']}): unknown quiz_id {att.get('quiz_id')!r}")
         total = len(att.get("answers") or [])
         if isinstance(att.get("total"), int) and att["total"] > 0 and total > att["total"]:
@@ -425,7 +464,7 @@ def validate_payload(data: dict) -> list[str]:
         if not isinstance(sess.get("id"), int):
             problems.append(f"{where}: missing session id")
             continue
-        if sess.get("quiz_id") not in q_ids:
+        if sess.get("quiz_id") not in q_ids | declared_missing:
             problems.append(f"{where} (id {sess['id']}): unknown quiz_id {sess.get('quiz_id')!r}")
         for j, a in enumerate(sess.get("answers") or []):
             if a.get("session_id") != sess["id"]:
@@ -437,6 +476,8 @@ def validate_payload(data: dict) -> list[str]:
 
     counts = data.get("counts")
     if isinstance(counts, dict):
+        if counts.get("orphans", 0):
+            problems.append("unattached database rows would be omitted; preserve/restore their original parent records before exporting")
         checks = [("quizzes", len(quizzes)),
                   ("questions", sum(len(q.get("questions") or []) for q in quizzes)),
                   ("attempts", len(data.get("attempts") or [])),
@@ -637,23 +678,27 @@ def export_now(reason: str = "manual", force: bool = False) -> dict:
             for attempt in range(1, attempts + 1):
                 out["attempts"] = attempt
                 try:
+                    with _dirty_guard:
+                        generation = _dirty_version["n"]
                     data = build_payload()
                     problems = validate_payload(data)
                     if problems:
                         out["errors"] = problems
                         log.error("Backup NOT written (%d problem(s)): %s",
                                   len(problems), "; ".join(problems[:5]))
-                        if attempt < attempts:
-                            _sleep(delay)
-                            continue
+                        out["retry_after"] = time.time() + max(60, float(getattr(config, "BACKUP_MAX_DELAY", 120)))
                         break
+                    if data.get("history_integrity"):
+                        out["history_integrity"] = data["history_integrity"]
+                        log.warning("Backup preserves missing original quiz references: %s", data["history_integrity"]["missing_quizzes"])
                     text = _serialise(data)
                     digest = content_hash(data)
                     path = backup_path()
                     if not force and digest == _last_hash.get("local") and path.exists():
                         out.update(ok=True, skipped="unchanged", bytes=path.stat().st_size,
                                    hash=digest, counts=data["counts"], generated_ts=data["generated_ts"])
-                        _dirty.clear()
+                        _clear_exported(generation)
+                        _last.clear()
                         _last.update(out)
                         return out
                     size = _atomic_write(path, text)
@@ -662,8 +707,8 @@ def export_now(reason: str = "manual", force: bool = False) -> dict:
                                prev=str(prev_path()) if prev_path().exists() else "")
                     _last_hash["local"] = digest
                     _db_sig["sig"] = db_signature()
-                    _dirty.clear()
-                    _dirty_reason["text"] = ""
+                    _clear_exported(generation)
+                    _last.clear()
                     _last.update(out)
                     log.info("Backup written: %s (%s bytes, %d quizzes, %d questions, %d attempts, "
                              "reason=%s)", path.name, f"{size:,}", data["counts"].get("quizzes", 0),
@@ -702,14 +747,23 @@ def reset_state() -> None:
 
 
 # --------------------------------------------------------------------- dirty tracking
+def _clear_exported(generation: int) -> None:
+    with _dirty_guard:
+        if _dirty_version["n"] == generation:
+            _dirty.clear()
+            _dirty_reason["text"] = ""
+
+
 def mark_dirty(reason: str = "db") -> None:
-    """Called after a committed database transaction (see ``database.py``)."""
+    """A committed write remains pending until a snapshot containing it is exported."""
     now = time.time()
-    if not _dirty.is_set():
-        _dirty_first["ts"] = now
-    _dirty_last["ts"] = now
-    _dirty_reason["text"] = reason or "db"
-    _dirty.set()
+    with _dirty_guard:
+        _dirty_version["n"] += 1
+        if not _dirty.is_set():
+            _dirty_first["ts"] = now
+        _dirty_last["ts"] = now
+        _dirty_reason["text"] = reason or "db"
+        _dirty.set()
 
 
 def pending() -> bool:
@@ -777,6 +831,8 @@ def github_payload(data: dict) -> dict:
         row.update(user_id=None, chat_id=None, request_id=None, consumed=1, redacted=True)
     for row in out.get("group_pdf_permissions") or []:
         row.update(user_id=None, redacted=True)
+    if out.get("history_integrity"):
+        out["history_integrity"]["missing_quizzes"] = _missing_quiz_inventory(out)
     return out
 
 
@@ -962,6 +1018,8 @@ def restore_payload(data: dict, db_file: Optional[Path] = None, apply: bool = Fa
                               "inserted": {}, "updated": {}, "skipped": {}, "target": str(db_file or db_path())}
     if problems:
         return result
+    if data.get("history_integrity"):
+        result["history_integrity"] = data["history_integrity"]
     target = Path(db_file) if db_file else db_path()
     con = sqlite3.connect(target, timeout=30)
     con.row_factory = sqlite3.Row
@@ -1178,6 +1236,9 @@ def run_once(now: Optional[float] = None, github_due: Optional[bool] = None) -> 
     """
     now = time.time() if now is None else now
     result: dict[str, Any] = {"exported": False, "github": None, "reason": ""}
+    if now < float(_last.get("retry_after") or 0):
+        result["reason"] = "validation-backoff"
+        return result
     if pending():
         reason = _dirty_reason["text"] or "db"
         debounce = float(getattr(config, "BACKUP_DEBOUNCE", 5))

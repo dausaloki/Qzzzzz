@@ -356,24 +356,35 @@ async def is_group_admin(bot, chat_id: int, user_id: int) -> bool:
     return member.status in (ChatMember.OWNER, ChatMember.ADMINISTRATOR)
 
 
-async def stop_cmd(update: Update, context) -> None:
-    if not is_private(update):
-        chat = update.effective_chat
-        s = db.get_active_group_session(chat.id)
-        if not s:
-            await chat.send_message("ℹ️ इस group में अभी कोई quiz नहीं चल रहा।")
-            return
-        uid = update.effective_user.id
-        if s["started_by"] != uid and not await is_group_admin(context.bot, chat.id, uid):
-            await chat.send_message("⛔ Quiz केवल उसे शुरू करने वाला या group admin रोक सकता है।")
-            return
-        if not await group_runner.stop_group_quiz(context.application, chat.id):
-            await chat.send_message("ℹ️ इस group में अभी कोई quiz नहीं चल रहा।")
+async def controls_cmd(update: Update, context, requested=None) -> None:
+    chat, user = update.effective_chat, update.effective_user
+    kind = "p" if is_private(update) else "g"
+    record = db.get_active_attempt(user.id) if kind == "p" else db.get_active_group_session(chat.id)
+    if not record:
+        await context.bot.send_message(chat.id, "No active quiz in this chat.")
         return
-    db.cancel_pdf_start_requests(update.effective_user.id)
-    done = await runner.stop_quiz(context.application, update.effective_user.id)
-    if not done:
-        await update.effective_chat.send_message("ℹ️ अभी कोई quiz नहीं चल रहा।", reply_markup=kb.main_menu())
+    if requested:
+        outcome = await runner.control_action(context.application, kind, record["id"], user.id,
+            chat.id, record["control_epoch"], requested)
+        if outcome != "ok":
+            await context.bot.send_message(chat.id, "ℹ️ " + outcome)
+        return
+    admin = config.is_admin(user.id) or (kind == "g" and await is_group_admin(context.bot, chat.id, user.id))
+    if record.get("is_paused"):
+        await runner.show_paused_controls(context.application, kind, record)
+    if admin:
+        await context.bot.send_message(chat.id, "Quiz admin controls", reply_markup=kb.quiz_control_markup(
+            kind, record["id"], record["control_epoch"], bool(record.get("is_paused")), menu=True))
+    elif not record.get("is_paused"):
+        await context.bot.send_message(chat.id, "Only bot admins or verified admins of this group can Pause, Stop or Restart.")
+
+
+async def stop_cmd(update: Update, context) -> None:
+    await controls_cmd(update, context, "stop")
+
+
+async def pause_cmd(update: Update, context) -> None:
+    await controls_cmd(update, context, "pause")
 
 
 async def skip_cmd(update: Update, context) -> None:
@@ -1117,6 +1128,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
     db.upsert_user(user)
     prefix = data.split(":", 1)[0]
+    if prefix == "qc":
+        await quiz_control_callback(update, context)
+        return
 
     if prefix == "fm":
         await format_settings_callback(update, context)
@@ -1235,10 +1249,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                                     start_msg_id=q.message.message_id if q.message else None)
             return
         if action == "stop":
-            await q.answer("⏹ Stopping…")
-            done = await runner.stop_quiz(context.application, user.id)
-            if not done:
-                await update.effective_chat.send_message("ℹ️ कोई quiz नहीं चल रहा।")
+            # Legacy buttons contain no session/revision; never apply them to a newer run.
+            await q.answer("Expired control. Open /controls for the current quiz.", show_alert=True)
         elif action == "skip":
             res = await runner.skip_current(context.application, user.id, q.message.message_id if q.message else None)
             await q.answer({"ok": "⏭ Skipped", "none": "कोई quiz नहीं चल रहा",
@@ -1489,6 +1501,7 @@ BOT_COMMANDS = [
     BotCommand("review", "Review PDF (पिछला quiz)"),
     BotCommand("htmlreport", "Interactive HTML Report"),
     BotCommand("backup", "Backup status (admin)"),
+    BotCommand("controls", "Quiz controls"), BotCommand("pause", "Pause quiz (admin)"),
 ]
 
 
@@ -1560,6 +1573,8 @@ def build_application(token: str, request=None, get_updates_request=None, rate_l
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(CommandHandler("controls", controls_cmd))
+    app.add_handler(CommandHandler("pause", pause_cmd))
     app.add_handler(CommandHandler("skip", skip_cmd))
     app.add_handler(CommandHandler("quiz", quiz_cmd))
     app.add_handler(CommandHandler("share", share_cmd))
@@ -1930,6 +1945,30 @@ async def format_settings_message(update: Update, context, state: str, data: dic
             await msg.reply_text(chunk,parse_mode=None)
     except (TelegramError,asyncio.TimeoutError):
         await msg.reply_text("⚠️ Telegram resolution/download failed. Configuration was not changed; retry after checking bot membership/permissions.")
+
+
+async def quiz_control_callback(update: Update, context) -> None:
+    query = update.callback_query
+    try:
+        _, kind, raw_sid, raw_epoch, action = (query.data or "").split(":")
+        sid, epoch = int(raw_sid), int(raw_epoch)
+        if (kind not in ("p", "g") or not 0 < sid < 2**63 or not 0 <= epoch < 2**63
+                or action not in ("pause", "resume", "stop", "confirm_stop", "restart", "confirm", "cancel")):
+            raise ValueError("Invalid control")
+    except (ValueError, TypeError):
+        await query.answer("Invalid or outdated quiz control.", show_alert=True)
+        return
+    chat, user = update.effective_chat, update.effective_user
+    record = db.get_attempt(sid) if kind == "p" else db.get_group_session(sid)
+    if not record or record["chat_id"] != chat.id or (kind == "p") != is_private(update):
+        await query.answer("This control belongs to another session/chat.", show_alert=True)
+        return
+    # Acknowledge before membership lookup, poll closure or any other Telegram I/O.
+    await query.answer()
+    outcome = await runner.control_action(context.application, kind, sid, user.id, chat.id,
+        epoch, action)
+    if outcome != "ok":
+        await context.bot.send_message(chat.id, "ℹ️ " + outcome)
 
 
 def main() -> None:

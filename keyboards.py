@@ -283,22 +283,23 @@ def group_review_markup(session_id: int) -> M:
     return M([[B("📄 मेरा Review PDF (private)", callback_data=f"p:g:{session_id}")]])
 
 
-def running_markup(control=None) -> M:
-    rows=[[B("⏭ Skip", callback_data="r:skip"), B("⏹ Stop", callback_data="r:stop")]]
-    if control:
-        kind,sid,epoch=control
-        rows.append([B("⏸ Pause Quiz",callback_data=f"qc:{kind}:{sid}:{epoch}:pause")])
-    return M(rows)
+def running_markup(control=None):
+    return None  # No controls underneath running questions; use /controls or /skip.
 
 
-def quiz_control_markup(kind: str, sid: int, epoch: int, paused: bool, confirm: bool = False) -> M:
-    def button(label,action):
-        return B(label,callback_data=f"qc:{kind}:{sid}:{epoch}:{action}")
+def quiz_control_markup(kind: str, sid: int, epoch: int, paused: bool, confirm=False, menu=False) -> M:
+    def button(label, action):
+        return B(label, callback_data=f"qc:{kind}:{sid}:{epoch}:{action}")
     if confirm:
-        return M([[button("✅ Confirm Restart","confirm")],[button("↩️ Keep paused quiz","cancel")]])
+        stop = confirm == "stop"
+        return M([[button("✅ Confirm Stop" if stop else "✅ Confirm Restart", "confirm_stop" if stop else "confirm")],
+                  [button("↩️ Keep paused quiz", "cancel")]])
+    if menu:
+        return M([[button("🔄 Restart Quiz", "restart")], [button("⏹ Stop Quiz", "stop")]] if paused else
+                 [[button("⏸ Pause Quiz", "pause")], [button("🔄 Restart Quiz", "restart")], [button("⏹ Stop Quiz", "stop")]])
     if paused:
-        return M([[button("▶️ Resume Quiz","resume")],[button("🔄 Restart Quiz","restart")]])
-    return M([[button("⏸ Pause Quiz","pause")]])
+        return M([[button("▶️ Resume Quiz", "resume")], [button("⏹ Stop Quiz", "stop")]])
+    return M([[button("⏸ Pause Quiz", "pause")]])
 
 
 def settings_menu(user: dict, support_url: Optional[str] = None) -> M:

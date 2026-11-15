@@ -96,7 +96,7 @@ def ready_text(quiz: dict) -> str:
     if neg > 0:
         lines.append(f"➖ Negative Marking: -{quiz_modes.negative_label(neg)} प्रति गलत उत्तर")
     lines += ["",
-              "तैयार होने पर नीचे button दबाएँ। रोकने के लिए /stop, प्रश्न छोड़ने के लिए /skip भेजें।"]
+              "तैयार होने पर नीचे button दबाएँ। Quiz controls: /controls (admin), प्रश्न छोड़ने के लिए /skip।"]
     return "\n".join(lines)
 
 
@@ -105,7 +105,7 @@ async def send_ready(app: Application, user, chat_id: int, qid: str,
     """Ready card: explicit PDF choice when enabled, legacy Start when disabled."""
     bot = app.bot
     quiz = db.get_quiz(qid)
-    if not quiz:
+    if not quiz or quiz.get("status") == "archived":
         await bot.send_message(chat_id, "❌ Quiz नहीं मिला (शायद delete हो चुका है)।", reply_markup=kb.main_menu())
         return False
     if quiz.get("status") == "draft" and quiz["owner_id"] != user.id:
@@ -141,7 +141,7 @@ async def start_quiz(app: Application, user, chat_id: int, qid: str, chat_type: 
         # Safety net: sessions are always private (see bot.py group handling).
         raise ValueError("Quiz sessions run only in private chat")
     quiz = db.get_quiz(qid)
-    if not quiz:
+    if not quiz or quiz.get("status") == "archived":
         await bot.send_message(chat_id, "❌ Quiz नहीं मिला (शायद delete हो चुका है)।", reply_markup=kb.main_menu())
         return None
     questions = db.get_questions(qid)
@@ -170,12 +170,8 @@ async def start_quiz(app: Application, user, chat_id: int, qid: str, chat_type: 
             await bot.send_message(chat_id, "⌛ यह PDF choice पहले इस्तेमाल हो चुकी है या expire हो गई। Quiz दोबारा खोलें।")
             return None
         if old:
-            had_answers = bool((old.get("correct") or 0) + (old.get("wrong") or 0) > 0)
-            await _stop_locked(
-                app, old, notify=True,
-                reason="नया quiz शुरू करने पर पिछला quiz रोक दिया गया।",
-                auto_pdf=had_answers,
-            )
+            await bot.send_message(chat_id, "An active quiz already exists. Use /controls; an admin must confirm Stop or Restart before a new run.")
+            return None
         order = engine.build_order([q["id"] for q in questions], bool(quiz["shuffle_questions"]))
         attempt_id = db.create_attempt(qid, user.id, chat_id, order, int(quiz["timer"] or 0),
                                        bool(quiz["shuffle_options"]), time.time(), start_msg_id,
@@ -188,6 +184,8 @@ async def start_quiz(app: Application, user, chat_id: int, qid: str, chat_type: 
     except Forbidden:
         db.finish_attempt(attempt_id, "stopped", 0)
         return None
+    except TelegramError as exc:
+        log.warning("Quiz intro unavailable; continuing to question delivery: %s", exc)
     async with user_lock(user.id):
         await send_current(app, attempt_id)
     return attempt_id
@@ -215,10 +213,25 @@ async def _send_pre_media(bot, chat_id: int, q: dict) -> None:
 
 
 async def send_current(app: Application, attempt_id: int) -> None:
+    try:
+        await send_current_impl(app, attempt_id)
+    except (TelegramError, asyncio.TimeoutError, db.DatabaseError, ValueError, TypeError, KeyError):
+        # Includes failures in the compact fallback, payload/media and DB finalisation.
+        # A send may have reached Telegram: never silently resend a claimed delivery.
+        log.exception("Question delivery failed: kind=p session=%s", attempt_id)
+        record = db.get_attempt(attempt_id)
+        await pause_session_locked(app, "p", record,
+            "Delivery interrupted; progress saved. Use /controls. If delivery is uncertain, an admin must verify the chat before confirmed Restart.")
+
+
+async def send_current_impl(app: Application, attempt_id: int) -> None:
     """Send the question at ``current_index``. Caller should hold the user lock."""
     bot = app.bot
     att = db.get_attempt(attempt_id)
     if not att or att["status"] != "active" or att.get("is_paused") or att.get("cur_poll_id"):
+        return
+    if not db.get_quiz(att["quiz_id"]):
+        await pause_session_locked(app, "p", att, "Original quiz content is missing. History is preserved; restore its original backup before continuing.")
         return
     idx, order = att["current_index"], att["order"]
     total = len(order)
@@ -571,12 +584,14 @@ async def _stop_locked(app: Application, att: dict, notify: bool = True, reason:
     return await _finish_locked(app, att, status="stopped", auto_pdf=auto_pdf)
 
 
-async def stop_quiz(app: Application, user_id: int, message_id: Optional[int] = None) -> Optional[dict]:
-    async with user_lock(user_id):
-        att = db.get_active_attempt(user_id)
-        if not att or (message_id is not None and att.get("cur_message_id") != message_id):
-            return None
-        return await _stop_locked(app, att)
+async def stop_quiz(app: Application, user_id: int, message_id: Optional[int] = None,
+                    *, actor_id=None, confirmation_epoch=None) -> Optional[dict]:
+    att = db.get_active_attempt(user_id)
+    if (not att or confirmation_epoch is None or actor_id is None
+            or (message_id is not None and att.get("cur_message_id") != message_id)):
+        return None
+    outcome = await control_action(app, "p", att["id"], actor_id, att["chat_id"], confirmation_epoch, "confirm_stop")
+    return db.get_attempt(att["id"]) if outcome == "ok" else None
 
 
 # ------------------------------------------------------------ recovery
@@ -589,6 +604,9 @@ async def recover_sessions(app: Application) -> dict:
         if att.get("is_paused"):
             await show_paused_controls(app,"p",att)
             continue  # Never expire, re-arm or resend a deliberately paused run.
+        if not db.get_quiz(att["quiz_id"]):
+            await pause_session_locked(app, "p", att, "Original quiz content is missing; history preserved. Restore the original backup to continue.")
+            continue
         if att.get("delivery_pending") or att.get("unanswered_streak",0)>=5:
             await pause_session_locked(app,"p",att,"Recovered safely paused: pending delivery or five unanswered questions.")
             continue
@@ -598,7 +616,9 @@ async def recover_sessions(app: Application) -> dict:
             stats["expired"] += 1
             continue
         if att.get("cur_poll_id"):
-            timer = float(att["control_remaining"]) if att.get("control_remaining") is not None else int(att.get("timer") or 0)
+            question = db.get_question(att["quiz_id"], att["cur_question_id"])
+            timer = float(att["control_remaining"]) if att.get("control_remaining") is not None else quiz_modes.resolve_question_timer(
+                db.get_quiz(att["quiz_id"]), question or {}, default_timer=int(att.get("timer") or 0))
             if timer > 0:
                 remaining = (att.get("cur_sent_ts") or now) + timer + config.TIMER_GRACE - now
                 _schedule(app, "timeout", att["id"], max(1.0, remaining),
@@ -648,7 +668,7 @@ async def show_paused_controls(app,kind,record):
 
 
 async def pause_session_locked(app,kind,record,reason) -> bool:
-    if not record or record["status"]!="active" or record.get("is_paused"):
+    if not record or record["status"] not in ("active", "pending") or record.get("is_paused"):
         return False
     remaining=None;perm=None;elapsed=0
     if record.get("cur_poll_id"):
@@ -680,41 +700,82 @@ async def pause_session_locked(app,kind,record,reason) -> bool:
 async def control_action(app,kind,sid,actor_id,chat_id,epoch,action,*,group_admin=False):
     if kind not in ("p","g"):
         return "Invalid session kind."
-    lock=user_lock(actor_id) if kind=="p" else group_runner.chat_lock(chat_id)
+    initial = _control_record(kind, sid)
+    if not initial or initial["chat_id"] != chat_id:
+        return "This session belongs to another chat."
+    lock = user_lock(initial["user_id"]) if kind == "p" else group_runner.chat_lock(chat_id)
     async with lock:
-        record=_control_record(kind,sid)
-        if not record or record["chat_id"]!=chat_id:
+        record = _control_record(kind, sid)
+        if not record or record["chat_id"] != chat_id:
             return "This session belongs to another chat."
-        if (kind=="p" and record["user_id"]!=actor_id) or (kind=="g" and record["started_by"]!=actor_id and not group_admin):
-            return "Not authorized to control this quiz."
-        if record["status"]!="active" or record.get("control_epoch",0)!=epoch:
+        admin = config.is_admin(actor_id)
+        if kind == "g" and action != "resume" and not admin:
+            try:
+                member = await app.bot.get_chat_member(chat_id, actor_id)
+                admin = member.status in ("creator", "administrator")
+            except TelegramError:
+                admin = False
+        if action == "resume":
+            if kind == "p" and record["user_id"] != actor_id:
+                return "Only the private quiz owner can Resume."
+            if kind == "g":
+                try:
+                    member = await app.bot.get_chat_member(chat_id, actor_id)
+                    if member.status in ("left", "kicked") or (member.status == "restricted" and not member.is_member):
+                        return "Only a current group participant can Resume."
+                except TelegramError:
+                    return "Cannot verify group membership. Retry later."
+        elif not admin:
+            return "Only bot admins or verified admins of this group can Pause, Stop or Restart."
+        pending_stop = kind == "g" and record["status"] == "pending" and action in ("stop", "confirm_stop", "cancel")
+        if (record["status"] != "active" and not pending_stop) or record.get("control_epoch",0)!=epoch:
             if record["status"]=="active" and record.get("is_paused"):
                 await show_paused_controls(app,kind,record)  # Recover UI without executing the stale action.
             return "This quiz control has expired; use the newest buttons."
         if action=="pause":
-            return "ok" if await pause_session_locked(app,kind,record,"Paused manually by the quiz controller.") else "Already paused."
+            return "ok" if await pause_session_locked(app,kind,record,"Paused manually by an authorized admin.") else "Already paused."
+        if action in ("restart", "stop"):
+            if not record.get("is_paused"):
+                await pause_session_locked(app, kind, record, "Paused pending admin confirmation.")
+                record = _control_record(kind, sid)
+                epoch = record["control_epoch"]
+            mode = 1 if action == "restart" else 2
+            if not db.control_confirmation(kind, sid, epoch, mode):
+                return "Expired control."
+            current = _control_record(kind, sid)
+            text = ("Restart from Question 1? Previous attempts/scores are retained. PDF consent does not carry forward."
+                    if action == "restart" else "Stop this quiz? Saved scores and history will be retained.")
+            if current.get("delivery_pending"):
+                text = "⚠️ Verify/close any poll from the uncertain send before confirming.\n" + text
+            await app.bot.send_message(chat_id, text, reply_markup=kb.quiz_control_markup(
+                kind, sid, current["control_epoch"], True, "stop" if action == "stop" else True))
+            return "ok"
         if not record.get("is_paused"):
             return "The quiz is not paused."
-        if action in ("restart","cancel"):
-            if not db.control_confirmation(kind,sid,epoch,action=="restart"):
+        if action == "cancel":
+            if not db.control_confirmation(kind, sid, epoch, 0):
                 return "Expired control."
-            current=_control_record(kind,sid)
-            text=("🔄 Restart from Question 1? New-run score/progress will reset; previous records are retained. "
-                  "Question order, timer and scoring snapshots stay unchanged. PDF consent does not carry into a new run."
-                  if action=="restart" else "⏸ Still paused; progress saved.")
-            if action=="restart" and record.get("delivery_pending"):
-                text="⚠️ Verify/close any poll from the uncertain send before confirming.\n"+text
-            await app.bot.send_message(chat_id,text,reply_markup=kb.quiz_control_markup(kind,sid,current["control_epoch"],True,action=="restart"))
+            await show_paused_controls(app, kind, _control_record(kind, sid))
             return "ok"
         if action in ("resume","confirm"):
             quiz=db.get_quiz(record["quiz_id"])
-            if not quiz or (quiz.get("status")=="draft" and quiz["owner_id"]!=actor_id):
+            if not quiz or (action == "confirm" and quiz.get("status") == "archived") or (quiz.get("status")=="draft" and quiz["owner_id"]!=actor_id):
                 return "Still paused: the quiz is missing or no longer available to this controller."
             allowed,_=access_control.check_quiz_access(actor_id,chat_id,quiz)
             if not allowed:
                 return "Still paused: existing quiz access rules do not currently permit this action."
         if not await _close_paused_poll(app,kind,record):
             return "Still paused: cannot confirm that the previous poll is closed. Retry Resume later."
+        if action == "confirm_stop":
+            if record.get("restart_confirm") != 2:
+                return "Stop confirmation expired or was not requested."
+            if kind == "p":
+                _cancel_jobs(app, sid)
+                await _finish_locked(app, record, status="stopped")
+            else:
+                group_runner._cancel(app, sid)
+                await group_runner._finish_locked(app, record, "stopped")
+            return "ok"
         if action=="resume":
             if record.get("delivery_pending"):
                 return "Still paused: previous poll delivery is uncertain. Verify the chat, then use confirmed Restart; no automatic duplicate will be sent."

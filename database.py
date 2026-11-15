@@ -665,7 +665,7 @@ def get_quiz(qid: str) -> Optional[dict]:
 def get_owner_quizzes(owner_id: int, include_drafts: bool = True) -> list[dict]:
     sql = """
         SELECT q.*, (SELECT COUNT(*) FROM questions WHERE quiz_id=q.id) AS question_count
-        FROM quizzes q WHERE owner_id=?
+        FROM quizzes q WHERE owner_id=? AND status!='archived'
     """
     if not include_drafts:
         sql += " AND status='ready'"
@@ -714,18 +714,14 @@ def update_quiz(qid: str, **fields) -> None:
 
 
 def delete_quiz(qid: str, owner_id: Optional[int] = None) -> bool:
+    """Hide a quiz without destroying questions, scores or active/history references."""
     with connect() as con:
-        if owner_id is None:
-            cur = con.execute("DELETE FROM quizzes WHERE id=?", (qid,))
-        else:
-            cur = con.execute("DELETE FROM quizzes WHERE id=? AND owner_id=?", (qid, owner_id))
-        deleted = cur.rowcount > 0
-        if deleted:
-            con.execute("DELETE FROM quiz_settings WHERE quiz_id=?", (qid,))
-            con.execute("DELETE FROM questions WHERE quiz_id=?", (qid,))
-            con.execute("""UPDATE attempts SET status='stopped', cur_poll_id=NULL
-                           WHERE quiz_id=? AND status='active'""", (qid,))
-    return deleted
+        sql = "UPDATE quizzes SET status='archived', updated_at=CURRENT_TIMESTAMP WHERE id=? AND status!='archived'"
+        args = [qid]
+        if owner_id is not None:
+            sql += " AND owner_id=?"
+            args.append(owner_id)
+        return con.execute(sql, args).rowcount == 1
 
 
 # -------------------------------------------------------------- questions
@@ -944,8 +940,11 @@ def create_attempt(qid: str, user_id: int, chat_id: int, order: list[int],
                    start_msg_id: Optional[int] = None, *, snapshot_rules: bool = False,
                    pdf_allowed: Optional[bool] = None, pdf_request_token: Optional[str] = None) -> int:
     with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        parent = con.execute("SELECT status FROM quizzes WHERE id=?", (qid,)).fetchone()
+        if not parent or parent["status"] == "archived":
+            raise ValueError("Quiz is missing or archived")
         if pdf_request_token:
-            con.execute("BEGIN IMMEDIATE")
             request = con.execute("""SELECT * FROM pdf_start_requests WHERE request_id=? AND user_id=?
                 AND chat_id=? AND quiz_id=? AND consumed=0 AND created_ts>=?""",
                 (pdf_request_token, user_id, chat_id, qid, time.time() - 1800)).fetchone()
@@ -1206,6 +1205,9 @@ def create_group_session(qid: str, chat_id: int, started_by: int, order: list[in
     the default), so later edits to the quiz never change a finished session's score."""
     with connect() as con:
         con.execute("BEGIN IMMEDIATE")
+        parent = con.execute("SELECT status FROM quizzes WHERE id=?", (qid,)).fetchone()
+        if not parent or parent["status"] == "archived":
+            raise ValueError("Quiz is missing or archived")
         busy = con.execute("SELECT id FROM group_sessions WHERE chat_id=? AND status IN ('active','pending')",
                            (chat_id,)).fetchone()
         if busy:
@@ -1907,7 +1909,7 @@ def pause_quiz_record(kind: str, sid: int, epoch: int, reason: str, remaining, p
             pause_poll_id=cur_poll_id,pause_message_id=cur_message_id,
             pause_stop_pending=CASE WHEN cur_poll_id IS NULL THEN 0 ELSE 1 END,
             pause_perm_json=?,control_remaining=?,pause_elapsed=?,paused_at=?,cur_poll_id=NULL,restart_confirm=0
-            WHERE id=? AND status='active' AND is_paused=0 AND control_epoch=?""",
+            WHERE id=? AND status IN ('active','pending') AND is_paused=0 AND control_epoch=?""",
             (reason,json.dumps(perm) if perm else None,remaining,elapsed,time.time(),sid,epoch))
         return cur.rowcount==1
 
@@ -1918,11 +1920,11 @@ def acknowledge_paused_poll(kind: str, sid: int, epoch: int) -> None:
         con.execute(f"UPDATE {table} SET pause_stop_pending=0 WHERE id=? AND is_paused=1 AND control_epoch=?",(sid,epoch))
 
 
-def control_confirmation(kind: str, sid: int, epoch: int, confirmed_prompt: bool) -> bool:
+def control_confirmation(kind: str, sid: int, epoch: int, confirmed_prompt: int) -> bool:
     table=_control_table(kind)
     with connect() as con:
         cur=con.execute(f"""UPDATE {table} SET restart_confirm=?,control_epoch=control_epoch+1
-            WHERE id=? AND status='active' AND is_paused=1 AND control_epoch=?""",
+            WHERE id=? AND status IN ('active','pending') AND is_paused=1 AND control_epoch=?""",
             (int(confirmed_prompt),sid,epoch))
         return cur.rowcount==1
 
@@ -1949,7 +1951,7 @@ def restart_quiz_record(kind: str, sid: int, epoch: int) -> Optional[int]:
         con.execute("BEGIN IMMEDIATE")
         old=con.execute(f"SELECT * FROM {table} WHERE id=?",(sid,)).fetchone()
         if (not old or old["status"]!="active" or not old["is_paused"] or old["control_epoch"]!=epoch
-                or not old["restart_confirm"] or old["pause_stop_pending"]):
+                or old["restart_confirm"] != 1 or old["pause_stop_pending"]):
             return None
         now=time.time()
         if kind=="p":

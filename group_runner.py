@@ -80,14 +80,14 @@ def ready_text(quiz: dict) -> str:
             f"🖊 {n} {'question' if n == 1 else 'questions'} · ⏱ {config.timer_label(group_timer(quiz))} per question\n\n"
             "▶️ दबाते ही quiz <b>इसी group में</b> शुरू होगा — हर सदस्य native quiz poll में उत्तर दे सकता है। "
             "आख़िरी प्रश्न के बाद leaderboard आएगा।\n"
-            "रोकने के लिए (quiz शुरू करने वाला या admin): /stop")
+            "Admin controls: /controls; रोकने के लिए admin confirmation आवश्यक है।")
 
 
 # ------------------------------------------------------------ start / send
 async def start_group_quiz(app: Application, chat_id: int, qid: str, user) -> str:
     """'ok' | 'busy' | 'missing' | 'empty' | 'draft' | 'denied'"""
     quiz = db.get_quiz(qid)
-    if not quiz:
+    if not quiz or quiz.get("status") == "archived":
         return "missing"
     if quiz.get("status") == "draft":
         return "draft"
@@ -144,6 +144,8 @@ async def _begin_locked(app: Application, session: dict, quiz: dict) -> None:
     except Forbidden:
         db.finish_group_session(sid, "stopped", time.time())
         return
+    except TelegramError as exc:
+        log.warning("Group intro unavailable; continuing to question delivery: %s", exc)
     await _send_current(app, sid)
 
 
@@ -194,14 +196,31 @@ async def _send_poll(bot, chat_id: int, payload, open_period: Optional[int], con
         chat_id=chat_id, question=payload.question, options=payload.options, type="quiz",
         correct_option_ids=[payload.correct_option_id], is_anonymous=False,
         allows_multiple_answers=False, explanation=payload.explanation, open_period=open_period,
-        reply_markup=kb.quiz_control_markup(*control,False) if control else None)
+        reply_markup=None)
 
 
 async def _send_current(app: Application, sid: int) -> None:
+    try:
+        await _send_current_impl(app, sid)
+    except (TelegramError, asyncio.TimeoutError, db.DatabaseError, ValueError, TypeError, KeyError):
+        # Includes failures in the compact fallback, payload/media and DB finalisation.
+        # A send may have reached Telegram: never silently resend a claimed delivery.
+        log.exception("Question delivery failed: kind=g session=%s", sid)
+        from quiz_runner import pause_session_locked
+        record = db.get_group_session(sid)
+        await pause_session_locked(app, "g", record,
+            "Delivery interrupted; progress saved. Use /controls. If delivery is uncertain, an admin must verify the chat before confirmed Restart.")
+
+
+async def _send_current_impl(app: Application, sid: int) -> None:
     """Send the question at current_index.  Caller holds the chat lock."""
     bot = app.bot
     s = db.get_group_session(sid)
     if not s or s["status"] != "active" or s.get("is_paused") or s.get("cur_poll_id"):
+        return
+    if not db.get_quiz(s["quiz_id"]):
+        from quiz_runner import pause_session_locked
+        await pause_session_locked(app, "g", s, "Original quiz content is missing. History preserved; restore its original backup before continuing.")
         return
     idx, order, chat_id = s["current_index"], s["order"], s["chat_id"]
     total = len(order)
@@ -394,17 +413,15 @@ async def _finish_locked(app: Application, s: dict, status: str) -> Optional[dic
     return done
 
 
-async def stop_group_quiz(app: Application, chat_id: int) -> Optional[dict]:
-    async with chat_lock(chat_id):
-        s = db.get_active_group_session(chat_id)
-        if not s:
-            return None
-        if s.get("cur_message_id"):
-            try:
-                await app.bot.stop_poll(chat_id, s["cur_message_id"])
-            except TelegramError:
-                pass
-        return await _finish_locked(app, s, "stopped")
+async def stop_group_quiz(app: Application, chat_id: int, *, actor_id=None,
+                          confirmation_epoch=None, group_admin=False) -> Optional[dict]:
+    s = db.get_active_group_session(chat_id)
+    if not s or actor_id is None or confirmation_epoch is None:
+        return None
+    from quiz_runner import control_action
+    outcome = await control_action(app, "g", s["id"], actor_id, chat_id, confirmation_epoch,
+                                   "confirm_stop", group_admin=group_admin)
+    return db.get_group_session(s["id"]) if outcome == "ok" else None
 
 
 async def recover_group_sessions(app: Application) -> dict:
@@ -419,6 +436,10 @@ async def recover_group_sessions(app: Application) -> dict:
         if s.get("is_paused"):
             from quiz_runner import show_paused_controls
             await show_paused_controls(app,"g",s)
+            continue
+        if not db.get_quiz(s["quiz_id"]):
+            from quiz_runner import pause_session_locked
+            await pause_session_locked(app, "g", s, "Original quiz content is missing; history preserved. Restore the original backup to continue.")
             continue
         if s.get("delivery_pending") or s.get("unanswered_streak",0)>=5:
             from quiz_runner import pause_session_locked
