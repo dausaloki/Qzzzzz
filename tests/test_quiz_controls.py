@@ -223,13 +223,16 @@ class Controls(unittest.IsolatedAsyncioTestCase):
 
     async def test_11_private_real_callback_pipeline_and_keyboard_buttons(self):
         await self.send()
-        buttons=[b for row in self.client.send_poll.await_args.kwargs['reply_markup'].inline_keyboard for b in row]
+        self.assertIsNone(self.client.send_poll.await_args.kwargs['reply_markup'])
+        update=NS(effective_chat=NS(id=OWNER,type='private'),effective_user=self.user)
+        await bot.controls_cmd(update,self.context)
+        buttons=[b for row in self.client.send_message.await_args.kwargs['reply_markup'].inline_keyboard for b in row]
         pause=next(b for b in buttons if b.text=='⏸ Pause Quiz')
         update=NS(callback_query=NS(data=pause.callback_data,answer=AsyncMock()),effective_chat=NS(id=OWNER,type='private'),effective_user=self.user)
         await bot.callback_router(update,self.context)
         self.assertTrue(self.record()['is_paused'])
         rows=self.client.send_message.await_args.kwargs['reply_markup'].inline_keyboard
-        self.assertEqual([b.text for row in rows for b in row],['▶️ Resume Quiz','🔄 Restart Quiz'])
+        self.assertEqual([b.text for row in rows for b in row],['▶️ Resume Quiz','⏹ Stop Quiz'])
         update.callback_query.data=rows[0][0].callback_data
         await bot.callback_router(update,self.context)
         self.assertFalse(self.record()['is_paused']);self.assertEqual(self.count,2)
@@ -488,7 +491,7 @@ class Controls(unittest.IsolatedAsyncioTestCase):
         self.client.send_message.side_effect=None
         await private.recover_sessions(self.app)
         buttons=[b for row in self.client.send_message.await_args.kwargs['reply_markup'].inline_keyboard for b in row]
-        self.assertEqual([b.text for b in buttons],['▶️ Resume Quiz','🔄 Restart Quiz'])
+        self.assertEqual([b.text for b in buttons],['▶️ Resume Quiz','⏹ Stop Quiz'])
         update=NS(callback_query=NS(data=buttons[0].callback_data,answer=AsyncMock()),
                   effective_chat=NS(id=OWNER,type='private'),effective_user=self.user)
         await bot.callback_router(update,self.context)
@@ -515,5 +518,398 @@ class Controls(unittest.IsolatedAsyncioTestCase):
         with db.connect() as con:self.assertEqual(con.execute('SELECT count(*) FROM attempts').fetchone()[0],1)
 
 
+
+
+    async def test_42_private_24_question_completion_through_real_jobs(self):
+        extra=[db.add_question(self.qid,f'Long run {i}', ['A','B','C','D'],0,'Why') for i in range(12)]
+        self.questions += extra
+        with db.connect() as con:
+            con.execute('UPDATE attempts SET order_json=?,total=24 WHERE id=?',(json.dumps(self.questions),self.private_id))
+        with patch.object(private.review_pdf,'auto_after_finish',new=AsyncMock()):
+            await self.send()
+            for i in range(24):
+                self.assertEqual(self.record()['current_index'],i)
+                await self.vote();await self.job('next')
+        r=self.record();self.assertEqual(r['status'],'finished');self.assertEqual(r['correct'],24)
+        self.assertEqual(len(db.get_answers(self.private_id)),24);self.assertEqual(self.count,24)
+        self.assertFalse(self.app.job_queue.get_jobs_by_name(f'next:{self.private_id}'))
+
+    async def test_43_group_24_question_completion_through_real_jobs(self):
+        self.questions += [db.add_question(self.qid,f'Group long run {i}',['A','B','C','D'],0,'Why') for i in range(12)]
+        with db.connect() as con:
+            con.execute('UPDATE group_sessions SET order_json=?,total=24 WHERE id=?',(json.dumps(self.questions),self.group_id))
+        with patch.object(group.review_pdf,'auto_group_after_finish',new=AsyncMock()):
+            await self.send('g')
+            for i in range(24):
+                self.assertEqual(self.record('g')['current_index'],i)
+                await self.vote('g',self.other);await self.job('timeout','g');await self.job('next','g')
+        r=self.record('g');self.assertEqual(r['status'],'finished');self.assertEqual(self.count,24)
+        self.assertEqual(db.group_leaderboard(self.group_id)[0]['correct'],24)
+        self.assertEqual(len(db.get_group_answers(self.group_id)),24)
+
+    async def test_44_starter_is_not_admin_and_cannot_pause_stop_restart(self):
+        await self.send();await self.send('g')
+        with patch.object(config,'is_admin',return_value=False):
+            for kind in ('p','g'):
+                for action in ('pause','stop','restart','confirm','confirm_stop'):
+                    self.assertNotEqual(await self.action(action,kind),'ok',(kind,action))
+                self.assertFalse(self.record(kind)['is_paused'])
+        self.client.get_chat_member.return_value=NS(status='administrator')
+        self.assertEqual(await self.action('pause','g',actor=OTHER),'ok')
+        # Group admin authority does not extend to a different private session.
+        self.assertNotEqual(await self.action('pause',actor=OTHER,admin=True),'ok')
+
+    async def test_45_any_current_group_participant_resumes_but_not_left_member(self):
+        await self.send('g');await self.action('pause','g')
+        epoch=self.record('g')['control_epoch']
+        self.client.get_chat_member.return_value=NS(status='left')
+        self.assertNotEqual(await self.action('resume','g',actor=OTHER),'ok')
+        self.assertEqual(self.record('g')['control_epoch'],epoch)
+        self.client.get_chat_member.return_value=NS(status='member')
+        self.assertEqual(await self.action('resume','g',actor=OTHER),'ok')
+        self.assertFalse(self.record('g')['is_paused']);self.assertEqual(self.count,2)
+
+    async def test_46_private_resume_owner_only_even_for_configured_admin(self):
+        await self.send();await self.action('pause')
+        with patch.object(config,'is_admin',return_value=True):
+            self.assertNotEqual(await self.action('resume',actor=OTHER),'ok')
+        self.assertEqual(await self.action('resume'),'ok')
+
+    async def test_47_stop_requires_confirmation_preserves_private_and_group_answers(self):
+        for kind in ('p','g'):
+            await self.send(kind);await self.vote(kind)
+            if kind=='p':await self.job('next')
+            r=self.record(kind)
+            self.assertNotEqual(await self.action('confirm_stop',kind),'ok')
+            self.assertEqual(await self.action('stop',kind),'ok')
+            self.assertEqual(self.record(kind)['status'],'active');self.assertTrue(self.record(kind)['is_paused'])
+            old=self.record(kind);epoch=old['control_epoch']
+            with patch.object(private.review_pdf,'auto_after_finish',new=AsyncMock()),patch.object(group.review_pdf,'auto_group_after_finish',new=AsyncMock()):
+                results=await asyncio.gather(*[self.action('confirm_stop',kind,epoch=epoch) for _ in range(12)])
+            self.assertEqual(results.count('ok'),1)
+            self.assertEqual(self.record(kind)['status'],'stopped')
+            answers=db.get_answers(self.private_id) if kind=='p' else db.get_group_answers(self.group_id)
+            self.assertEqual(len(answers),1)
+
+    async def test_48_stop_confirmation_cannot_be_used_as_restart_confirmation(self):
+        await self.send();await self.action('stop')
+        self.assertNotEqual(await self.action('confirm'),'ok')
+        self.assertEqual(self.record()['status'],'active')
+        with db.connect() as con:self.assertEqual(con.execute('SELECT count(*) FROM attempts').fetchone()[0],1)
+        await self.action('cancel');self.assertEqual(self.record()['restart_confirm'],0)
+        self.assertNotEqual(await self.action('confirm_stop'),'ok')
+
+    async def test_49_nonadmin_callbacks_and_legacy_stop_command_cannot_stop(self):
+        await self.send('g')
+        update=NS(callback_query=NS(data=f'qc:g:{self.group_id}:0:stop',answer=AsyncMock()),
+                  effective_chat=NS(id=CHAT,type='supergroup'),effective_user=self.user)
+        with patch.object(config,'is_admin',return_value=False):
+            await bot.callback_router(update,self.context)
+            await bot.stop_cmd(update,self.context)
+        self.assertEqual(self.record('g')['status'],'active');self.assertFalse(self.record('g')['is_paused'])
+        self.assertIsNone(await private.stop_quiz(self.app,OWNER))
+        self.assertIsNone(await group.stop_group_quiz(self.app,CHAT))
+
+    async def test_50_racing_resume_restart_and_stop_single_revision(self):
+        await self.send('g');await self.action('pause','g')
+        epoch=self.record('g')['control_epoch']
+        results=await asyncio.gather(self.action('resume','g',actor=OTHER,epoch=epoch),
+            self.action('restart','g',epoch=epoch),self.action('stop','g',epoch=epoch))
+        self.assertEqual(results.count('ok'),1)
+        with db.connect() as con:self.assertEqual(con.execute("SELECT count(*) FROM group_sessions WHERE status='active'").fetchone()[0],1)
+        self.assertLessEqual(self.count,2)
+
+    async def test_51_timeout_and_network_error_in_compact_fallback_pause_both_runners(self):
+        from telegram.error import TimedOut
+        for kind,error in (('p',TimedOut('uncertain fallback')),('g',NetworkError('uncertain fallback'))):
+            self.client.send_poll.side_effect=[BadRequest('poll too long'),error]
+            await self.send(kind)
+            r=self.record(kind);self.assertTrue(r['is_paused']);self.assertEqual(r['delivery_pending'],1)
+            attempts=self.client.send_poll.await_count
+            await self.action('resume',kind)
+            await private.recover_sessions(self.app);await group.recover_group_sessions(self.app)
+            self.assertEqual(self.client.send_poll.await_count,attempts)
+
+    async def test_52_start_intro_network_error_does_not_strand_new_session(self):
+        # Stop the setUp fixture without touching its history, then exercise real start.
+        db.finish_attempt(self.private_id,'stopped',0)
+        with db.connect() as con:con.execute("UPDATE quizzes SET pre_text='Introduction' WHERE id=?",(self.qid,))
+        self.client.send_message.side_effect=NetworkError('intro unavailable')
+        aid=await private.start_quiz(self.app,self.user,OWNER,self.qid,start_msg_id=909)
+        self.assertIsNotNone(aid);self.assertIsNotNone(db.get_attempt(aid)['cur_poll_id'])
+        db.finish_group_session(self.group_id,'stopped',time.time())
+        self.assertEqual(await group.start_group_quiz(self.app,CHAT,self.qid,self.user),'ok')
+        self.assertIsNotNone(db.get_active_group_session(CHAT)['cur_poll_id'])
+
+    async def test_53_missing_parent_backup_preserves_history_without_fabricated_quiz(self):
+        await self.send();await self.vote();await self.send('g');await self.vote('g',self.other)
+        before_answers=db.get_answers(self.private_id);before_votes=db.get_group_answers(self.group_id)
+        # Reproduce the old deployed hard-delete defect on disposable SQLite only.
+        with db.connect() as con:con.execute('DELETE FROM quizzes WHERE id=?',(self.qid,))
+        payload=backup.build_payload();self.assertEqual(payload['quizzes'],[])
+        self.assertEqual(backup.validate_payload(payload),[])
+        evidence=payload['history_integrity']['missing_quizzes'][0]
+        self.assertEqual(evidence['quiz_id'],self.qid)
+        self.assertEqual(evidence['attempts'],[self.private_id]);self.assertEqual(evidence['group_sessions'],[self.group_id])
+        self.assertEqual(payload['attempts'][0]['answers'],before_answers)
+        self.assertEqual(payload['group_sessions'][0]['answers'],before_votes)
+        dest=Path(self.tmp.name)/'orphan-restored.sqlite3'
+        restored=backup.restore_payload(payload,db_file=dest,apply=True)
+        self.assertTrue(restored['ok'],restored);self.assertIn('history_integrity',restored)
+        db.set_db_path(dest)
+        self.assertIsNone(db.get_quiz(self.qid));self.assertEqual(db.get_answers(self.private_id),before_answers)
+        self.assertEqual(db.get_group_answers(self.group_id),before_votes)
+        self.assertEqual(backup.validate_payload(backup.build_payload()),[])
+
+    async def test_54_missing_parent_inventory_cannot_silently_allow_unlisted_rows(self):
+        with db.connect() as con:con.execute('DELETE FROM quizzes WHERE id=?',(self.qid,))
+        data=backup.build_payload();self.assertFalse(backup.validate_payload(data))
+        missing=copy.deepcopy(data);missing.pop('history_integrity')
+        self.assertTrue(any('unknown quiz_id' in e for e in backup.validate_payload(missing)))
+        wrong=copy.deepcopy(data);wrong['history_integrity']['missing_quizzes'][0]['attempts']=[]
+        self.assertTrue(any('history_integrity' in e for e in backup.validate_payload(wrong)))
+        mismatch=copy.deepcopy(data);mismatch['attempts'][0]['quiz_id']='different-missing-id'
+        self.assertTrue(backup.validate_payload(mismatch))
+        self.assertFalse(backup.restore_payload(mismatch,apply=True)['ok'])
+
+    async def test_55_soft_delete_keeps_real_content_scores_and_active_run(self):
+        await self.send();await self.vote();await self.job('next');before=self.record()
+        questions=db.get_questions(self.qid);answers=db.get_answers(self.private_id)
+        self.assertFalse(db.delete_quiz(self.qid,owner_id=OTHER))
+        self.assertTrue(db.delete_quiz(self.qid,owner_id=OWNER))
+        self.assertEqual(db.get_quiz(self.qid)['status'],'archived')
+        self.assertEqual(db.get_questions(self.qid),questions);self.assertEqual(db.get_answers(self.private_id),answers)
+        self.assertEqual(self.record(),before);self.assertEqual(db.get_owner_quizzes(OWNER),[])
+        self.assertFalse(await private.send_ready(self.app,self.user,OWNER,self.qid))
+        self.assertEqual(await group.start_group_quiz(self.app,CHAT,self.qid,self.user),'missing')
+        self.assertFalse(backup.validate_payload(backup.build_payload()))
+        # Archiving doesn't interrupt an existing active run.
+        await self.vote();await self.job('next');self.assertEqual(self.record()['current_index'],2)
+
+    async def test_56_database_creation_rejects_missing_or_archived_parent(self):
+        for qid in ('not-a-real-quiz',self.qid):
+            if qid==self.qid:db.delete_quiz(qid)
+            with self.assertRaises(ValueError):db.create_attempt(qid,OTHER,OTHER,[],45,False,time.time())
+            with self.assertRaises(ValueError):db.create_group_session(qid,CHAT-1,OTHER,[],45,False,time.time())
+
+    async def test_57_orphan_export_writes_valid_full_backup_and_keeps_previous_backup(self):
+        path=Path(self.tmp.name)/'quiz_backup.json'
+        with patch.object(backup,'backup_path',return_value=path):
+            backup.reset_state()
+            good=backup.export_now(force=True);self.assertTrue(good['ok'],good)
+            previous=path.read_bytes()
+            with db.connect() as con:con.execute('DELETE FROM quizzes WHERE id=?',(self.qid,))
+            result=backup.export_now(force=True)
+            self.assertTrue(result['ok'],result);self.assertIn('history_integrity',result)
+            data=json.loads(path.read_text());self.assertEqual(data['attempts'][0]['id'],self.private_id)
+            self.assertFalse(backup.validate_payload(data))
+            # Existing backup rotation remains enabled and non-empty.
+            self.assertTrue(backup.prev_path().exists())
+        backup.reset_state()
+
+    async def test_58_invalid_snapshot_has_backoff_and_does_not_overwrite_good_backup(self):
+        path=Path(self.tmp.name)/'quiz_backup.json'
+        with patch.object(backup,'backup_path',return_value=path):
+            backup.reset_state();self.assertTrue(backup.export_now(force=True)['ok']);good=path.read_bytes()
+            data=backup.build_payload();data['attempts'][0]['quiz_id']='undeclared'
+            with patch.object(backup,'build_payload',return_value=data) as build:
+                result=backup.export_now(force=True)
+                self.assertFalse(result['ok']);self.assertEqual(build.call_count,1)
+                self.assertEqual(path.read_bytes(),good)
+                tick=backup.run_once(now=time.time());self.assertEqual(tick['reason'],'validation-backoff')
+                self.assertEqual(build.call_count,1)
+        backup.reset_state()
+
+    async def test_59_backup_reader_does_not_take_runner_mutex_and_snapshot_is_consistent(self):
+        import threading
+        began=threading.Event();finished=threading.Event();errors=[]
+        def export():
+            began.set()
+            try:self.assertFalse(backup.validate_payload(backup.build_payload()))
+            except Exception as e:errors.append(e)
+            finally:finished.set()
+        with db._lock:
+            thread=threading.Thread(target=export);thread.start();self.assertTrue(began.wait(2))
+            # An old db.connect()-based exporter could not finish while this lock was held.
+            self.assertTrue(finished.wait(3),'Backup blocked on the runner mutex')
+        thread.join(3);self.assertEqual(errors,[])
+        # A writer committing between table reads cannot leak into the pinned snapshot.
+        original=backup._select;changed=[]
+        def select(con,table,order):
+            rows=original(con,table,order)
+            if table=='quizzes' and not changed:
+                changed.append(True);db.new_quiz(OWNER,'Committed after snapshot')
+            return rows
+        with patch.object(backup,'_select',side_effect=select):data=backup.build_payload()
+        self.assertEqual(len(data['quizzes']),1);self.assertEqual(len(db.get_owner_quizzes(OWNER)),2)
+        self.assertFalse(backup.validate_payload(data))
+
+    async def test_60_dirty_write_after_snapshot_is_not_lost(self):
+        path=Path(self.tmp.name)/'quiz_backup.json';original=backup.build_payload
+        def build():
+            data=original();backup.mark_dirty('write-after-snapshot');return data
+        with patch.object(backup,'backup_path',return_value=path),patch.object(backup,'build_payload',side_effect=build):
+            backup.reset_state();backup.mark_dirty('before');result=backup.export_now(force=True)
+            self.assertTrue(result['ok'],result);self.assertTrue(backup.pending())
+        backup.reset_state()
+
+    async def test_61_missing_original_content_pauses_without_consuming_questions(self):
+        with db.connect() as con:con.execute('DELETE FROM quizzes WHERE id=?',(self.qid,))
+        await self.send();await self.send('g')
+        for kind in ('p','g'):
+            self.assertTrue(self.record(kind)['is_paused']);self.assertEqual(self.record(kind)['current_index'],0)
+            self.assertNotEqual(await self.action('resume',kind),'ok')
+        self.assertEqual(self.count,0)
+
+    async def test_62_legacy_valid_payload_still_restores_without_manifest(self):
+        payload=backup.build_payload();self.assertNotIn('history_integrity',payload)
+        dest=Path(self.tmp.name)/'legacy.sqlite3'
+        result=backup.restore_payload(payload,db_file=dest,apply=True)
+        self.assertTrue(result['ok'],result)
+        again=backup.restore_payload(payload,db_file=dest,apply=True);self.assertTrue(again['ok'],again)
+        with sqlite3.connect(dest) as con:
+            self.assertEqual(con.execute('SELECT count(*) FROM attempts').fetchone()[0],1)
+            self.assertEqual(con.execute('SELECT count(*) FROM questions').fetchone()[0],12)
+
+    async def test_63_group_membership_verification_failure_denies_privilege_not_starter_exception(self):
+        with patch.object(config,'is_admin',return_value=False):
+            self.client.get_chat_member.side_effect=NetworkError('cannot verify')
+            self.assertNotEqual(await self.action('pause','g',admin=True),'ok')
+            self.assertFalse(self.record('g')['is_paused'])
+        self.client.get_chat_member.side_effect=None
+
+    async def test_64_group_pdf_lobby_can_be_stopped_with_admin_confirmation(self):
+        db.finish_group_session(self.group_id,'stopped',time.time())
+        sid=db.create_group_session(self.qid,CHAT,OWNER,self.questions,45,True,time.time(),pending=True)
+        self.assertEqual(await self.action('stop','g',sid=sid),'ok')
+        self.assertEqual(db.get_group_session(sid)['status'],'pending')
+        self.assertEqual(await self.action('confirm_stop','g',sid=sid),'ok')
+        self.assertEqual(db.get_group_session(sid)['status'],'stopped')
+
+    async def test_65_separate_menu_restart_is_available_while_running_and_confirmation_is_required(self):
+        await self.send()
+        self.assertIsNone(self.client.send_poll.await_args.kwargs['reply_markup'])
+        await self.send('g')
+        self.assertIsNone(self.client.send_poll.await_args.kwargs['reply_markup'])
+        update=NS(effective_chat=NS(id=OWNER,type='private'),effective_user=self.user)
+        await bot.controls_cmd(update,self.context)
+        buttons=[b for row in self.client.send_message.await_args.kwargs['reply_markup'].inline_keyboard for b in row]
+        restart=next(b for b in buttons if b.text=='🔄 Restart Quiz')
+        update.callback_query=NS(data=restart.callback_data,answer=AsyncMock())
+        await bot.callback_router(update,self.context)
+        self.assertEqual(db.get_active_attempt(OWNER)['id'],self.private_id)
+        self.assertTrue(self.record()['is_paused']);self.assertEqual(self.record()['restart_confirm'],1)
+        self.assertEqual(self.count,2)
+
+    async def test_66_old_start_card_cannot_silently_stop_and_replace_active_quiz(self):
+        await self.send()
+        second=db.new_quiz(OWNER,'Second quiz');db.add_question(second,'Q',['A','B'],0,'')
+        self.assertIsNone(await private.start_quiz(self.app,self.user,OWNER,second,start_msg_id=12345))
+        self.assertEqual(self.record()['status'],'active');self.assertEqual(db.get_active_attempt(OWNER)['id'],self.private_id)
+        self.assertEqual(self.count,1)
+
+    async def test_67_pdf_request_orphans_inventory_and_redacted_backup_do_not_leak_request_tokens(self):
+        surviving=db.new_quiz(OWNER,'Surviving quiz')
+        token=db.new_pdf_start_request(surviving,OWNER,OWNER,777)
+        with db.connect() as con:con.execute('DELETE FROM quizzes WHERE id=?',(self.qid,))
+        data=backup.build_payload();self.assertFalse(backup.validate_payload(data))
+        self.assertIn('history_integrity',data)
+        redacted=backup.github_payload(data)
+        self.assertNotIn(token,json.dumps(redacted))
+        self.assertFalse(backup.restore_payload(redacted,apply=True)['ok'])
+
+    async def test_68_callback_is_acknowledged_before_admin_network_lookup(self):
+        await self.send('g');events=[]
+        async def ack(*args,**kwargs):events.append('ack')
+        async def member(*args,**kwargs):events.append('lookup');return NS(status='administrator')
+        self.client.get_chat_member.side_effect=member
+        update=NS(callback_query=NS(data=f'qc:g:{self.group_id}:0:pause',answer=AsyncMock(side_effect=ack)),
+                  effective_chat=NS(id=CHAT,type='supergroup'),effective_user=self.other)
+        await bot.callback_router(update,self.context)
+        self.assertEqual(events[0],'ack');self.assertIn('lookup',events);self.assertTrue(self.record('g')['is_paused'])
+
+
+
+    async def test_69_missing_parent_recovery_pauses_existing_poll_without_advancing(self):
+        await self.send();await self.send('g')
+        with db.connect() as con:con.execute('DELETE FROM quizzes WHERE id=?',(self.qid,))
+        await private.recover_sessions(self.app);await group.recover_group_sessions(self.app)
+        for kind in ('p','g'):
+            self.assertTrue(self.record(kind)['is_paused']);self.assertEqual(self.record(kind)['current_index'],0)
+        self.assertEqual(self.count,2)
+
+    async def test_70_recovery_uses_effective_question_timer_not_wrong_default(self):
+        await self.send()
+        with patch.object(private.quiz_modes,'resolve_question_timer',return_value=91) as timer:
+            await private.recover_sessions(self.app)
+        timer.assert_called_once()
+        self.assertEqual(timer.call_args.kwargs['default_timer'],45)
+        self.assertEqual(timer.call_args.args[1]['id'],self.questions[0])
+        self.assertEqual(len(self.app.job_queue.get_jobs_by_name(f'timeout:{self.private_id}')),1)
+
+    async def test_71_archived_active_attempt_can_resume_but_cannot_be_restarted_as_fresh_run(self):
+        await self.send();db.delete_quiz(self.qid);await self.action('pause')
+        self.assertEqual(await self.action('resume'),'ok')
+        await self.action('restart');self.assertNotEqual(await self.action('confirm'),'ok')
+        with db.connect() as con:self.assertEqual(con.execute('SELECT count(*) FROM attempts').fetchone()[0],1)
+
+    async def test_72_new_quiz_button_racing_restart_cannot_create_multiple_private_sessions(self):
+        await self.send();await self.action('restart');epoch=self.record()['control_epoch']
+        results=await asyncio.gather(self.action('confirm',epoch=epoch),
+            private.start_quiz(self.app,self.user,OWNER,self.qid,start_msg_id=9876))
+        self.assertEqual(results[0],'ok');self.assertIsNone(results[1])
+        with db.connect() as con:self.assertEqual(con.execute("SELECT count(*) FROM attempts WHERE status='active'").fetchone()[0],1)
+
+    async def test_73_bootstrap_migration_remains_idempotent_with_history_integrity_payload(self):
+        await self.send();await self.vote();answers=db.get_answers(self.private_id)
+        db.init_db();db.init_db()
+        self.assertEqual(db.get_answers(self.private_id),answers);self.assertEqual(self.record()['correct'],1)
+        payload=backup.build_payload();self.assertNotIn('history_integrity',payload)
+        self.assertFalse(backup.validate_payload(payload))
+
+    async def test_74_stop_confirmation_from_other_group_is_rejected(self):
+        await self.send('g');await self.action('stop','g');epoch=self.record('g')['control_epoch']
+        self.assertNotEqual(await self.action('confirm_stop','g',epoch=epoch,chat=CHAT-1),'ok')
+        self.assertEqual(self.record('g')['status'],'active')
+        self.assertEqual(await self.action('confirm_stop','g',epoch=epoch),'ok')
+
+    async def test_75_backup_refuses_unattached_answer_rows_instead_of_silently_dropping_them(self):
+        await self.send();await self.vote()
+        # Model an old externally corrupted DB, exclusively inside this disposable fixture.
+        con=sqlite3.connect(db.get_db_path())
+        try:
+            con.execute('PRAGMA foreign_keys=OFF')
+            con.execute('DELETE FROM attempts WHERE id=?',(self.private_id,));con.commit()
+        finally:con.close()
+        data=backup.build_payload();self.assertEqual(data['counts']['orphans'],1)
+        self.assertTrue(any('unattached' in e for e in backup.validate_payload(data)))
+
+    async def test_76_empty_or_numeric_missing_quiz_ids_are_not_reclassified_as_valid_history(self):
+        with db.connect() as con:con.execute('DELETE FROM quizzes WHERE id=?',(self.qid,))
+        for value in ('',123,None):
+            with db.connect() as con:
+                # SQLite NOT NULL disallows None at rest; exercise the JSON validator for it.
+                con.execute('UPDATE attempts SET quiz_id=?',(str(value),))
+            data=backup.build_payload();data['attempts'][0]['quiz_id']=value
+            data['history_integrity']['missing_quizzes']=backup._missing_quiz_inventory(data)
+            self.assertTrue(backup.validate_payload(data),value)
+
+
+
+    async def test_77_legacy_unbound_stop_button_cannot_pause_or_stop_current_session(self):
+        await self.send()
+        update=NS(callback_query=NS(data='r:stop',answer=AsyncMock()),
+                  effective_chat=NS(id=OWNER,type='private'),effective_user=self.user)
+        await bot.callback_router(update,self.context)
+        self.assertEqual(self.record()['status'],'active');self.assertFalse(self.record()['is_paused'])
+        update.callback_query.answer.assert_awaited_once()
+
+    async def test_78_application_registers_controls_pause_stop_and_qc_router_without_network(self):
+        from telegram.ext import CommandHandler,CallbackQueryHandler
+        app=bot.build_application('123456:offline-test-placeholder-not-a-real-token')
+        commands={name for handlers in app.handlers.values() for handler in handlers if isinstance(handler,CommandHandler) for name in handler.commands}
+        self.assertTrue({'controls','pause','stop'} <= commands)
+        callbacks=[handler.callback for handlers in app.handlers.values() for handler in handlers if isinstance(handler,CallbackQueryHandler)]
+        self.assertIn(bot.callback_router,callbacks)
 
 if __name__=='__main__':unittest.main()
