@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
+import math
 import time
 from collections import defaultdict
 from typing import Optional
@@ -185,48 +187,55 @@ async def _send_pre(bot, chat_id: int, q: dict) -> None:
             await bot.send_message(chat_id, chunk)
 
 
-async def _send_poll(bot, chat_id: int, payload, open_period: Optional[int]):
+async def _send_poll(bot, chat_id: int, payload, open_period: Optional[int], control=None):
     for chunk in payload.full_text_chunks:
         await bot.send_message(chat_id, chunk)
     return await bot.send_poll(
         chat_id=chat_id, question=payload.question, options=payload.options, type="quiz",
         correct_option_ids=[payload.correct_option_id], is_anonymous=False,
-        allows_multiple_answers=False, explanation=payload.explanation, open_period=open_period)
+        allows_multiple_answers=False, explanation=payload.explanation, open_period=open_period,
+        reply_markup=kb.quiz_control_markup(*control,False) if control else None)
 
 
 async def _send_current(app: Application, sid: int) -> None:
     """Send the question at current_index.  Caller holds the chat lock."""
     bot = app.bot
     s = db.get_group_session(sid)
-    if not s or s["status"] != "active" or s.get("cur_poll_id"):
+    if not s or s["status"] != "active" or s.get("is_paused") or s.get("cur_poll_id"):
         return
     idx, order, chat_id = s["current_index"], s["order"], s["chat_id"]
     total = len(order)
     if idx >= total:
         await _finish_locked(app, s, "finished")
         return
+    if s.get("unanswered_streak",0)>=5:
+        from quiz_runner import pause_session_locked
+        await pause_session_locked(app,"g",s,"Auto-paused: nobody answered 5 consecutive group questions.")
+        return
     q = db.get_question(s["quiz_id"], order[idx])
     if q is None:                                   # deleted meanwhile
         db.close_group_question(sid, None)
         await _send_current(app, sid)
         return
+    if not db.claim_quiz_delivery("g",sid):
+        return
     quiz = db.get_quiz(s["quiz_id"])
-    perm = engine.make_permutation(len(q["options"]), bool(s["shuffle_options"]))
+    perm = json.loads(s["pause_perm_json"]) if s.get("pause_perm_json") else engine.make_permutation(len(q["options"]), bool(s["shuffle_options"]))
     try:
         payload = engine.build_poll_payload(q, perm, idx, total, presentation=engine.presentation_from(s), quiz_title=(quiz or {}).get("title", ""))
     except Exception:  # noqa: BLE001 — one bad question never stops the quiz
         log.exception("group payload failed for question %s", q["id"])
         payload = engine.compact_fallback(q, perm, idx, total, presentation=engine.presentation_from(s), quiz_title=(quiz or {}).get("title", ""))
-    timer = int(s["timer"] or config.GROUP_DEFAULT_TIMER)
-    open_period = timer if 5 <= timer <= 600 else None
+    timer = float(s["control_remaining"]) if s.get("control_remaining") is not None else int(s["timer"] or config.GROUP_DEFAULT_TIMER)
+    open_period = math.ceil(timer) if 5 <= timer <= 600 else None
     try:
         await _send_pre(bot, chat_id, q)
-        msg = await _send_poll(bot, chat_id, payload, open_period)
+        msg = await _send_poll(bot, chat_id, payload, open_period, control=("g",sid,s.get("control_epoch",0)))
     except BadRequest as exc:
         log.warning("group poll rejected (%s) — compact fallback", exc)
         payload = engine.compact_fallback(q, perm, idx, total, presentation=engine.presentation_from(s), quiz_title=(quiz or {}).get("title", ""))
         try:
-            msg = await _send_poll(bot, chat_id, payload, open_period)
+            msg = await _send_poll(bot, chat_id, payload, open_period, control=("g",sid,s.get("control_epoch",0)))
         except BadRequest as exc2:
             await bot.send_message(chat_id, f"⚠️ प्रश्न {idx + 1} भेजा नहीं जा सका ({exc2.message}) — अगला प्रश्न।")
             db.close_group_question(sid, None)
@@ -236,11 +245,10 @@ async def _send_current(app: Application, sid: int) -> None:
         log.info("bot removed from group %s — stopping session %s", chat_id, sid)
         db.finish_group_session(sid, "stopped", time.time())
         return
-    except (TimedOut, NetworkError) as exc:
-        _send_failures[sid] += 1
-        if _send_failures[sid] <= 5:
-            log.warning("network error sending group question, retrying: %s", exc)
-            _schedule(app, "next", sid, 3.0 * _send_failures[sid], {"sid": sid, "index": idx, "chat_id": chat_id})
+    except (TimedOut, NetworkError):
+        from quiz_runner import pause_session_locked
+        await pause_session_locked(app,"g",db.get_group_session(sid),
+            "Telegram send outcome is uncertain. Automatic retries stopped to avoid duplicate polls; verify before Restart.")
         return
     _send_failures.pop(sid, None)
     db.set_group_current(sid, msg.poll.id, msg.message_id, q["id"], idx, payload.perm,
@@ -265,6 +273,11 @@ async def _close_current_locked(app: Application, s: dict) -> None:
                 await bot.send_message(s["chat_id"], chunk)
         except TelegramError as exc:
             log.warning("could not send group explanation: %s", exc)
+    current=db.get_group_session(s["id"])
+    if current and current.get("unanswered_streak",0)>=5:
+        from quiz_runner import pause_session_locked
+        await pause_session_locked(app,"g",current,"Auto-paused: nobody answered 5 consecutive group questions.")
+        return
     _schedule(app, "next", s["id"], config.GROUP_NEXT_DELAY,
               {"sid": s["id"], "index": s["current_index"] + 1, "chat_id": s["chat_id"]})
 
@@ -273,7 +286,7 @@ async def _timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     d = context.job.data
     async with chat_lock(d["chat_id"]):
         s = db.get_group_session(d["sid"])
-        if not s or s["status"] != "active" or s.get("cur_poll_id") != d["poll_id"]:
+        if not s or s["status"] != "active" or s.get("is_paused") or s.get("cur_poll_id") != d["poll_id"]:
             return
         await _close_current_locked(context.application, s)
 
@@ -282,7 +295,7 @@ async def _next_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     d = context.job.data
     async with chat_lock(d["chat_id"]):
         s = db.get_group_session(d["sid"])
-        if not s or s["status"] != "active" or s.get("cur_poll_id") or s["current_index"] != d["index"]:
+        if not s or s["status"] != "active" or s.get("is_paused") or s.get("cur_poll_id") or s["current_index"] != d["index"]:
             return
         await _send_current(context.application, d["sid"])
 
@@ -294,22 +307,25 @@ async def handle_group_answer(update, context) -> bool:
     info = db.get_group_poll(ans.poll_id)
     if info is None:
         return False
-    if info["session_status"] != "active" or ans.user is None or not ans.option_ids:
+    async with chat_lock(info["chat_id"]):
+        info = db.get_group_poll(ans.poll_id)  # Recheck after acquiring the same lock as pause/timeout.
+        if info is None:
+            return True
+        if info["session_status"] != "active" or ans.user is None or not ans.option_ids:
+            return True
+        if info.get("cur_poll_id") != ans.poll_id:
+            return True                                 # question already closed — late answers never count
+        chosen = ans.option_ids[0]
+        perm = info["perm"]
+        if not 0 <= chosen < len(perm):
+            return True
+        db.upsert_user(ans.user)                       # name for the leaderboard
+        now = time.time()
+        db.record_group_answer(info["session_id"], info["quiz_id"], info["chat_id"], ans.poll_id,
+                               info["question_id"], info["q_index"], ans.user.id, chosen,
+                               engine.original_choice(perm, chosen), chosen == info["correct_display"],
+                               max(0.0, now - (info.get("sent_ts") or now)) + float(info.get("pause_elapsed") or 0), now)
         return True
-    if info.get("cur_poll_id") != ans.poll_id:
-        return True                                 # question already closed — late answers never count
-    chosen = ans.option_ids[0]
-    perm = info["perm"]
-    if not 0 <= chosen < len(perm):
-        return True
-    db.upsert_user(ans.user)                       # name for the leaderboard
-    now = time.time()
-    db.record_group_answer(info["session_id"], info["quiz_id"], info["chat_id"], ans.poll_id,
-                           info["question_id"], info["q_index"], ans.user.id, chosen,
-                           engine.original_choice(perm, chosen), chosen == info["correct_display"],
-                           max(0.0, now - (info.get("sent_ts") or now)), now)
-    return True
-
 
 # ------------------------------------------------------------ finish / stop
 def _name(r: dict) -> str:
@@ -400,11 +416,20 @@ async def recover_group_sessions(app: Application) -> dict:
             db.finish_group_session(s["id"], "expired", now)
             stats["expired"] += 1
     for s in db.list_active_group_sessions():
-        if s.get("started_ts") and now - s["started_ts"] > config.SESSION_EXPIRY_HOURS * 3600:
+        if s.get("is_paused"):
+            from quiz_runner import show_paused_controls
+            await show_paused_controls(app,"g",s)
+            continue
+        if s.get("delivery_pending") or s.get("unanswered_streak",0)>=5:
+            from quiz_runner import pause_session_locked
+            await pause_session_locked(app,"g",s,"Recovered safely paused: pending delivery or five unanswered questions.")
+            continue
+        if s.get("started_ts") and now - s["started_ts"] - float(s.get("paused_total") or 0) > config.SESSION_EXPIRY_HOURS * 3600:
             db.finish_group_session(s["id"], "expired", now)
             stats["expired"] += 1
         elif s.get("cur_poll_id"):
-            remaining = (s.get("cur_sent_ts") or now) + int(s["timer"]) + config.TIMER_GRACE - now
+            timer = float(s["control_remaining"]) if s.get("control_remaining") is not None else int(s["timer"])
+            remaining = (s.get("cur_sent_ts") or now) + timer + config.TIMER_GRACE - now
             _schedule(app, "timeout", s["id"], max(1.0, remaining),
                       {"sid": s["id"], "poll_id": s["cur_poll_id"], "chat_id": s["chat_id"]})
             stats["timers"] += 1

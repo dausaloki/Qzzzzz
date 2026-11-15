@@ -1120,6 +1120,14 @@ def _missing_for_expansion(con: sqlite3.Connection, rows: dict) -> list[str]:
             need.append((t, None))
     if nonzero("users", "batches_json"):
         need.append(("users", "batches_json"))
+    # Refuse restoring an active paused/control run into a schema that would
+    # silently drop its safety flags and start delivering questions again.
+    for t in ("attempts","group_sessions"):
+        for col in ("is_paused","unanswered_streak","control_epoch","pause_reason","pause_poll_id",
+                    "pause_message_id","pause_stop_pending","pause_perm_json","control_remaining",
+                    "delivery_pending","restart_confirm","restart_parent","pause_elapsed","paused_at","paused_total"):
+            if nonzero(t,col):
+                need.append((t,col))
     if nonzero("users", "txt_import_format_id"):
         need.append(("users", "txt_import_format_id"))
     for t in ("quizzes","attempts","group_sessions"):

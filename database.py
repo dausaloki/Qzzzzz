@@ -410,6 +410,21 @@ _MIGRATION_COLUMNS = {
         "created_at": "TEXT",
     },
     "attempts": {
+        "is_paused": "INTEGER NOT NULL DEFAULT 0",
+        "unanswered_streak": "INTEGER NOT NULL DEFAULT 0",
+        "control_epoch": "INTEGER NOT NULL DEFAULT 0",
+        "pause_reason": "TEXT DEFAULT ''",
+        "pause_poll_id": "TEXT",
+        "pause_message_id": "INTEGER",
+        "pause_stop_pending": "INTEGER NOT NULL DEFAULT 0",
+        "pause_perm_json": "TEXT",
+        "control_remaining": "REAL",
+        "pause_elapsed": "REAL NOT NULL DEFAULT 0",
+        "paused_at": "REAL",
+        "paused_total": "REAL NOT NULL DEFAULT 0",
+        "delivery_pending": "INTEGER NOT NULL DEFAULT 0",
+        "restart_confirm": "INTEGER NOT NULL DEFAULT 0",
+        "restart_parent": "INTEGER",
         "presentation_json": "TEXT",
         "pdf_allowed": "INTEGER",
         "timeouts": "INTEGER DEFAULT 0",
@@ -440,6 +455,21 @@ _MIGRATION_COLUMNS = {
     },
     # negative mark snapshot taken when a group quiz starts (0 = disabled, the default)
     "group_sessions": {
+        "is_paused": "INTEGER NOT NULL DEFAULT 0",
+        "unanswered_streak": "INTEGER NOT NULL DEFAULT 0",
+        "control_epoch": "INTEGER NOT NULL DEFAULT 0",
+        "pause_reason": "TEXT DEFAULT ''",
+        "pause_poll_id": "TEXT",
+        "pause_message_id": "INTEGER",
+        "pause_stop_pending": "INTEGER NOT NULL DEFAULT 0",
+        "pause_perm_json": "TEXT",
+        "control_remaining": "REAL",
+        "pause_elapsed": "REAL NOT NULL DEFAULT 0",
+        "paused_at": "REAL",
+        "paused_total": "REAL NOT NULL DEFAULT 0",
+        "delivery_pending": "INTEGER NOT NULL DEFAULT 0",
+        "restart_confirm": "INTEGER NOT NULL DEFAULT 0",
+        "restart_parent": "INTEGER",
         "presentation_json": "TEXT",
         "pdf_enabled_at_start": "INTEGER",
         "negative_mark": "REAL DEFAULT 0",
@@ -984,7 +1014,7 @@ def set_current_poll(attempt_id: int, poll_id: str, message_id: int, question_id
                      post_explanation: str = "") -> None:
     with connect() as con:
         con.execute("""
-            UPDATE attempts SET cur_poll_id=?, cur_message_id=?, cur_question_id=?,
+            UPDATE attempts SET delivery_pending=0,cur_poll_id=?, cur_message_id=?, cur_question_id=?,
                    cur_perm_json=?, cur_correct=?, cur_sent_ts=?, cur_post_explanation=?
             WHERE id=?
         """, (poll_id, message_id, question_id, json.dumps(perm), correct, sent_ts,
@@ -993,7 +1023,7 @@ def set_current_poll(attempt_id: int, poll_id: str, message_id: int, question_id
 
 def record_answer(attempt_id: int, question_id: int, position: int,
                   chosen_index: Optional[int], is_correct: bool, status: str,
-                  elapsed: float) -> None:
+                  elapsed: float) -> bool:
     """Save one answer and advance the attempt atomically.
 
     ``timeout`` (timer ran out) counts as skipped AND is counted separately in
@@ -1003,6 +1033,13 @@ def record_answer(attempt_id: int, question_id: int, position: int,
     sets = {"correct": "correct=correct+1", "wrong": "wrong=wrong+1", "skipped": "skipped=skipped+1",
             "timeout": "skipped=skipped+1, timeouts=timeouts+1"}[status]
     with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        current = con.execute("SELECT * FROM attempts WHERE id=?",(attempt_id,)).fetchone()
+        if (not current or current["status"] != "active" or current["is_paused"]
+                or current["current_index"] != position
+                or (current["cur_question_id"] is not None and current["cur_question_id"] != question_id)):
+            return False
+        streak = 0 if status in ("correct","wrong") else (current["unanswered_streak"] + bool(current["cur_poll_id"]))
         con.execute("""
             INSERT INTO answers(attempt_id,question_id,position,chosen_index,correct,status,elapsed)
             VALUES(?,?,?,?,?,?,?)
@@ -1012,9 +1049,11 @@ def record_answer(attempt_id: int, question_id: int, position: int,
             UPDATE attempts SET {sets}, score=correct+?, current_index=current_index+1,
                    cur_poll_id=NULL, cur_message_id=NULL, cur_question_id=NULL,
                    cur_perm_json=NULL, cur_correct=NULL, cur_sent_ts=NULL,
-                   cur_post_explanation=''
+                   cur_post_explanation='',unanswered_streak=?,control_epoch=control_epoch+1,
+                   pause_perm_json=NULL,control_remaining=NULL,pause_elapsed=0,delivery_pending=0
             WHERE id=?
-        """, (1 if status == "correct" else 0, attempt_id))
+        """, (1 if status == "correct" else 0, int(streak), attempt_id))
+        return True
 
 
 def finish_attempt(attempt_id: int, status: str, duration_sec: float) -> Optional[dict]:
@@ -1203,7 +1242,7 @@ def list_active_group_sessions() -> list[dict]:
 def set_group_current(session_id: int, poll_id: str, message_id: int, question_id: int, q_index: int,
                       perm: list[int], correct_display: int, sent_ts: float, post_explanation: str) -> None:
     with connect() as con:
-        con.execute("""UPDATE group_sessions SET cur_poll_id=?, cur_message_id=?, cur_question_id=?,
+        con.execute("""UPDATE group_sessions SET delivery_pending=0,cur_poll_id=?, cur_message_id=?, cur_question_id=?,
                        cur_sent_ts=?, cur_post_explanation=?, asked=MAX(asked, ?) WHERE id=?""",
                     (poll_id, message_id, question_id, sent_ts, post_explanation or "", q_index + 1, session_id))
         con.execute("""INSERT OR REPLACE INTO group_polls(poll_id,session_id,question_id,q_index,perm_json,
@@ -1217,18 +1256,23 @@ def close_group_question(session_id: int, poll_id: Optional[str]) -> bool:
     question was already closed (timer and /skip racing)."""
     with connect() as con:
         if poll_id is None:
-            cur = con.execute("""UPDATE group_sessions SET current_index=current_index+1
-                                 WHERE id=? AND status='active' AND cur_poll_id IS NULL""", (session_id,))
+            cur = con.execute("""UPDATE group_sessions SET current_index=current_index+1,control_epoch=control_epoch+1,
+                                 pause_perm_json=NULL,control_remaining=NULL,pause_elapsed=0,delivery_pending=0
+                                 WHERE id=? AND status='active' AND is_paused=0 AND cur_poll_id IS NULL""", (session_id,))
         else:
-            cur = con.execute("""UPDATE group_sessions SET current_index=current_index+1, cur_poll_id=NULL,
+            cur = con.execute("""UPDATE group_sessions SET unanswered_streak=CASE WHEN EXISTS(SELECT 1 FROM group_answers a
+                                 WHERE a.session_id=group_sessions.id AND a.q_index=group_sessions.current_index)
+                                 THEN 0 ELSE unanswered_streak+1 END,
+                                 control_epoch=control_epoch+1,pause_perm_json=NULL,control_remaining=NULL,pause_elapsed=0,
+                                 current_index=current_index+1, cur_poll_id=NULL,
                                  cur_message_id=NULL, cur_question_id=NULL, cur_post_explanation=''
-                                 WHERE id=? AND status='active' AND cur_poll_id=?""", (session_id, poll_id))
+                                 WHERE id=? AND status='active' AND is_paused=0 AND cur_poll_id=?""", (session_id, poll_id))
         return cur.rowcount > 0
 
 
 def get_group_poll(poll_id: str) -> Optional[dict]:
     with connect() as con:
-        row = con.execute("""SELECT p.*, s.quiz_id, s.chat_id, s.status AS session_status, s.cur_poll_id
+        row = con.execute("""SELECT p.*, s.quiz_id, s.chat_id, s.status AS session_status, s.cur_poll_id,s.pause_elapsed
                              FROM group_polls p JOIN group_sessions s ON s.id=p.session_id
                              WHERE p.poll_id=?""", (poll_id,)).fetchone()
     if not row:
@@ -1243,13 +1287,21 @@ def record_group_answer(session_id: int, quiz_id: str, chat_id: int, poll_id: st
                         is_correct: bool, elapsed: float, ts: float) -> bool:
     """False if this participant already answered this question (never overwritten)."""
     with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        live = con.execute("SELECT 1 FROM group_sessions WHERE id=? AND status='active' AND is_paused=0 AND cur_poll_id=? AND current_index=?",
+                           (session_id,poll_id,q_index)).fetchone()
+        if not live:
+            return False
         cur = con.execute("""
             INSERT OR IGNORE INTO group_answers(session_id,quiz_id,chat_id,poll_id,question_id,q_index,user_id,
                                                 chosen_display,chosen_index,is_correct,score,elapsed,answered_ts)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (session_id, quiz_id, chat_id, poll_id, question_id, q_index, user_id, chosen_display,
               chosen_index, int(bool(is_correct)), 1 if is_correct else 0, elapsed, ts))
-        return cur.rowcount > 0
+        accepted = cur.rowcount > 0
+        if accepted:
+            con.execute("UPDATE group_sessions SET unanswered_streak=0 WHERE id=?",(session_id,))
+        return accepted
 
 
 def finish_group_session(session_id: int, status: str, ts: float) -> Optional[dict]:
@@ -1830,3 +1882,86 @@ def finish_txt_forward(event_key: str, status: str, message_id: Optional[int] = 
     with connect() as con:
         con.execute("UPDATE txt_upload_deliveries SET status=?,message_id=?,updated_ts=? WHERE event_key=?",
                     (status,message_id,time.time(),event_key))
+
+
+# ------------------------------------------------ durable, revision-bound quiz controls
+
+def _control_table(kind: str) -> str:
+    if kind not in ("p","g"):
+        raise ValueError("Unknown session kind")
+    return "attempts" if kind == "p" else "group_sessions"
+
+
+def claim_quiz_delivery(kind: str, sid: int) -> bool:
+    table=_control_table(kind)
+    with connect() as con:
+        cur=con.execute(f"""UPDATE {table} SET delivery_pending=1 WHERE id=? AND status='active'
+            AND is_paused=0 AND cur_poll_id IS NULL AND delivery_pending=0""",(sid,))
+        return cur.rowcount==1
+
+
+def pause_quiz_record(kind: str, sid: int, epoch: int, reason: str, remaining, perm, elapsed: float = 0) -> bool:
+    table=_control_table(kind)
+    with connect() as con:
+        cur=con.execute(f"""UPDATE {table} SET is_paused=1,pause_reason=?,control_epoch=control_epoch+1,
+            pause_poll_id=cur_poll_id,pause_message_id=cur_message_id,
+            pause_stop_pending=CASE WHEN cur_poll_id IS NULL THEN 0 ELSE 1 END,
+            pause_perm_json=?,control_remaining=?,pause_elapsed=?,paused_at=?,cur_poll_id=NULL,restart_confirm=0
+            WHERE id=? AND status='active' AND is_paused=0 AND control_epoch=?""",
+            (reason,json.dumps(perm) if perm else None,remaining,elapsed,time.time(),sid,epoch))
+        return cur.rowcount==1
+
+
+def acknowledge_paused_poll(kind: str, sid: int, epoch: int) -> None:
+    table=_control_table(kind)
+    with connect() as con:
+        con.execute(f"UPDATE {table} SET pause_stop_pending=0 WHERE id=? AND is_paused=1 AND control_epoch=?",(sid,epoch))
+
+
+def control_confirmation(kind: str, sid: int, epoch: int, confirmed_prompt: bool) -> bool:
+    table=_control_table(kind)
+    with connect() as con:
+        cur=con.execute(f"""UPDATE {table} SET restart_confirm=?,control_epoch=control_epoch+1
+            WHERE id=? AND status='active' AND is_paused=1 AND control_epoch=?""",
+            (int(confirmed_prompt),sid,epoch))
+        return cur.rowcount==1
+
+
+def resume_quiz_record(kind: str, sid: int, epoch: int) -> bool:
+    table=_control_table(kind)
+    with connect() as con:
+        cur=con.execute(f"""UPDATE {table} SET is_paused=0,unanswered_streak=0,
+            control_epoch=control_epoch+1,restart_confirm=0,pause_reason='',
+            paused_total=paused_total+MAX(0,?-COALESCE(paused_at,?)),paused_at=NULL
+            WHERE id=? AND status='active' AND is_paused=1 AND control_epoch=?
+            AND pause_stop_pending=0 AND delivery_pending=0""",(time.time(),time.time(),sid,epoch))
+        return cur.rowcount==1
+
+
+def restart_quiz_record(kind: str, sid: int, epoch: int) -> Optional[int]:
+    """Archive the old run, never delete its answers; start exactly one clean run.
+
+    Order, rule/presentation snapshots and timers are copied, not reread from
+    edited quiz defaults. PDF consent is attempt-specific: never copied forward.
+    """
+    table=_control_table(kind)
+    with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        old=con.execute(f"SELECT * FROM {table} WHERE id=?",(sid,)).fetchone()
+        if (not old or old["status"]!="active" or not old["is_paused"] or old["control_epoch"]!=epoch
+                or not old["restart_confirm"] or old["pause_stop_pending"]):
+            return None
+        now=time.time()
+        if kind=="p":
+            paused=float(old["paused_total"] or 0)+max(0,now-(old["paused_at"] or now))
+            duration=max(0,now-(old["started_ts"] or now)-paused)
+            con.execute("UPDATE attempts SET status='stopped',control_epoch=control_epoch+1,finished_at=CURRENT_TIMESTAMP,duration_sec=? WHERE id=?",(duration,sid))
+        else:
+            con.execute("UPDATE group_sessions SET status='stopped',control_epoch=control_epoch+1,finished_ts=? WHERE id=?",(now,sid))
+        common=["quiz_id","chat_id","order_json","total","timer","shuffle_options","negative_mark","presentation_json"]
+        fields=common+(["user_id","quiz_mode","start_msg_id"] if kind=="p" else ["started_by"])
+        values=[old[key] for key in fields]
+        fields += ["started_ts","restart_parent", "pdf_allowed" if kind=="p" else "pdf_enabled_at_start"]
+        values += [now,sid,0]
+        cur=con.execute(f"INSERT INTO {table} ({','.join(fields)}) VALUES ({','.join('?' for _ in fields)})",values)
+        return cur.lastrowid

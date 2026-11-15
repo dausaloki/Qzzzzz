@@ -283,8 +283,22 @@ def group_review_markup(session_id: int) -> M:
     return M([[B("📄 मेरा Review PDF (private)", callback_data=f"p:g:{session_id}")]])
 
 
-def running_markup() -> M:
-    return M([[B("⏭ Skip", callback_data="r:skip"), B("⏹ Stop", callback_data="r:stop")]])
+def running_markup(control=None) -> M:
+    rows=[[B("⏭ Skip", callback_data="r:skip"), B("⏹ Stop", callback_data="r:stop")]]
+    if control:
+        kind,sid,epoch=control
+        rows.append([B("⏸ Pause Quiz",callback_data=f"qc:{kind}:{sid}:{epoch}:pause")])
+    return M(rows)
+
+
+def quiz_control_markup(kind: str, sid: int, epoch: int, paused: bool, confirm: bool = False) -> M:
+    def button(label,action):
+        return B(label,callback_data=f"qc:{kind}:{sid}:{epoch}:{action}")
+    if confirm:
+        return M([[button("✅ Confirm Restart","confirm")],[button("↩️ Keep paused quiz","cancel")]])
+    if paused:
+        return M([[button("▶️ Resume Quiz","resume")],[button("🔄 Restart Quiz","restart")]])
+    return M([[button("⏸ Pause Quiz","pause")]])
 
 
 def settings_menu(user: dict, support_url: Optional[str] = None) -> M:

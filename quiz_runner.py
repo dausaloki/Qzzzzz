@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
+import math
 import time
 from collections import defaultdict
 from typing import Optional
@@ -29,12 +31,17 @@ from keyboards import esc
 
 log = logging.getLogger(__name__)
 
-_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+_locks: dict[int, tuple[object, asyncio.Lock]] = {}
 _send_failures: dict[int, int] = defaultdict(int)
 
 
 def user_lock(user_id: int) -> asyncio.Lock:
-    return _locks[user_id]
+    loop=asyncio.get_running_loop()
+    entry=_locks.get(user_id)
+    if entry is None or entry[0] is not loop:
+        entry=(loop,asyncio.Lock())
+        _locks[user_id]=entry
+    return entry[1]
 
 
 def _job_name(kind: str, attempt_id: int) -> str:
@@ -153,6 +160,8 @@ async def start_quiz(app: Application, user, chat_id: int, qid: str, chat_type: 
         old = db.get_active_attempt(user.id)
         if old and start_msg_id is not None and old.get("start_msg_id") == start_msg_id \
                 and old["quiz_id"] == qid:
+            if old.get("is_paused"):
+                await show_paused_controls(app,"p",old)
             return None                      # double tap on the same Start button
         if db.pdf_review_enabled() and pdf_allowed is None:
             await send_ready(app, user, chat_id, qid, start_msg_id)
@@ -209,12 +218,15 @@ async def send_current(app: Application, attempt_id: int) -> None:
     """Send the question at ``current_index``. Caller should hold the user lock."""
     bot = app.bot
     att = db.get_attempt(attempt_id)
-    if not att or att["status"] != "active" or att.get("cur_poll_id"):
+    if not att or att["status"] != "active" or att.get("is_paused") or att.get("cur_poll_id"):
         return
     idx, order = att["current_index"], att["order"]
     total = len(order)
     if idx >= total:
         await _finish_locked(app, att, status="finished")
+        return
+    if att.get("unanswered_streak",0)>=5:
+        await pause_session_locked(app,"p",att,"Auto-paused: 5 consecutive questions were not attempted.")
         return
     q = db.get_question(att["quiz_id"], order[idx])
     if q is None:
@@ -222,10 +234,12 @@ async def send_current(app: Application, attempt_id: int) -> None:
         db.record_answer(attempt_id, order[idx], idx, None, False, "skipped", 0)
         await send_current(app, attempt_id)
         return
+    if not db.claim_quiz_delivery("p",attempt_id):
+        return
     chat_id = att["chat_id"]
     quiz = db.get_quiz(att["quiz_id"])
     mode = quiz_modes.normalize_mode(att.get("quiz_mode"))
-    perm = engine.make_permutation(len(q["options"]), bool(att["shuffle_options"]))
+    perm = json.loads(att["pause_perm_json"]) if att.get("pause_perm_json") else engine.make_permutation(len(q["options"]), bool(att["shuffle_options"]))
     try:
         payload = engine.build_poll_payload(q, perm, idx, total, presentation=engine.presentation_from(att), quiz_title=(quiz or {}).get("title", ""))
     except Exception:  # never let one bad question crash the quiz
@@ -233,6 +247,8 @@ async def send_current(app: Application, attempt_id: int) -> None:
         payload = engine.compact_fallback(q, perm, idx, total, presentation=engine.presentation_from(att), quiz_title=(quiz or {}).get("title", ""))
 
     timer = quiz_modes.resolve_question_timer(quiz, q, default_timer=int(att.get("timer") or 0))
+    if att.get("control_remaining") is not None:
+        timer=float(att["control_remaining"])
     # Section header notice when entering a new section in sectional mode (or when section timers exist)
     cur_sec = (q.get("section") or "").strip()
     if cur_sec and (mode == "sectional" or quiz_modes.get_section_timers(quiz)):
@@ -251,12 +267,12 @@ async def send_current(app: Application, attempt_id: int) -> None:
                 pass
 
     # Telegram accepts open_period 5..600 s; shorter values are enforced by our job only
-    open_period = timer if 5 <= timer <= 600 else None
+    open_period = math.ceil(timer) if 5 <= timer <= 600 else None
     exam_mode = (mode == "exam")
     sent = {"text": False}
     try:
         await _send_pre_media(bot, chat_id, q)
-        msg = await _send_poll(bot, chat_id, payload, open_period, sent, exam_mode=exam_mode)
+        msg = await _send_poll(bot, chat_id, payload, open_period, sent, exam_mode=exam_mode, control=("p",attempt_id,att.get("control_epoch",0)))
     except BadRequest as exc:
         log.warning("send_poll rejected (%s) — using compact fallback", exc)
         had_text = bool(payload.full_text_chunks) and sent["text"]
@@ -264,7 +280,7 @@ async def send_current(app: Application, attempt_id: int) -> None:
         if had_text:          # the identical full question text is already in the chat
             payload.full_text_chunks = []
         try:
-            msg = await _send_poll(bot, chat_id, payload, open_period, exam_mode=exam_mode)
+            msg = await _send_poll(bot, chat_id, payload, open_period, exam_mode=exam_mode, control=("p",attempt_id,att.get("control_epoch",0)))
         except BadRequest as exc2:
             log.error("compact poll also failed for question %s: %s", q["id"], exc2)
             await bot.send_message(chat_id, f"⚠️ प्रश्न {idx + 1} भेजा नहीं जा सका ({exc2.message}). इसे skip किया गया।")
@@ -275,14 +291,9 @@ async def send_current(app: Application, attempt_id: int) -> None:
         log.info("user blocked the bot; stopping attempt %s", attempt_id)
         db.finish_attempt(attempt_id, "stopped", time.time() - (att.get("started_ts") or time.time()))
         return
-    except (TimedOut, NetworkError) as exc:
-        _send_failures[attempt_id] += 1
-        if _send_failures[attempt_id] <= 5:
-            log.warning("network error sending question, retrying: %s", exc)
-            _schedule(app, "next", attempt_id, 3.0 * _send_failures[attempt_id],
-                      {"attempt_id": attempt_id, "index": idx, "user_id": att["user_id"]})
-        else:
-            log.error("giving up sending question for attempt %s", attempt_id)
+    except (TimedOut, NetworkError):
+        await pause_session_locked(app,"p",db.get_attempt(attempt_id),
+            "Telegram send outcome is uncertain. Automatic retries stopped to avoid duplicate polls; confirm Restart if needed.")
         return
     _send_failures.pop(attempt_id, None)
     db.set_current_poll(attempt_id, msg.poll.id, msg.message_id, q["id"], payload.perm,
@@ -293,7 +304,7 @@ async def send_current(app: Application, attempt_id: int) -> None:
 
 
 async def _send_poll(bot, chat_id: int, payload: engine.PollPayload, open_period: Optional[int],
-                     sent: Optional[dict] = None, *, exam_mode: bool = False):
+                     sent: Optional[dict] = None, *, exam_mode: bool = False, control=None):
     for chunk in payload.full_text_chunks:
         await bot.send_message(chat_id, chunk)
     if sent is not None and payload.full_text_chunks:
@@ -308,7 +319,7 @@ async def _send_poll(bot, chat_id: int, payload: engine.PollPayload, open_period
             is_anonymous=False,
             allows_multiple_answers=False,
             open_period=open_period,
-            reply_markup=kb.running_markup(),
+            reply_markup=kb.running_markup(control),
         )
     return await bot.send_poll(
         chat_id=chat_id,
@@ -320,7 +331,7 @@ async def _send_poll(bot, chat_id: int, payload: engine.PollPayload, open_period
         allows_multiple_answers=False,
         explanation=payload.explanation,
         open_period=open_period,
-        reply_markup=kb.running_markup(),
+        reply_markup=kb.running_markup(control),
     )
 
 
@@ -336,7 +347,7 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         att = db.get_attempt_by_poll(ans.poll_id)
         if att and att["user_id"] == ans.user.id:
             att = db.get_attempt(att["id"])
-            if not att or att["status"] != "active" or att.get("cur_poll_id") != ans.poll_id:
+            if not att or att["status"] != "active" or att.get("is_paused") or att.get("cur_poll_id") != ans.poll_id:
                 return
             _cancel_jobs(app, att["id"], ("timeout",))
             chosen = ans.option_ids[0]
@@ -344,13 +355,14 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if not 0 <= chosen < len(perm):
                 return
             is_correct = chosen == att["cur_correct"]
-            elapsed = time.time() - (att.get("cur_sent_ts") or time.time())
+            elapsed = time.time() - (att.get("cur_sent_ts") or time.time()) + float(att.get("pause_elapsed") or 0)
             post_expl = att.get("cur_post_explanation") or ""
             orig_choice = engine.original_choice(perm, chosen)
             status_str = "correct" if is_correct else "wrong"
             q_id = att["cur_question_id"]
-            db.record_answer(att["id"], q_id, att["current_index"],
-                             orig_choice, is_correct, status_str, elapsed)
+            if not db.record_answer(att["id"], q_id, att["current_index"],
+                                    orig_choice, is_correct, status_str, elapsed):
+                return
             mode = quiz_modes.normalize_mode(att.get("quiz_mode"))
             if mode == "exam":
                 pass  # Keep answers/explanations hidden until the exam finishes
@@ -381,7 +393,7 @@ async def _next_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data
     async with user_lock(data["user_id"]):
         att = db.get_attempt(data["attempt_id"])
-        if not att or att["status"] != "active" or att.get("cur_poll_id"):
+        if not att or att["status"] != "active" or att.get("is_paused") or att.get("cur_poll_id"):
             return
         if att["current_index"] != data["index"]:
             return
@@ -393,7 +405,7 @@ async def _timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
     async with user_lock(data["user_id"]):
         att = db.get_attempt(data["attempt_id"])
-        if not att or att["status"] != "active" or att.get("cur_poll_id") != data["poll_id"]:
+        if not att or att["status"] != "active" or att.get("is_paused") or att.get("cur_poll_id") != data["poll_id"]:
             return
         await _skip_current_locked(app, att, reason="⏰ समय समाप्त! प्रश्न skipped।", status="timeout")
 
@@ -406,10 +418,11 @@ async def _skip_current_locked(app: Application, att: dict, reason: str, status:
             await bot.stop_poll(att["chat_id"], att["cur_message_id"])
         except TelegramError:
             pass  # already closed by open_period
-    elapsed = time.time() - (att.get("cur_sent_ts") or time.time())
+    elapsed = time.time() - (att.get("cur_sent_ts") or time.time()) + float(att.get("pause_elapsed") or 0)
     post_expl = att.get("cur_post_explanation") or ""
     q_id = att["cur_question_id"]
-    db.record_answer(att["id"], q_id, att["current_index"], None, False, status, elapsed)
+    if not db.record_answer(att["id"], q_id, att["current_index"], None, False, status, elapsed):
+        return
     mode = quiz_modes.normalize_mode(att.get("quiz_mode"))
     text = reason
     if mode == "exam":
@@ -430,6 +443,10 @@ async def _skip_current_locked(app: Application, att: dict, reason: str, status:
         return
     except TelegramError as exc:
         log.warning("could not send skip notice: %s", exc)
+    current=db.get_attempt(att["id"])
+    if current and current.get("unanswered_streak",0)>=5:
+        await pause_session_locked(app,"p",current,"Auto-paused: 5 consecutive questions were not attempted.")
+        return
     _schedule(app, "next", att["id"], config.NEXT_QUESTION_DELAY / 2,
               {"attempt_id": att["id"], "index": att["current_index"] + 1, "user_id": att["user_id"]})
 
@@ -439,7 +456,7 @@ async def skip_current(app: Application, user_id: int, message_id: Optional[int]
         att = db.get_active_attempt(user_id)
         if not att:
             return "none"
-        if not att.get("cur_poll_id"):
+        if att.get("is_paused") or not att.get("cur_poll_id"):
             return "busy"
         if message_id is not None and att.get("cur_message_id") != message_id:
             return "expired"
@@ -483,7 +500,8 @@ def result_text(att: dict, quiz_title: str, stopped: bool, *,
 
 async def _finish_locked(app: Application, att: dict, status: str, *, auto_pdf: bool = True) -> Optional[dict]:
     _cancel_jobs(app, att["id"])
-    duration = time.time() - (att.get("started_ts") or time.time())
+    duration = max(0,time.time() - (att.get("started_ts") or time.time()) - float(att.get("paused_total") or 0)
+                   - (max(0,time.time()-att["paused_at"]) if att.get("is_paused") and att.get("paused_at") else 0))
     done = db.finish_attempt(att["id"], status, duration)
     if not done:
         return None
@@ -553,10 +571,10 @@ async def _stop_locked(app: Application, att: dict, notify: bool = True, reason:
     return await _finish_locked(app, att, status="stopped", auto_pdf=auto_pdf)
 
 
-async def stop_quiz(app: Application, user_id: int) -> Optional[dict]:
+async def stop_quiz(app: Application, user_id: int, message_id: Optional[int] = None) -> Optional[dict]:
     async with user_lock(user_id):
         att = db.get_active_attempt(user_id)
-        if not att:
+        if not att or (message_id is not None and att.get("cur_message_id") != message_id):
             return None
         return await _stop_locked(app, att)
 
@@ -568,13 +586,19 @@ async def recover_sessions(app: Application) -> dict:
     stats = {"expired": 0, "timers": 0, "resent": 0, "waiting": 0}
     now = time.time()
     for att in db.list_active_attempts():
+        if att.get("is_paused"):
+            await show_paused_controls(app,"p",att)
+            continue  # Never expire, re-arm or resend a deliberately paused run.
+        if att.get("delivery_pending") or att.get("unanswered_streak",0)>=5:
+            await pause_session_locked(app,"p",att,"Recovered safely paused: pending delivery or five unanswered questions.")
+            continue
         started = att.get("started_ts") or 0
-        if started and now - started > config.SESSION_EXPIRY_HOURS * 3600:
+        if started and now - started - float(att.get("paused_total") or 0) > config.SESSION_EXPIRY_HOURS * 3600:
             db.finish_attempt(att["id"], "expired", now - started)
             stats["expired"] += 1
             continue
         if att.get("cur_poll_id"):
-            timer = int(att.get("timer") or 0)
+            timer = float(att["control_remaining"]) if att.get("control_remaining") is not None else int(att.get("timer") or 0)
             if timer > 0:
                 remaining = (att.get("cur_sent_ts") or now) + timer + config.TIMER_GRACE - now
                 _schedule(app, "timeout", att["id"], max(1.0, remaining),
@@ -587,3 +611,129 @@ async def recover_sessions(app: Application) -> dict:
                       {"attempt_id": att["id"], "index": att["current_index"], "user_id": att["user_id"]})
             stats["resent"] += 1
     return stats
+
+
+# ------------------------------------------------ shared durable control adapters (caller holds session lock)
+
+def _control_record(kind,sid):
+    return db.get_attempt(sid) if kind=="p" else db.get_group_session(sid)
+
+
+async def _close_paused_poll(app,kind,record) -> bool:
+    if not record.get("pause_stop_pending"):
+        return True
+    try:
+        await app.bot.stop_poll(record["chat_id"],record["pause_message_id"])
+    except BadRequest as exc:
+        if not any(token in str(exc).lower() for token in ("already been closed","already closed","poll was closed","message to stop poll not found")):
+            return False
+    except TelegramError:
+        return False
+    db.acknowledge_paused_poll(kind,record["id"],record["control_epoch"])
+    return True
+
+
+async def show_paused_controls(app,kind,record):
+    text=("⏸ Quiz paused\n"+str(record.get("pause_reason") or "Progress saved.")+
+          f"\nSaved position: {record['current_index']}/{record['total']}. Score and recorded answers are preserved.")
+    if record.get("pause_stop_pending"):
+        text+="\nPoll closure is unconfirmed. Resume retries closure before any delivery."
+    if record.get("delivery_pending"):
+        text+="\nDelivery outcome is uncertain. Verify/close any unknown poll before confirming a fresh Restart."
+    try:
+        await app.bot.send_message(record["chat_id"],text,
+            reply_markup=kb.quiz_control_markup(kind,record["id"],record["control_epoch"],True))
+    except TelegramError:
+        log.warning("Paused state is saved; control message unavailable")
+
+
+async def pause_session_locked(app,kind,record,reason) -> bool:
+    if not record or record["status"]!="active" or record.get("is_paused"):
+        return False
+    remaining=None;perm=None;elapsed=0
+    if record.get("cur_poll_id"):
+        if kind=="p":
+            q=db.get_question(record["quiz_id"],record["cur_question_id"])
+            timer=quiz_modes.resolve_question_timer(db.get_quiz(record["quiz_id"]),q or {},default_timer=int(record["timer"] or 0))
+            perm=record.get("cur_perm")
+        else:
+            timer=record["timer"]
+            info=db.get_group_poll(record["cur_poll_id"])
+            perm=info["perm"] if info else None
+        if record.get("control_remaining") is not None:
+            timer=record["control_remaining"]
+        spent=max(0,time.time()-(record.get("cur_sent_ts") or time.time()))
+        elapsed=float(record.get("pause_elapsed") or 0)+spent
+        remaining=max(0.1,float(timer)-spent) if timer else 0
+    if not db.pause_quiz_record(kind,record["id"],record.get("control_epoch",0),reason,remaining,perm,elapsed):
+        return False
+    if kind=="p":
+        _cancel_jobs(app,record["id"])
+    else:
+        group_runner._cancel(app,record["id"])
+    paused=_control_record(kind,record["id"])
+    await _close_paused_poll(app,kind,paused)
+    await show_paused_controls(app,kind,_control_record(kind,record["id"]))
+    return True
+
+
+async def control_action(app,kind,sid,actor_id,chat_id,epoch,action,*,group_admin=False):
+    if kind not in ("p","g"):
+        return "Invalid session kind."
+    lock=user_lock(actor_id) if kind=="p" else group_runner.chat_lock(chat_id)
+    async with lock:
+        record=_control_record(kind,sid)
+        if not record or record["chat_id"]!=chat_id:
+            return "This session belongs to another chat."
+        if (kind=="p" and record["user_id"]!=actor_id) or (kind=="g" and record["started_by"]!=actor_id and not group_admin):
+            return "Not authorized to control this quiz."
+        if record["status"]!="active" or record.get("control_epoch",0)!=epoch:
+            if record["status"]=="active" and record.get("is_paused"):
+                await show_paused_controls(app,kind,record)  # Recover UI without executing the stale action.
+            return "This quiz control has expired; use the newest buttons."
+        if action=="pause":
+            return "ok" if await pause_session_locked(app,kind,record,"Paused manually by the quiz controller.") else "Already paused."
+        if not record.get("is_paused"):
+            return "The quiz is not paused."
+        if action in ("restart","cancel"):
+            if not db.control_confirmation(kind,sid,epoch,action=="restart"):
+                return "Expired control."
+            current=_control_record(kind,sid)
+            text=("🔄 Restart from Question 1? New-run score/progress will reset; previous records are retained. "
+                  "Question order, timer and scoring snapshots stay unchanged. PDF consent does not carry into a new run."
+                  if action=="restart" else "⏸ Still paused; progress saved.")
+            if action=="restart" and record.get("delivery_pending"):
+                text="⚠️ Verify/close any poll from the uncertain send before confirming.\n"+text
+            await app.bot.send_message(chat_id,text,reply_markup=kb.quiz_control_markup(kind,sid,current["control_epoch"],True,action=="restart"))
+            return "ok"
+        if action in ("resume","confirm"):
+            quiz=db.get_quiz(record["quiz_id"])
+            if not quiz or (quiz.get("status")=="draft" and quiz["owner_id"]!=actor_id):
+                return "Still paused: the quiz is missing or no longer available to this controller."
+            allowed,_=access_control.check_quiz_access(actor_id,chat_id,quiz)
+            if not allowed:
+                return "Still paused: existing quiz access rules do not currently permit this action."
+        if not await _close_paused_poll(app,kind,record):
+            return "Still paused: cannot confirm that the previous poll is closed. Retry Resume later."
+        if action=="resume":
+            if record.get("delivery_pending"):
+                return "Still paused: previous poll delivery is uncertain. Verify the chat, then use confirmed Restart; no automatic duplicate will be sent."
+            if not db.resume_quiz_record(kind,sid,epoch):
+                return "Expired or already resumed control."
+            if kind=="p":
+                await send_current(app,sid)
+            else:
+                await group_runner._send_current(app,sid)
+            return "ok"
+        if action=="confirm":
+            new_id=db.restart_quiz_record(kind,sid,epoch)
+            if not new_id:
+                return "Restart confirmation expired or was not requested."
+            if kind=="p":
+                _cancel_jobs(app,sid)
+                await send_current(app,new_id)
+            else:
+                group_runner._cancel(app,sid)
+                await group_runner._send_current(app,new_id)
+            return "ok"
+        return "Invalid quiz control."
