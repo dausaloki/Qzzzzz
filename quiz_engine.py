@@ -363,6 +363,83 @@ def _parse_checked_txt_blocks(text: str):
     return result
 
 
+def _parse_topicwise_txt(text: str):
+    """TXT-only, explicitly headed Q-number blocks; no guessing of answers.
+
+    Guard on multiple numbered headings, each followed by a divider and a Q
+    block. This prevents a contents list or ordinary numbered MCQ from being
+    mistaken for this dialect. PDF and every other TXT dialect keep their path.
+    """
+    lines = text.splitlines()
+    heading = re.compile(r"^\s*(\d+)\.\s+(.+?)\s*$")
+    divider = re.compile(r"^\s*[-=─━_]{3,}\s*$")
+    question = re.compile(r"^\s*Q\s*(\d+)\s*[.):]\s*(.*)$", re.I)
+    option = re.compile(r"^\s*\(([1-4a-d])\)\s*(.*)$", re.I)
+    answer = re.compile(r"^\s*(?:उत्तर|Answer)\s*[:：]\s*\(([1-4a-d])\)\s*(.*)$", re.I)
+    heads = []
+    for i, line in enumerate(lines):
+        match = heading.match(line)
+        if not match:
+            continue
+        j = i + 1
+        while j < len(lines) and not lines[j].strip():
+            j += 1
+        if j == len(lines) or not divider.match(lines[j]):
+            continue
+        j += 1
+        while j < len(lines) and not lines[j].strip():
+            j += 1
+        if j < len(lines) and question.match(lines[j]):
+            heads.append((i, line.strip(), j))
+    if len(heads) < 2:
+        return None
+    result = pdf_parser.ParseResult()
+    result.sections = [label for _, label, _ in heads]
+    result.removed = [("preamble", line) for line in lines[:heads[0][0]] if line.strip()]
+    mapped = {str(i + 1): i for i in range(4)} | {c: i for i, c in enumerate("abcd")}
+    for section, (start, label, first) in enumerate(heads):
+        end = heads[section + 1][0] if section + 1 < len(heads) else len(lines)
+        starts = [i for i in range(first, end) if question.match(lines[i])]
+        seen = set()
+        for k, pos in enumerate(starts):
+            match = question.match(lines[pos])
+            number = int(match.group(1))
+            result.detected_numbers.append(number)
+            block_end = starts[k + 1] if k + 1 < len(starts) else end
+            block = [match.group(2)] + lines[pos + 1:block_end]
+            # A ruled footer is outside the last question, never an option suffix.
+            footer = next((j for j, line in enumerate(block) if divider.match(line)), len(block))
+            result.removed += [("header/footer", line) for line in block[footer:] if line.strip()]
+            block = block[:footer]
+            try:
+                if number in seen:
+                    raise ValueError("duplicate question number within this section")
+                seen.add(number)
+                answers = [(j, answer.match(line)) for j, line in enumerate(block) if answer.match(line)]
+                if len(answers) != 1:
+                    raise ValueError("exactly one explicit उत्तर:/Answer: marker is required")
+                ans_pos, ans = answers[0]
+                if any(line.strip() for line in block[ans_pos + 1:]):
+                    raise ValueError("unrecognised content after answer; review source block")
+                opts = [(j, option.match(line)) for j, line in enumerate(block[:ans_pos]) if option.match(line)]
+                if [mapped[m.group(1).lower()] for _, m in opts] != [0, 1, 2, 3]:
+                    raise ValueError("four ordered options (1)-(4)/(a)-(d) are required")
+                stem = "\n".join(block[:opts[0][0]]).strip()
+                values = []
+                for n, (j, marker) in enumerate(opts):
+                    stop = opts[n + 1][0] if n + 1 < len(opts) else ans_pos
+                    values.append("\n".join([marker.group(2)] + block[j + 1:stop]).strip())
+                if not stem or not all(values):
+                    raise ValueError("empty question or option")
+                result.questions.append(pdf_parser.ParsedQuestion(
+                    number=number, question=stem, options=values,
+                    correct_index=mapped[ans.group(1).lower()], answer_source="inline",
+                    section=section, section_label=label, qtype=detect_qtype(stem)))
+            except ValueError as exc:
+                result.errors.append(pdf_parser.ParseError(number, str(exc), label))
+    return result
+
+
 def parse_txt_source(text: str):
     """Adapt checked A)–D) TXT options to the existing import parser.
 
@@ -370,6 +447,9 @@ def parse_txt_source(text: str):
     matching rows before those options are untouched; the original parser
     still determines question boundaries and preserves source order.
     """
+    topicwise = _parse_topicwise_txt(text)
+    if topicwise is not None:
+        return topicwise
     original = pdf_parser.parse_source(text)
     if original.questions and not original.errors:
         return original  # Every previously valid format keeps its original result.

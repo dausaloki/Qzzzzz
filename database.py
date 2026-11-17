@@ -736,6 +736,19 @@ def count_questions(qid: str) -> int:
         return con.execute("SELECT COUNT(*) FROM questions WHERE quiz_id=?", (qid,)).fetchone()[0]
 
 
+def _normalise_section(value=None, label=None) -> str:
+    """Parser section is an integer index; its label is the original heading.
+
+    Preserve explicit text sections, prefer the heading to an internal numeric
+    index, and preserve numeric zero rather than treating it as absent.
+    """
+    if isinstance(value, str) and value.strip() and not value.strip().isdecimal():
+        return value.strip()
+    if label is not None and str(label).strip():
+        return str(label).strip()
+    return "" if value is None else str(value).strip()
+
+
 def add_question(qid: str, question: str, options: list[str], correct_index: int,
                  explanation: str = "", *, qtype: str = "mcq", pre_text: str = "",
                  pre_media_type: str = "", pre_media_id: str = "",
@@ -757,7 +770,7 @@ def add_question(qid: str, question: str, options: list[str], correct_index: int
         """, (qid, pos, question, json.dumps(list(options), ensure_ascii=False),
               int(correct_index), explanation or "", qtype, pre_text or "",
               pre_media_type or "", pre_media_id or "", source_number, source_ref or "",
-              (section or "").strip()))
+              _normalise_section(section)))
         con.execute("UPDATE quizzes SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (qid,))
         return cur.lastrowid
 
@@ -795,7 +808,7 @@ def add_questions_bulk(qid: str, questions: Iterable[dict], source: str = "impor
         """, [(qid, pos + i + 1, q["question"], json.dumps(list(q["options"]), ensure_ascii=False),
                int(q["correct_index"]), q.get("explanation", "") or "", q.get("qtype", "mcq") or "mcq",
                q.get("pre_text", "") or "", q.get("number"), q.get("source_ref", "") or "",
-               (q.get("section") or q.get("section_label") or "").strip()) for i, q in enumerate(rows)])
+               _normalise_section(q.get("section"), q.get("section_label"))) for i, q in enumerate(rows)])
         con.execute("UPDATE quizzes SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (qid,))
     return len(rows)
 
