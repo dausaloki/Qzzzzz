@@ -2,6 +2,10 @@
 
 Generates a single-file, offline-capable HTML scorecard and question-by-question
 review report featuring:
+
+Optional reference Marked/KaTeX enhancement needs CDN access in the browser;
+the original escaped text/basic-math fallback remains usable offline. The
+report is read-only: it does not start a new quiz or change saved scores.
 * Interactive Question Navigator grid (1..N) with status color-coding
 * Filter tabs (All / Correct / Wrong / Skipped) and live keyword search
 * Full Answer Review with YOUR ANSWER & CORRECT ANSWER badges and explanations
@@ -15,6 +19,7 @@ review report featuring:
 from __future__ import annotations
 
 import html
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -23,6 +28,13 @@ import config
 import database as db
 import quiz_modes
 import review_pdf
+
+# Reference adaptation: devgaganin/Quizbot, commit
+# 9c1453929db8ca1903b361b1dc7b80f7b52c9e40,
+# quizbot/shared/html/quiz_report.py: renderContent(), lt()/tgt().
+# Retained read-only Qzzzzz scorecard/navigation and public report builders.
+# Reference quiz execution, randomization, timers and browser scoring are NOT imported.
+_REFERENCE_LICENSE = 'MIT License\n\nCopyright (c) 2026 devgagan.in\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the "Software"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n'
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -94,7 +106,10 @@ def render_math_and_text(raw: str) -> str:
             out.append(_convert_latex_expr(part[2:-2], display=False))
         else:
             out.append(html.escape(part).replace("\n", "<br>"))
-    return "".join(out)
+    # Keep the original escaped/offline math fallback. Reference enhancement
+    # reads the source via a safely escaped attribute only after libraries load.
+    return ('<span class="report-rich" data-report-source="' + html.escape(text, quote=True)
+            + '">' + "".join(out) + '</span>')
 
 
 def build_html_from_report_data(report: dict, *, negative_mark: Optional[float] = None) -> bytes:
@@ -517,6 +532,10 @@ function applyVisibility() {{
 </script>
 </body>
 </html>"""
+    try:
+        doc = _enhance_reference_report(doc)
+    except Exception:  # optional enhancement must not prevent existing report delivery
+        logging.getLogger(__name__).exception("HTML reference enhancement failed; using existing report")
     return doc.encode("utf-8")
 
 
@@ -616,3 +635,121 @@ def build_latest_html_report(user_id: int, quiz_id: Optional[str] = None, user=N
     if gs:
         return build_html_report_for_group(gs, user_id, user=user)
     return None
+
+
+_REFERENCE_HEAD = """
+<!-- Markdown/KaTeX versions verified in the pinned reference implementation. -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+<style>
+.report-rich { display: block; overflow-wrap: anywhere; }
+.report-rich > :first-child { margin-top: 0; }
+.report-rich > :last-child { margin-bottom: 0; }
+.report-rich pre, .report-rich .katex-display { overflow-x: auto; }
+.report-rich table { border-collapse: collapse; max-width: 100%; }
+.report-rich th, .report-rich td { border: 1px solid var(--border); padding: 4px 8px; }
+.report-rich a { color: var(--primary); }
+</style>
+"""
+
+_REFERENCE_JS = r"""
+(function () {
+'use strict';
+// Security adaptation: the reference's marked output is unsanitized. Do not
+// allow imported question text to acquire executable HTML in a downloaded file.
+function cleanMarkdownHTML(raw) {
+    const template = document.createElement('template');
+    template.innerHTML = raw;
+    const allowed = new Set(['P','BR','STRONG','B','EM','I','CODE','PRE','UL','OL','LI',
+        'BLOCKQUOTE','H1','H2','H3','H4','H5','H6','TABLE','THEAD','TBODY','TR','TH','TD',
+        'HR','A','DEL','S','MARK']);
+    function clean(parent) {
+        Array.from(parent.children).forEach(el => {
+            if (!allowed.has(el.tagName)) {
+                el.replaceWith(document.createTextNode(el.textContent || ''));
+                return;
+            }
+            const href = el.tagName === 'A' ? el.getAttribute('href') : null;
+            Array.from(el.attributes).forEach(attr => el.removeAttribute(attr.name));
+            if (href && /^(https?:|mailto:)/i.test(href.trim())) {
+                el.setAttribute('href', href);
+                el.setAttribute('rel', 'noopener noreferrer');
+            }
+            clean(el);
+        });
+    }
+    clean(template.content);
+    return template.innerHTML;
+}
+function renderContent(text,inline){
+    if(text===undefined||text===null||text==='')return '';
+    let t=String(text);
+    const store=[];
+    const stash=(expr,display)=>{store.push({expr:expr.trim(),display});return '@@MATHPH'+(store.length-1)+'@@'};
+    t=t.replace(/\$\$([\s\S]+?)\$\$/g,(m,e,off,str)=>{
+        const bLine=str.slice(0,off).split('\n').pop();
+        const aLine=str.slice(off+m.length).split('\n')[0];
+        const isBlock=e.indexOf('\n')>=0||(/^\s*$/.test(bLine)&&/^\s*$/.test(aLine));
+        return stash(e,isBlock);
+    });
+    t=t.replace(/(?<!\\)\$(?!\s|\$)([^$\n]+?)(?<!\s)\$(?!\d)/g,(m,e)=>stash(e,false));
+    t=t.replace(/(?<!=)==(?!=|\s)([^=\n]+?)(?<!\s)==(?!=)/g,(m,e)=>'<mark>'+e+'</mark>');
+    let html;
+    try{
+        html=inline?marked.parseInline(t):marked.parse(t);
+    }catch(e){
+        html=t.replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+    html=cleanMarkdownHTML(html);
+    html=html.replace(/@@MATHPH(\d+)@@/g,(m,idx)=>{
+        const item=store[parseInt(idx)];
+        if(!item)return m;
+        try{
+            return katex.renderToString(item.expr,{displayMode:item.display,throwOnError:false,strict:false});
+        }catch(e){
+            const safe = item.expr.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            return item.display?('$$'+safe+'$$'):('$'+safe+'$');
+        }
+    });
+    return html;
+}
+
+function enhanceContent() {
+    if (!window.marked || !window.katex) return; // keep existing readable fallback
+    marked.setOptions({gfm:true,breaks:true});
+    document.querySelectorAll('[data-report-source]').forEach(el => {
+        try {
+            el.innerHTML = renderContent(el.getAttribute('data-report-source'), false);
+            el.setAttribute('data-reference-rendered', 'true');
+        } catch (e) { /* preserve the pre-rendered escaped fallback for this item */ }
+    });
+}
+// Adapted reference lt()/tgt(): preserve existing toggle button and handler,
+// adding only the reference's localStorage persistence. No Telegram UI changes.
+function restoreTheme() {
+    try {
+        const theme = localStorage.getItem('qt');
+        if (theme === 'dark' || theme === 'light') document.documentElement.setAttribute('data-theme', theme);
+    } catch (e) {}
+    const toggle = document.querySelector('[onclick="toggleTheme()"]');
+    if (toggle) toggle.addEventListener('click', function () {
+        try { localStorage.setItem('qt', document.documentElement.getAttribute('data-theme')); } catch (e) {}
+    });
+}
+function ready() { restoreTheme(); enhanceContent(); }
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ready);
+else ready();
+})();
+"""
+
+
+def _enhance_reference_report(doc: str) -> str:
+    """Add only reference rich-text/theme behavior to the existing read-only report.
+
+    All scorecards, navigator, status/answer badges, selection of saved attempts,
+    calculations and Telegram delivery remain in their original implementations.
+    """
+    attribution = '<!-- Reference adaptation: devgaganin/Quizbot\n' + _REFERENCE_LICENSE.replace('--', '- -') + '-->\n'
+    return doc.replace('</head>', attribution + _REFERENCE_HEAD + '</head>', 1).replace(
+        '</body>', '<script>' + _REFERENCE_JS + '</script></body>', 1)
