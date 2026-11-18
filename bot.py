@@ -282,6 +282,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db.upsert_user(user)
     if is_private(update):
         await notify_first_start(context, user)
+    if context.args and context.args[0].startswith("htmlgroup_"):
+        await group_html_report_link(update, context, context.args[0])
+        return
     if context.args and context.args[0] == "join":      # from the inline "join first" button
         context.args = []
     qid = engine.parse_start_payload(context.args[0]) if context.args else None
@@ -570,6 +573,45 @@ async def review_cmd(update: Update, context) -> None:
     elif not res.get("ok"):
         await update.effective_chat.send_message(
             "❌ Review PDF नहीं भेजा जा सका। कृपया थोड़ी देर बाद /review दोबारा भेजें।")
+
+
+async def group_html_report_link(update: Update, context, payload: str) -> None:
+    """Private, exact-session report for the requesting saved participant only.
+
+    The existing membership gate still runs before /start. Never use the latest
+    report fallback here: a shared link must not select a different session/user.
+    """
+    if not is_private(update):
+        await update.effective_chat.send_message(
+            "🌐 अपना HTML Report खोलने के लिए group result का button दबाकर bot की private chat खोलें।")
+        return
+    suffix = payload[len("htmlgroup_"):]
+    if not (suffix.isascii() and suffix.isdecimal() and 0 < len(suffix) <= 19):
+        await update.effective_chat.send_message("⚠️ HTML Report link invalid है।")
+        return
+    sid = int(suffix)
+    if not 0 < sid <= 9223372036854775807:
+        await update.effective_chat.send_message("⚠️ HTML Report link invalid है।")
+        return
+    session = db.get_group_session(sid)
+    user = update.effective_user
+    if not session or session.get("status") not in ("finished", "stopped"):
+        await update.effective_chat.send_message("ℹ️ इस group quiz का completed result उपलब्ध नहीं है।")
+        return
+    if not any(int(a["user_id"]) == user.id for a in db.get_group_answers(sid)):
+        await update.effective_chat.send_message("ℹ️ इस group quiz में आपके saved answers नहीं मिले।")
+        return
+    try:
+        html_bytes, filename, rep = html_report.build_html_report_for_group(session, user.id, user=user)
+        await update.effective_chat.send_document(
+            document=html_bytes, filename=filename,
+            caption=(f"🌐 <b>Interactive HTML Result Report</b> — {esc(rep.get('quiz_title') or 'Quiz')}\n"
+                     "यह आपकी saved answers वाली report है। HTML file download करके browser में खोलें।"),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:  # HTML failure must not affect the saved quiz/result
+        log.warning("could not deliver group HTML report session=%s user=%s", sid, user.id)
+        await update.effective_chat.send_message("❌ HTML Report नहीं भेजी जा सकी — थोड़ी देर बाद दोबारा button दबाएँ।")
 
 
 async def htmlreport_cmd(update: Update, context) -> None:

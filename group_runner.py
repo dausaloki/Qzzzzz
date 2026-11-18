@@ -22,6 +22,7 @@ import time
 from collections import defaultdict
 from typing import Optional
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError, TimedOut
 from telegram.ext import Application, ContextTypes
@@ -400,10 +401,22 @@ async def _finish_locked(app: Application, s: dict, status: str) -> Optional[dic
     text = result_text(done, quiz["title"] if quiz else "Quiz", status == "stopped")
     try:
         chunks = engine.split_message(text)
+        result_markup = kb.group_review_markup(done["id"]) if db.pdf_review_enabled() else None
+        try:
+            username = (await app.bot.get_me()).username
+            if not isinstance(username, str) or not username:
+                raise ValueError("Bot username unavailable")
+            rows = list(result_markup.inline_keyboard) if result_markup else []
+            rows.append([InlineKeyboardButton(
+                "🌐 मेरा HTML Report (private)",
+                url=f"https://t.me/{username}?start=htmlgroup_{done['id']}")])
+            result_markup = InlineKeyboardMarkup(rows)
+        except Exception:  # report-link failure must never suppress the existing result/PDF
+            log.warning("could not add group HTML report link")
         for i, chunk in enumerate(chunks):
             await app.bot.send_message(
                 done["chat_id"], chunk, parse_mode=ParseMode.HTML,
-                reply_markup=kb.group_review_markup(done["id"]) if i == len(chunks) - 1 and db.pdf_review_enabled() else None)
+                reply_markup=result_markup if i == len(chunks) - 1 else None)
     except TelegramError as exc:
         log.warning("could not send group result: %s", exc)
     try:
