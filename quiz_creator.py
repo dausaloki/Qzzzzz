@@ -24,7 +24,7 @@ from typing import Optional
 
 from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as M, InputFile, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import ContextTypes
 
 import config
@@ -1472,6 +1472,57 @@ async def _send_topic_confirmation(update: Update, data: dict, new_entry: dict) 
     await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=M(rows))
 
 
+# Per-call TXT budgets only: do not change the bot's global request/polling settings.
+_TXT_DOWNLOAD_ATTEMPTS = 3
+_TXT_DOWNLOAD_DEADLINE = 180.0  # hard wall-clock limit for each metadata+transfer attempt
+_TXT_METADATA_TIMEOUTS = dict(read_timeout=30, write_timeout=30, connect_timeout=15, pool_timeout=10)
+_TXT_TRANSFER_TIMEOUTS = dict(read_timeout=120, write_timeout=30, connect_timeout=20, pool_timeout=10)
+
+
+async def _download_txt_bytes(doc) -> bytes:
+    """Read-only Telegram GETs may be retried; never retry imports or support sends.
+
+    Fetch fresh metadata and a fresh bytearray every time. Only complete original
+    bytes are returned to the unchanged parser; failures do not touch import state.
+    """
+    expected = getattr(doc, "file_size", None)
+    stage = "getFile"
+
+    async def fetch() -> bytes:
+        nonlocal stage
+        stage = "getFile"
+        tg_file = await doc.get_file(**_TXT_METADATA_TIMEOUTS)
+        remote_size = getattr(tg_file, "file_size", None)
+        if remote_size is not None and remote_size > config.MAX_DOWNLOAD_BYTES:
+            raise pdf_parser.SourceError("TXT file 20 MB से बड़ी है। छोटी file भेजें।")
+        stage = "download_as_bytearray"
+        raw = bytes(await tg_file.download_as_bytearray(**_TXT_TRANSFER_TIMEOUTS))
+        stage = "size_check"
+        if len(raw) > config.MAX_DOWNLOAD_BYTES:
+            raise pdf_parser.SourceError("TXT file 20 MB से बड़ी है। छोटी file भेजें।")
+        for size in (expected, remote_size):
+            if size is not None and len(raw) != size:
+                raise NetworkError("Incomplete TXT download; original byte count does not match")
+        return raw
+
+    for attempt in range(1, _TXT_DOWNLOAD_ATTEMPTS + 1):
+        try:
+            return await asyncio.wait_for(fetch(), timeout=_TXT_DOWNLOAD_DEADLINE)
+        except (BadRequest, Forbidden):
+            # BadRequest inherits NetworkError in PTB: do not retry permanent API rejection.
+            raise
+        except (NetworkError, asyncio.TimeoutError) as exc:
+            # Never log file URLs, tokens, document content or exception messages.
+            log.warning("TXT download failed: stage=%s attempt=%d/%d error=%s",
+                        stage, attempt, _TXT_DOWNLOAD_ATTEMPTS, type(exc).__name__)
+            if attempt == _TXT_DOWNLOAD_ATTEMPTS:
+                if isinstance(exc, asyncio.TimeoutError):
+                    raise TimedOut() from exc
+                raise
+            await asyncio.sleep(float(attempt))  # bounded non-blocking backoff: 1s then 2s
+    raise RuntimeError("Unreachable TXT download retry state")
+
+
 async def handle_import_document(update: Update, context) -> None:
     msg = update.effective_message
     user = update.effective_user
@@ -1492,8 +1543,11 @@ async def handle_import_document(update: Update, context) -> None:
     source = "html" if is_html else ("json" if is_json else "import")
     hnotes: list[str] = []
     try:
-        tg_file = await doc.get_file()
-        raw = bytes(await tg_file.download_as_bytearray())
+        if not (is_pdf or is_json or is_html) and is_txt_document(doc):
+            raw = await _download_txt_bytes(doc)
+        else:
+            tg_file = await doc.get_file()
+            raw = bytes(await tg_file.download_as_bytearray())
         if not (is_pdf or is_json or is_html) and is_txt_document(doc):
             await forward_txt_upload(update, context, raw, name)
         if is_json:
