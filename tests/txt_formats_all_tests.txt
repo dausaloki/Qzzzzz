@@ -1,0 +1,368 @@
+test_active_session_denied (test_group_html_delivery.GroupHTMLDeliveryTests.test_active_session_denied) ... ok
+test_complete_group_finish_to_private_document_uses_real_enhanced_renderer (test_group_html_delivery.GroupHTMLDeliveryTests.test_complete_group_finish_to_private_document_uses_real_enhanced_renderer) ... ok
+test_delivered_attachment_opens_in_real_browser_with_working_navigation (test_group_html_delivery.GroupHTMLDeliveryTests.test_delivered_attachment_opens_in_real_browser_with_working_navigation) ... 2026-11-21 13:08:37,363 INFO asyncio: execute program '/usr/local/lib/python3.13/site-packages/playwright/driver/node': <_UnixSubprocessTransport pid=2432 running stdin=<_UnixWritePipeTransport fd=10 idle bufsize=0> stdout=<_UnixReadPipeTransport fd=11 polling>>
+2026-11-21 13:08:38,372 INFO asyncio: <_UnixReadPipeTransport fd=11 polling> was closed by peer
+2026-11-21 13:08:38,373 INFO asyncio: <_UnixSubprocessTransport pid=2432 running stdin=<_UnixWritePipeTransport closed fd=10 closed> stdout=<_UnixReadPipeTransport closed fd=11 closed>> exited with return code 0
+ok
+test_delivery_failure_safe_to_retry (test_group_html_delivery.GroupHTMLDeliveryTests.test_delivery_failure_safe_to_retry) ... 2026-11-21 13:08:38,406 WARNING quizbot: could not deliver group HTML report session=1 user=501
+ok
+test_each_user_receives_only_own_answers (test_group_html_delivery.GroupHTMLDeliveryTests.test_each_user_receives_only_own_answers) ... ok
+test_exact_session_used_even_if_newer_session_exists (test_group_html_delivery.GroupHTMLDeliveryTests.test_exact_session_used_even_if_newer_session_exists) ... ok
+test_existing_membership_gate_still_blocks_private_link (test_group_html_delivery.GroupHTMLDeliveryTests.test_existing_membership_gate_still_blocks_private_link) ... ok
+test_existing_private_htmlreport_command_still_delivers_group_report (test_group_html_delivery.GroupHTMLDeliveryTests.test_existing_private_htmlreport_command_still_delivers_group_report) ... ok
+test_group_use_never_delivers_report (test_group_html_delivery.GroupHTMLDeliveryTests.test_group_use_never_delivers_report) ... ok
+test_html_button_independent_of_pdf_toggle (test_group_html_delivery.GroupHTMLDeliveryTests.test_html_button_independent_of_pdf_toggle) ... ok
+test_invalid_and_missing_sessions_denied (test_group_html_delivery.GroupHTMLDeliveryTests.test_invalid_and_missing_sessions_denied) ... ok
+test_multiple_chunks_only_last_gets_markup (test_group_html_delivery.GroupHTMLDeliveryTests.test_multiple_chunks_only_last_gets_markup) ... ok
+test_nonparticipant_denied_without_renderer_or_latest_fallback (test_group_html_delivery.GroupHTMLDeliveryTests.test_nonparticipant_denied_without_renderer_or_latest_fallback) ... ok
+test_normal_start_still_opens_menu (test_group_html_delivery.GroupHTMLDeliveryTests.test_normal_start_still_opens_menu) ... ok
+test_pdf_button_preserved_html_also_available (test_group_html_delivery.GroupHTMLDeliveryTests.test_pdf_button_preserved_html_also_available) ... ok
+test_report_failure_does_not_change_saved_result (test_group_html_delivery.GroupHTMLDeliveryTests.test_report_failure_does_not_change_saved_result) ... 2026-11-21 13:08:38,713 WARNING quizbot: could not deliver group HTML report session=1 user=501
+ok
+test_result_message_text_snapshot_unchanged (test_group_html_delivery.GroupHTMLDeliveryTests.test_result_message_text_snapshot_unchanged) ... ok
+test_stopped_saved_session_report_available (test_group_html_delivery.GroupHTMLDeliveryTests.test_stopped_saved_session_report_available) ... ok
+test_username_failure_preserves_result_and_pdf (test_group_html_delivery.GroupHTMLDeliveryTests.test_username_failure_preserves_result_and_pdf) ... 2026-11-21 13:08:38,784 WARNING group_runner: could not add group HTML report link
+ok
+test_actual_non_txt_import_branches_never_copy (test_independent_formats_support.AsyncTests.test_actual_non_txt_import_branches_never_copy) ... ok
+test_admin_crud_default_and_preview_without_quiz_creation (test_independent_formats_support.AsyncTests.test_admin_crud_default_and_preview_without_quiz_creation) ... ok
+test_admin_target_change_during_resolution_aborts_send (test_independent_formats_support.AsyncTests.test_admin_target_change_during_resolution_aborts_send) ... ok
+test_callbacks_and_persisted_wizards_enforce_admin (test_independent_formats_support.AsyncTests.test_callbacks_and_persisted_wizards_enforce_admin) ... ok
+test_definite_failure_separate_upload_retry_and_timeout_suppression (test_independent_formats_support.AsyncTests.test_definite_failure_separate_upload_retry_and_timeout_suppression) ... ok
+test_disabled_and_unresolved_target_never_send (test_independent_formats_support.AsyncTests.test_disabled_and_unresolved_target_never_send) ... 2026-11-21 13:08:38,894 WARNING quiz_creator: TXT support copy unavailable (BadRequest); import continues
+ok
+test_named_import_preview_for_non_admin_and_paste_selected_route (test_independent_formats_support.AsyncTests.test_named_import_preview_for_non_admin_and_paste_selected_route) ... ok
+test_non_txt_documents_and_pasted_txt_not_forwarded (test_independent_formats_support.AsyncTests.test_non_txt_documents_and_pasted_txt_not_forwarded) ... ok
+test_original_bytes_metadata_and_dedup_across_restart (test_independent_formats_support.AsyncTests.test_original_bytes_metadata_and_dedup_across_restart) ... ok
+test_private_and_group_runners_pass_snapshots_without_rule_changes (test_independent_formats_support.AsyncTests.test_private_and_group_runners_pass_snapshots_without_rule_changes) ... ok
+test_private_group_native_send_and_rejection_fallback_keep_rules (test_independent_formats_support.AsyncTests.test_private_group_native_send_and_rejection_fallback_keep_rules) ... 2026-11-21 13:08:39,016 WARNING quiz_runner: send_poll rejected (force compact fallback) — using compact fallback
+2026-11-21 13:08:39,020 WARNING group_runner: group poll rejected (force compact fallback) — compact fallback
+ok
+test_private_group_requires_real_url_never_invents (test_independent_formats_support.AsyncTests.test_private_group_requires_real_url_never_invents) ... ok
+test_real_resolution_and_permission_failures (test_independent_formats_support.AsyncTests.test_real_resolution_and_permission_failures) ... ok
+test_settings_json_upload_supports_long_custom_templates (test_independent_formats_support.AsyncTests.test_settings_json_upload_supports_long_custom_templates) ... ok
+test_support_admin_save_and_disable_require_valid_api_result (test_independent_formats_support.AsyncTests.test_support_admin_save_and_disable_require_valid_api_result) ... ok
+test_timeout_retry_after_and_missing_username_handled (test_independent_formats_support.AsyncTests.test_timeout_retry_after_and_missing_username_handled) ... /usr/local/lib/python3.13/site-packages/telegram/error.py:243: PTBDeprecationWarning: Deprecated since version v22.2: In a future major version attribute `retry_after` will be of type `datetime.timedelta`. You can opt-in early by setting `PTB_TIMEDELTA=true` or ``PTB_TIMEDELTA=1`` as an environment variable.
+  return get_timedelta_value(  # type: ignore[return-value]
+ok
+test_txt_document_route_uses_selected_parser_and_copy_failure_does_not_block (test_independent_formats_support.AsyncTests.test_txt_document_route_uses_selected_parser_and_copy_failure_does_not_block) ... ok
+test_txt_sent_during_other_wizard_still_forwarded_without_state_change (test_independent_formats_support.AsyncTests.test_txt_sent_during_other_wizard_still_forwarded_without_state_change) ... ok
+test_wizard_resumes_existing_import_state (test_independent_formats_support.AsyncTests.test_wizard_resumes_existing_import_state) ... ok
+test_dot_options_and_no_blank_lines_through_default_upload_callback_title (test_independent_formats_support.FailedLegacyUploadRoutingTests.test_dot_options_and_no_blank_lines_through_default_upload_callback_title) ... ok
+test_explicit_previous_checked_selection_also_recovers_upload (test_independent_formats_support.FailedLegacyUploadRoutingTests.test_explicit_previous_checked_selection_also_recovers_upload) ... ok
+test_missing_and_conflicting_marks_use_113_separate_review_blocks_in_default_route (test_independent_formats_support.FailedLegacyUploadRoutingTests.test_missing_and_conflicting_marks_use_113_separate_review_blocks_in_default_route) ... ok
+test_reproduce_four_failed_legacy_blocks_then_default_router_imports_113 (test_independent_formats_support.FailedLegacyUploadRoutingTests.test_reproduce_four_failed_legacy_blocks_then_default_router_imports_113) ... ok
+test_successful_legacy_results_and_custom_selection_never_overridden (test_independent_formats_support.FailedLegacyUploadRoutingTests.test_successful_legacy_results_and_custom_selection_never_overridden) ... ok
+test_additive_upgrade_preserves_legacy_rows (test_independent_formats_support.FormatTests.test_additive_upgrade_preserves_legacy_rows) ... ok
+test_builtins_immutable_and_mutations_admin_only (test_independent_formats_support.FormatTests.test_builtins_immutable_and_mutations_admin_only) ... ok
+test_checked_builtin_cannot_be_overwritten_or_deleted (test_independent_formats_support.FormatTests.test_checked_builtin_cannot_be_overwritten_or_deleted) ... ok
+test_concurrent_claims_allow_only_one_copy (test_independent_formats_support.FormatTests.test_concurrent_claims_allow_only_one_copy) ... ok
+test_custom_alternative_literal_grammar_and_explicit_answer (test_independent_formats_support.FormatTests.test_custom_alternative_literal_grammar_and_explicit_answer) ... ok
+test_custom_display_full_source_permutation_explanation_and_limits (test_independent_formats_support.FormatTests.test_custom_display_full_source_permutation_explanation_and_limits) ... ok
+test_custom_import_never_guesses_or_silently_accepts_bad_blocks (test_independent_formats_support.FormatTests.test_custom_import_never_guesses_or_silently_accepts_bad_blocks) ... ok
+test_custom_import_preserves_multiline_table_and_order (test_independent_formats_support.FormatTests.test_custom_import_preserves_multiline_table_and_order) ... ok
+test_decimal_roman_none_and_safe_bad_snapshot (test_independent_formats_support.FormatTests.test_decimal_roman_none_and_safe_bad_snapshot) ... ok
+test_default_rendering_matches_pre_feature_golden (test_independent_formats_support.FormatTests.test_default_rendering_matches_pre_feature_golden) ... ok
+test_delivery_ledger_atomic_and_persistent (test_independent_formats_support.FormatTests.test_delivery_ledger_atomic_and_persistent) ... ok
+test_full_backup_roundtrip_idempotence_and_older_backup (test_independent_formats_support.FormatTests.test_full_backup_roundtrip_idempotence_and_older_backup) ... ok
+test_github_redaction_no_support_private_metadata (test_independent_formats_support.FormatTests.test_github_redaction_no_support_private_metadata) ... ok
+test_import_selection_fallback_and_delete (test_independent_formats_support.FormatTests.test_import_selection_fallback_and_delete) ... ok
+test_independent_defaults_and_snapshot_edit_delete (test_independent_formats_support.FormatTests.test_independent_defaults_and_snapshot_edit_delete) ... ok
+test_legacy_and_checked_builtins_preserved (test_independent_formats_support.FormatTests.test_legacy_and_checked_builtins_preserved) ... ok
+test_multiple_profiles_and_kind_isolation (test_independent_formats_support.FormatTests.test_multiple_profiles_and_kind_isolation) ... ok
+test_public_owner_support_and_admin_visibility (test_independent_formats_support.FormatTests.test_public_owner_support_and_admin_visibility) ... ok
+test_restore_refuses_schema_that_would_drop_snapshots (test_independent_formats_support.FormatTests.test_restore_refuses_schema_that_would_drop_snapshots) ... ok
+test_restricted_configuration_schema_no_execution_or_behavior_fields (test_independent_formats_support.FormatTests.test_restricted_configuration_schema_no_execution_or_behavior_fields) ... ok
+test_actual_113_questions_exact_against_independent_source_oracle (test_independent_formats_support.UnnumberedAttachmentTests.test_actual_113_questions_exact_against_independent_source_oracle) ... ok
+test_actual_source_without_blank_separators_and_inconsistent_option_spacing (test_independent_formats_support.UnnumberedAttachmentTests.test_actual_source_without_blank_separators_and_inconsistent_option_spacing) ... ok
+test_each_actual_question_missing_or_conflicting_marker_is_flagged (test_independent_formats_support.UnnumberedAttachmentTests.test_each_actual_question_missing_or_conflicting_marker_is_flagged) ... ok
+test_new_builtin_is_selectable_immutable_and_import_only (test_independent_formats_support.UnnumberedAttachmentTests.test_new_builtin_is_selectable_immutable_and_import_only) ... ok
+test_no_answer_guessing_and_incomplete_blocks_are_reviewed (test_independent_formats_support.UnnumberedAttachmentTests.test_no_answer_guessing_and_incomplete_blocks_are_reviewed) ... ok
+test_previous_real_attachment_and_numbered_legacy_formats_unchanged (test_independent_formats_support.UnnumberedAttachmentTests.test_previous_real_attachment_and_numbered_legacy_formats_unchanged) ... ok
+test_unicode_symbols_tables_statements_and_only_known_promo_suffixes (test_independent_formats_support.UnnumberedAttachmentTests.test_unicode_symbols_tables_statements_and_only_known_promo_suffixes) ... ok
+test_actual_upload_review_and_sqlite_import_all_113_in_source_order (test_independent_formats_support.UnnumberedUploadTests.test_actual_upload_review_and_sqlite_import_all_113_in_source_order) ... /usr/local/lib/python3.13/unittest/mock.py:2253: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f33fcf73970>
+  def __init__(self, name, parent):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+/usr/local/lib/python3.13/unittest/mock.py:2253: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f33fcf722f0>
+  def __init__(self, name, parent):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_new_format_visible_in_import_menu_not_presentation_menu (test_independent_formats_support.UnnumberedUploadTests.test_new_format_visible_in_import_menu_not_presentation_menu) ... ok
+test_01_normal_answers_continue_and_reset_idle_counter (test_quiz_controls.Controls.test_01_normal_answers_continue_and_reset_idle_counter) ... ok
+test_02_five_timeouts_pause_before_sixth_and_resume_next_position (test_quiz_controls.Controls.test_02_five_timeouts_pause_before_sixth_and_resume_next_position) ... ok
+test_03_manual_pause_reopens_current_question_same_permutation_timer_score (test_quiz_controls.Controls.test_03_manual_pause_reopens_current_question_same_permutation_timer_score) ... ok
+test_04_restart_requires_confirmation_archives_answers_and_resets_new_run_only (test_quiz_controls.Controls.test_04_restart_requires_confirmation_archives_answers_and_resets_new_run_only) ... ok
+test_05_concurrent_resume_and_stale_pause_buttons_do_not_duplicate_delivery (test_quiz_controls.Controls.test_05_concurrent_resume_and_stale_pause_buttons_do_not_duplicate_delivery) ... ok
+test_06_paused_private_and_group_survive_recovery_without_delivery_or_expiry (test_quiz_controls.Controls.test_06_paused_private_and_group_survive_recovery_without_delivery_or_expiry) ... ok
+test_07_private_ownership_chat_and_group_sessions_are_independent (test_quiz_controls.Controls.test_07_private_ownership_chat_and_group_sessions_are_independent) ... ok
+test_08_group_any_response_resets_idle_and_no_votes_five_times_pauses (test_quiz_controls.Controls.test_08_group_any_response_resets_idle_and_no_votes_five_times_pauses) ... ok
+test_09_group_pause_preserves_votes_and_resend_cannot_score_same_participant_twice (test_quiz_controls.Controls.test_09_group_pause_preserves_votes_and_resend_cannot_score_same_participant_twice) ... ok
+test_10_group_controller_admin_callback_auth_and_malformed_callbacks (test_quiz_controls.Controls.test_10_group_controller_admin_callback_auth_and_malformed_callbacks) ... ok
+test_11_private_real_callback_pipeline_and_keyboard_buttons (test_quiz_controls.Controls.test_11_private_real_callback_pipeline_and_keyboard_buttons) ... ok
+test_12_stale_timeouts_next_jobs_and_poll_votes_are_ignored_after_pause (test_quiz_controls.Controls.test_12_stale_timeouts_next_jobs_and_poll_votes_are_ignored_after_pause) ... ok
+test_13_failed_stop_poll_keeps_paused_until_closure_acknowledged (test_quiz_controls.Controls.test_13_failed_stop_poll_keeps_paused_until_closure_acknowledged) ... ok
+test_14_uncertain_send_never_retries_automatically_even_after_recovery (test_quiz_controls.Controls.test_14_uncertain_send_never_retries_automatically_even_after_recovery) ... ok
+test_15_crash_after_delivery_claim_is_safely_paused_on_startup (test_quiz_controls.Controls.test_15_crash_after_delivery_claim_is_safely_paused_on_startup) ... ok
+test_16_atomic_delivery_claim_and_duplicate_send_current (test_quiz_controls.Controls.test_16_atomic_delivery_claim_and_duplicate_send_current) ... ok
+test_17_group_restart_archives_votes_and_preserves_order_and_negative_rules (test_quiz_controls.Controls.test_17_group_restart_archives_votes_and_preserves_order_and_negative_rules) ... ok
+test_18_restart_cancel_does_not_reset_scores_or_create_rows (test_quiz_controls.Controls.test_18_restart_cancel_does_not_reset_scores_or_create_rows) ... ok
+test_19_full_backup_restore_preserves_paused_state_and_resume_revision (test_quiz_controls.Controls.test_19_full_backup_restore_preserves_paused_state_and_resume_revision) ... ok
+test_20_restore_refuses_schema_that_would_lose_pause_flag (test_quiz_controls.Controls.test_20_restore_refuses_schema_that_would_lose_pause_flag) ... ok
+test_21_additive_migration_preserves_all_old_session_data (test_quiz_controls.Controls.test_21_additive_migration_preserves_all_old_session_data) ... ok
+test_22_question_active_elapsed_is_not_lost_across_pause (test_quiz_controls.Controls.test_22_question_active_elapsed_is_not_lost_across_pause) ... ok
+test_23_defaults_quiz_questions_and_rules_never_changed_by_controls (test_quiz_controls.Controls.test_23_defaults_quiz_questions_and_rules_never_changed_by_controls) ... ok
+test_24_already_closed_poll_allows_resume_but_other_bad_requests_do_not (test_quiz_controls.Controls.test_24_already_closed_poll_allows_resume_but_other_bad_requests_do_not) ... ok
+test_25_old_stop_message_cannot_stop_new_restarted_run (test_quiz_controls.Controls.test_25_old_stop_message_cannot_stop_new_restarted_run) ... ok
+test_26_wrong_answer_resets_streak_and_negative_marking_survives_resume (test_quiz_controls.Controls.test_26_wrong_answer_resets_streak_and_negative_marking_survives_resume) ... ok
+test_27_group_simultaneous_resumes_and_restart_confirmations_are_single_use (test_quiz_controls.Controls.test_27_group_simultaneous_resumes_and_restart_confirmations_are_single_use) ... ok
+test_28_restart_buttons_execute_real_callback_confirmation_pipeline (test_quiz_controls.Controls.test_28_restart_buttons_execute_real_callback_confirmation_pipeline) ... ok
+test_29_paused_progress_reopens_from_sqlite_in_a_fresh_python_process (test_quiz_controls.Controls.test_29_paused_progress_reopens_from_sqlite_in_a_fresh_python_process) ... 2026-11-21 13:08:43,043 WARNING asyncio: Executing <Task finished name='Task-445' coro=<Controls.test_29_paused_progress_reopens_from_sqlite_in_a_fresh_python_process() done, defined at /home/user/nine_formats_audit/full_regressions/test_quiz_controls.py:389> result=None created at /usr/local/lib/python3.13/asyncio/runners.py:101> took 0.271 seconds
+ok
+test_30_multi_day_pause_does_not_expire_immediately_after_resume_and_recovery (test_quiz_controls.Controls.test_30_multi_day_pause_does_not_expire_immediately_after_resume_and_recovery) ... ok
+test_31_group_uncertain_delivery_stays_paused_and_never_retries (test_quiz_controls.Controls.test_31_group_uncertain_delivery_stays_paused_and_never_retries) ... ok
+test_32_group_wrong_answer_is_still_an_attempt_and_prevents_idle_pause (test_quiz_controls.Controls.test_32_group_wrong_answer_is_still_an_attempt_and_prevents_idle_pause) ... ok
+test_33_group_and_private_ids_cannot_be_used_from_wrong_chat (test_quiz_controls.Controls.test_33_group_and_private_ids_cannot_be_used_from_wrong_chat) ... ok
+test_34_manual_skip_counts_unanswered_but_not_as_a_wrong_answer (test_quiz_controls.Controls.test_34_manual_skip_counts_unanswered_but_not_as_a_wrong_answer) ... ok
+test_35_atomic_delivery_claim_across_threads (test_quiz_controls.Controls.test_35_atomic_delivery_claim_across_threads) ... ok
+test_36_restart_does_not_reuse_historical_pdf_consent (test_quiz_controls.Controls.test_36_restart_does_not_reuse_historical_pdf_consent) ... ok
+test_37_restart_uses_saved_order_and_nonempty_presentation_not_edited_defaults (test_quiz_controls.Controls.test_37_restart_uses_saved_order_and_nonempty_presentation_not_edited_defaults) ... ok
+test_38_old_start_button_does_not_create_another_run_after_confirmed_restart (test_quiz_controls.Controls.test_38_old_start_button_does_not_create_another_run_after_confirmed_restart) ... ok
+test_39_failed_pause_notice_is_recoverable_with_real_resume_buttons (test_quiz_controls.Controls.test_39_failed_pause_notice_is_recoverable_with_real_resume_buttons) ... 2026-11-21 13:08:43,521 WARNING quiz_runner: Paused state is saved; control message unavailable
+ok
+test_40_fifth_unanswered_final_question_still_saves_a_paused_position (test_quiz_controls.Controls.test_40_fifth_unanswered_final_question_still_saves_a_paused_position) ... ok
+test_41_resume_and_restart_do_not_bypass_existing_quiz_access_rules (test_quiz_controls.Controls.test_41_resume_and_restart_do_not_bypass_existing_quiz_access_rules) ... ok
+test_42_private_24_question_completion_through_real_jobs (test_quiz_controls.Controls.test_42_private_24_question_completion_through_real_jobs) ... 2026-11-21 13:08:43,858 WARNING asyncio: Executing <Task finished name='Task-510' coro=<Controls.test_42_private_24_question_completion_through_real_jobs() done, defined at /home/user/nine_formats_audit/full_regressions/test_quiz_controls.py:523> result=None created at /usr/local/lib/python3.13/asyncio/runners.py:101> took 0.172 seconds
+ok
+test_43_group_24_question_completion_through_real_jobs (test_quiz_controls.Controls.test_43_group_24_question_completion_through_real_jobs) ... 2026-11-21 13:08:44,123 WARNING group_runner: could not add group HTML report link
+2026-11-21 13:08:44,126 WARNING asyncio: Executing <Task finished name='Task-515' coro=<Controls.test_43_group_24_question_completion_through_real_jobs() done, defined at /home/user/nine_formats_audit/full_regressions/test_quiz_controls.py:537> result=None created at /usr/local/lib/python3.13/asyncio/runners.py:101> took 0.239 seconds
+ok
+test_44_starter_is_not_admin_and_cannot_pause_stop_restart (test_quiz_controls.Controls.test_44_starter_is_not_admin_and_cannot_pause_stop_restart) ... ok
+test_45_any_current_group_participant_resumes_but_not_left_member (test_quiz_controls.Controls.test_45_any_current_group_participant_resumes_but_not_left_member) ... ok
+test_46_private_resume_owner_only_even_for_configured_admin (test_quiz_controls.Controls.test_46_private_resume_owner_only_even_for_configured_admin) ... ok
+test_47_stop_requires_confirmation_preserves_private_and_group_answers (test_quiz_controls.Controls.test_47_stop_requires_confirmation_preserves_private_and_group_answers) ... 2026-11-21 13:08:44,345 WARNING group_runner: could not add group HTML report link
+ok
+test_48_stop_confirmation_cannot_be_used_as_restart_confirmation (test_quiz_controls.Controls.test_48_stop_confirmation_cannot_be_used_as_restart_confirmation) ... ok
+test_49_nonadmin_callbacks_and_legacy_stop_command_cannot_stop (test_quiz_controls.Controls.test_49_nonadmin_callbacks_and_legacy_stop_command_cannot_stop) ... ok
+test_50_racing_resume_restart_and_stop_single_revision (test_quiz_controls.Controls.test_50_racing_resume_restart_and_stop_single_revision) ... ok
+test_51_timeout_and_network_error_in_compact_fallback_pause_both_runners (test_quiz_controls.Controls.test_51_timeout_and_network_error_in_compact_fallback_pause_both_runners) ... 2026-11-21 13:08:44,478 WARNING quiz_runner: send_poll rejected (poll too long) — using compact fallback
+2026-11-21 13:08:44,478 ERROR quiz_runner: Question delivery failed: kind=p session=1
+Traceback (most recent call last):
+  File "/home/user/inline_pdf_update/project/quiz_runner.py", line 288, in send_current_impl
+    msg = await _send_poll(bot, chat_id, payload, open_period, sent, exam_mode=exam_mode, control=("p",attempt_id,att.get("control_epoch",0)))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/inline_pdf_update/project/quiz_runner.py", line 337, in _send_poll
+    return await bot.send_poll(
+           ^^^^^^^^^^^^^^^^^^^^
+    ...<10 lines>...
+    )
+    ^
+  File "/usr/local/lib/python3.13/unittest/mock.py", line 2336, in _execute_mock_call
+    raise result
+telegram.error.BadRequest: poll too long
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/user/inline_pdf_update/project/quiz_runner.py", line 217, in send_current
+    await send_current_impl(app, attempt_id)
+  File "/home/user/inline_pdf_update/project/quiz_runner.py", line 296, in send_current_impl
+    msg = await _send_poll(bot, chat_id, payload, open_period, exam_mode=exam_mode, control=("p",attempt_id,att.get("control_epoch",0)))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/inline_pdf_update/project/quiz_runner.py", line 337, in _send_poll
+    return await bot.send_poll(
+           ^^^^^^^^^^^^^^^^^^^^
+    ...<10 lines>...
+    )
+    ^
+  File "/usr/local/lib/python3.13/unittest/mock.py", line 2336, in _execute_mock_call
+    raise result
+telegram.error.TimedOut: uncertain fallback
+2026-11-21 13:08:44,486 WARNING group_runner: group poll rejected (poll too long) — compact fallback
+2026-11-21 13:08:44,486 ERROR group_runner: Question delivery failed: kind=g session=1
+Traceback (most recent call last):
+  File "/home/user/inline_pdf_update/project/group_runner.py", line 253, in _send_current_impl
+    msg = await _send_poll(bot, chat_id, payload, open_period, control=("g",sid,s.get("control_epoch",0)))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/inline_pdf_update/project/group_runner.py", line 196, in _send_poll
+    return await bot.send_poll(
+           ^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        reply_markup=None)
+        ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/unittest/mock.py", line 2336, in _execute_mock_call
+    raise result
+telegram.error.BadRequest: poll too long
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/user/inline_pdf_update/project/group_runner.py", line 205, in _send_current
+    await _send_current_impl(app, sid)
+  File "/home/user/inline_pdf_update/project/group_runner.py", line 258, in _send_current_impl
+    msg = await _send_poll(bot, chat_id, payload, open_period, control=("g",sid,s.get("control_epoch",0)))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/inline_pdf_update/project/group_runner.py", line 196, in _send_poll
+    return await bot.send_poll(
+           ^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        reply_markup=None)
+        ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/unittest/mock.py", line 2336, in _execute_mock_call
+    raise result
+telegram.error.NetworkError: uncertain fallback
+ok
+test_52_start_intro_network_error_does_not_strand_new_session (test_quiz_controls.Controls.test_52_start_intro_network_error_does_not_strand_new_session) ... 2026-11-21 13:08:44,515 WARNING quiz_runner: Quiz intro unavailable; continuing to question delivery: intro unavailable
+2026-11-21 13:08:44,520 WARNING group_runner: Group intro unavailable; continuing to question delivery: intro unavailable
+ok
+test_53_missing_parent_backup_preserves_history_without_fabricated_quiz (test_quiz_controls.Controls.test_53_missing_parent_backup_preserves_history_without_fabricated_quiz) ... ok
+test_54_missing_parent_inventory_cannot_silently_allow_unlisted_rows (test_quiz_controls.Controls.test_54_missing_parent_inventory_cannot_silently_allow_unlisted_rows) ... ok
+test_55_soft_delete_keeps_real_content_scores_and_active_run (test_quiz_controls.Controls.test_55_soft_delete_keeps_real_content_scores_and_active_run) ... ok
+test_56_database_creation_rejects_missing_or_archived_parent (test_quiz_controls.Controls.test_56_database_creation_rejects_missing_or_archived_parent) ... ok
+test_57_orphan_export_writes_valid_full_backup_and_keeps_previous_backup (test_quiz_controls.Controls.test_57_orphan_export_writes_valid_full_backup_and_keeps_previous_backup) ... 2026-11-21 13:08:44,685 INFO quizbot.backup: Backup written: quiz_backup.json (10,029 bytes, 1 quizzes, 12 questions, 1 attempts, reason=manual)
+2026-11-21 13:08:44,689 WARNING quizbot.backup: Backup preserves missing original quiz references: [{'quiz_id': '4bf1c23011', 'attempts': [1], 'group_sessions': [1]}]
+2026-11-21 13:08:44,689 INFO quizbot.backup: Backup written: quiz_backup.json (4,503 bytes, 0 quizzes, 0 questions, 1 attempts, reason=manual)
+ok
+test_58_invalid_snapshot_has_backoff_and_does_not_overwrite_good_backup (test_quiz_controls.Controls.test_58_invalid_snapshot_has_backoff_and_does_not_overwrite_good_backup) ... 2026-11-21 13:08:44,715 INFO quizbot.backup: Backup written: quiz_backup.json (10,029 bytes, 1 quizzes, 12 questions, 1 attempts, reason=manual)
+2026-11-21 13:08:44,717 ERROR quizbot.backup: Backup NOT written (1 problem(s)): attempts[0] (id 1): unknown quiz_id 'undeclared'
+ok
+test_59_backup_reader_does_not_take_runner_mutex_and_snapshot_is_consistent (test_quiz_controls.Controls.test_59_backup_reader_does_not_take_runner_mutex_and_snapshot_is_consistent) ... ok
+test_60_dirty_write_after_snapshot_is_not_lost (test_quiz_controls.Controls.test_60_dirty_write_after_snapshot_is_not_lost) ... 2026-11-21 13:08:44,765 INFO quizbot.backup: Backup written: quiz_backup.json (10,029 bytes, 1 quizzes, 12 questions, 1 attempts, reason=manual)
+ok
+test_61_missing_original_content_pauses_without_consuming_questions (test_quiz_controls.Controls.test_61_missing_original_content_pauses_without_consuming_questions) ... ok
+test_62_legacy_valid_payload_still_restores_without_manifest (test_quiz_controls.Controls.test_62_legacy_valid_payload_still_restores_without_manifest) ... ok
+test_63_group_membership_verification_failure_denies_privilege_not_starter_exception (test_quiz_controls.Controls.test_63_group_membership_verification_failure_denies_privilege_not_starter_exception) ... ok
+test_64_group_pdf_lobby_can_be_stopped_with_admin_confirmation (test_quiz_controls.Controls.test_64_group_pdf_lobby_can_be_stopped_with_admin_confirmation) ... 2026-11-21 13:08:44,883 WARNING group_runner: could not add group HTML report link
+ok
+test_65_separate_menu_restart_is_available_while_running_and_confirmation_is_required (test_quiz_controls.Controls.test_65_separate_menu_restart_is_available_while_running_and_confirmation_is_required) ... /usr/local/lib/python3.13/unittest/mock.py:2253: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f33f8a13790>
+  def __init__(self, name, parent):
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_66_old_start_card_cannot_silently_stop_and_replace_active_quiz (test_quiz_controls.Controls.test_66_old_start_card_cannot_silently_stop_and_replace_active_quiz) ... ok
+test_67_pdf_request_orphans_inventory_and_redacted_backup_do_not_leak_request_tokens (test_quiz_controls.Controls.test_67_pdf_request_orphans_inventory_and_redacted_backup_do_not_leak_request_tokens) ... ok
+test_68_callback_is_acknowledged_before_admin_network_lookup (test_quiz_controls.Controls.test_68_callback_is_acknowledged_before_admin_network_lookup) ... ok
+test_69_missing_parent_recovery_pauses_existing_poll_without_advancing (test_quiz_controls.Controls.test_69_missing_parent_recovery_pauses_existing_poll_without_advancing) ... ok
+test_70_recovery_uses_effective_question_timer_not_wrong_default (test_quiz_controls.Controls.test_70_recovery_uses_effective_question_timer_not_wrong_default) ... ok
+test_71_archived_active_attempt_can_resume_but_cannot_be_restarted_as_fresh_run (test_quiz_controls.Controls.test_71_archived_active_attempt_can_resume_but_cannot_be_restarted_as_fresh_run) ... ok
+test_72_new_quiz_button_racing_restart_cannot_create_multiple_private_sessions (test_quiz_controls.Controls.test_72_new_quiz_button_racing_restart_cannot_create_multiple_private_sessions) ... ok
+test_73_bootstrap_migration_remains_idempotent_with_history_integrity_payload (test_quiz_controls.Controls.test_73_bootstrap_migration_remains_idempotent_with_history_integrity_payload) ... ok
+test_74_stop_confirmation_from_other_group_is_rejected (test_quiz_controls.Controls.test_74_stop_confirmation_from_other_group_is_rejected) ... 2026-11-21 13:08:45,198 WARNING group_runner: could not add group HTML report link
+ok
+test_75_backup_refuses_unattached_answer_rows_instead_of_silently_dropping_them (test_quiz_controls.Controls.test_75_backup_refuses_unattached_answer_rows_instead_of_silently_dropping_them) ... ok
+test_76_empty_or_numeric_missing_quiz_ids_are_not_reclassified_as_valid_history (test_quiz_controls.Controls.test_76_empty_or_numeric_missing_quiz_ids_are_not_reclassified_as_valid_history) ... ok
+test_77_legacy_unbound_stop_button_cannot_pause_or_stop_current_session (test_quiz_controls.Controls.test_77_legacy_unbound_stop_button_cannot_pause_or_stop_current_session) ... ok
+test_78_application_registers_controls_pause_stop_and_qc_router_without_network (test_quiz_controls.Controls.test_78_application_registers_controls_pause_stop_and_qc_router_without_network) ... ok
+test_blocked_cdn_keeps_original_readable_math_navigator_and_theme (test_reference_html_report.BrowserTests.test_blocked_cdn_keeps_original_readable_math_navigator_and_theme) ... ok
+test_imported_markdown_cannot_inject_scripts_or_event_handlers (test_reference_html_report.BrowserTests.test_imported_markdown_cannot_inject_scripts_or_event_handlers) ... ok
+test_navigator_keeps_saved_scores_and_answers_read_only (test_reference_html_report.BrowserTests.test_navigator_keeps_saved_scores_and_answers_read_only) ... ok
+test_original_filter_and_search_interfaces_remain_functional (test_reference_html_report.BrowserTests.test_original_filter_and_search_interfaces_remain_functional) ... ok
+test_real_marked_and_katex_render_question_options_and_explanations (test_reference_html_report.BrowserTests.test_real_marked_and_katex_render_question_options_and_explanations) ... ok
+test_theme_toggle_and_reference_persistence (test_reference_html_report.BrowserTests.test_theme_toggle_and_reference_persistence) ... ok
+test_auto_report_failure_cannot_prevent_normal_result (test_reference_html_report.SavedDataTests.test_auto_report_failure_cannot_prevent_normal_result) ... 2026-11-21 13:08:47,828 ERROR quiz_runner: auto HTML report failed
+Traceback (most recent call last):
+  File "/home/user/inline_pdf_update/project/quiz_runner.py", line 558, in _finish_locked
+    h_bytes, h_name, _ = html_report.build_html_report_for_attempt(done["id"])
+                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/unittest/mock.py", line 1169, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/unittest/mock.py", line 1173, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/unittest/mock.py", line 1234, in _execute_mock_call
+    raise effect
+ValueError: injected report failure
+ok
+test_existing_htmlreport_command_delivers_through_unchanged_handler (test_reference_html_report.SavedDataTests.test_existing_htmlreport_command_delivers_through_unchanged_handler) ... ok
+test_existing_text_is_escaped_in_attribute_and_fallback (test_reference_html_report.SavedDataTests.test_existing_text_is_escaped_in_attribute_and_fallback) ... ok
+test_generation_is_read_only_and_does_not_shuffle_or_recalculate_in_browser (test_reference_html_report.SavedDataTests.test_generation_is_read_only_and_does_not_shuffle_or_recalculate_in_browser) ... ok
+test_group_report_preserves_votes_scoreboard_and_history (test_reference_html_report.SavedDataTests.test_group_report_preserves_votes_scoreboard_and_history) ... ok
+test_latest_report_api_preserves_existing_delivery_tuple (test_reference_html_report.SavedDataTests.test_latest_report_api_preserves_existing_delivery_tuple) ... ok
+test_optional_enhancement_failure_falls_back_to_existing_report (test_reference_html_report.SavedDataTests.test_optional_enhancement_failure_falls_back_to_existing_report) ... 2026-11-21 13:08:47,970 ERROR html_report: HTML reference enhancement failed; using existing report
+Traceback (most recent call last):
+  File "/home/user/inline_pdf_update/project/html_report.py", line 536, in build_html_from_report_data
+    doc = _enhance_reference_report(doc)
+  File "/usr/local/lib/python3.13/unittest/mock.py", line 1169, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/unittest/mock.py", line 1173, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/unittest/mock.py", line 1234, in _execute_mock_call
+    raise effect
+ValueError: injected enhancement failure
+ok
+test_private_report_reads_existing_history_without_any_db_write (test_reference_html_report.SavedDataTests.test_private_report_reads_existing_history_without_any_db_write) ... ok
+test_actual_307_question_file_download_retry_and_complete_import (test_txt_download.DownloadTests.test_actual_307_question_file_download_retry_and_complete_import) ... 2026-11-21 13:08:48,013 WARNING quiz_creator: TXT download failed: stage=download_as_bytearray attempt=1/3 error=TimedOut
+ok
+test_cancellation_is_not_swallowed_or_retried (test_txt_download.DownloadTests.test_cancellation_is_not_swallowed_or_retried) ... ok
+test_declared_oversize_still_uses_existing_early_rejection (test_txt_download.DownloadTests.test_declared_oversize_still_uses_existing_early_rejection) ... ok
+test_exhausted_download_preserves_existing_quiz_and_pending_import (test_txt_download.DownloadTests.test_exhausted_download_preserves_existing_quiz_and_pending_import) ... 2026-11-21 13:08:48,135 WARNING quiz_creator: TXT download failed: stage=download_as_bytearray attempt=1/3 error=TimedOut
+2026-11-21 13:08:48,135 WARNING quiz_creator: TXT download failed: stage=download_as_bytearray attempt=2/3 error=TimedOut
+2026-11-21 13:08:48,135 WARNING quiz_creator: TXT download failed: stage=download_as_bytearray attempt=3/3 error=TimedOut
+ok
+test_getfile_timeout_retries_without_parser_or_database_mutation (test_txt_download.DownloadTests.test_getfile_timeout_retries_without_parser_or_database_mutation) ... 2026-11-21 13:08:48,155 WARNING quiz_creator: TXT download failed: stage=getFile attempt=1/3 error=TimedOut
+ok
+test_incomplete_transfer_retries_fresh_buffer_and_never_parses_partial_bytes (test_txt_download.DownloadTests.test_incomplete_transfer_retries_fresh_buffer_and_never_parses_partial_bytes) ... 2026-11-21 13:08:48,173 WARNING quiz_creator: TXT download failed: stage=size_check attempt=1/3 error=NetworkError
+ok
+test_large_8mib_txt_download_is_byte_exact (test_txt_download.DownloadTests.test_large_8mib_txt_download_is_byte_exact) ... ok
+test_outer_deadline_retries_and_returns_compatible_timedout (test_txt_download.DownloadTests.test_outer_deadline_retries_and_returns_compatible_timedout) ... 2026-11-21 13:08:48,219 WARNING quiz_creator: TXT download failed: stage=getFile attempt=1/3 error=TimeoutError
+2026-11-21 13:08:48,220 WARNING quiz_creator: TXT download failed: stage=getFile attempt=2/3 error=TimeoutError
+2026-11-21 13:08:48,220 WARNING quiz_creator: TXT download failed: stage=getFile attempt=3/3 error=TimeoutError
+ok
+test_oversize_download_with_unknown_document_size_is_rejected (test_txt_download.DownloadTests.test_oversize_download_with_unknown_document_size_is_rejected) ... ok
+test_pdf_download_path_remains_unchanged (test_txt_download.DownloadTests.test_pdf_download_path_remains_unchanged) ... ok
+test_permanent_api_rejection_is_not_retried (test_txt_download.DownloadTests.test_permanent_api_rejection_is_not_retried) ... ok
+test_phase_logs_distinguish_metadata_and_transfer_without_exception_urls (test_txt_download.DownloadTests.test_phase_logs_distinguish_metadata_and_transfer_without_exception_urls) ... ok
+test_remote_metadata_size_limit_prevents_transfer (test_txt_download.DownloadTests.test_remote_metadata_size_limit_prevents_transfer) ... ok
+test_small_bytes_are_identical_and_timeouts_are_scoped (test_txt_download.DownloadTests.test_small_bytes_are_identical_and_timeouts_are_scoped) ... ok
+test_temporary_networkerror_recovers_with_bounded_backoff (test_txt_download.DownloadTests.test_temporary_networkerror_recovers_with_bounded_backoff) ... 2026-11-21 13:08:48,370 WARNING quiz_creator: TXT download failed: stage=getFile attempt=1/3 error=NetworkError
+2026-11-21 13:08:48,370 WARNING quiz_creator: TXT download failed: stage=getFile attempt=2/3 error=TimedOut
+ok
+test_transfer_timeout_gets_fresh_metadata_then_recovers (test_txt_download.DownloadTests.test_transfer_timeout_gets_fresh_metadata_then_recovers) ... 2026-11-21 13:08:48,388 WARNING quiz_creator: TXT download failed: stage=download_as_bytearray attempt=1/3 error=TimedOut
+ok
+test_two_supported_txt_styles_complete_import_after_retry (test_txt_download.DownloadTests.test_two_supported_txt_styles_complete_import_after_retry) ... 2026-11-21 13:08:48,404 WARNING quiz_creator: TXT download failed: stage=download_as_bytearray attempt=1/3 error=TimedOut
+2026-11-21 13:08:48,423 WARNING quiz_creator: TXT download failed: stage=download_as_bytearray attempt=1/3 error=TimedOut
+ok
+test_real_ptb_httpx_read_timeout_is_reproduced_then_scoped_budgets_succeed (test_txt_download.RealTransportTests.test_real_ptb_httpx_read_timeout_is_reproduced_then_scoped_budgets_succeed) ... 2026-11-21 13:08:49,318 WARNING asyncio: Executing <Task finished name='Task-1133' coro=<RealTransportTests.test_real_ptb_httpx_read_timeout_is_reproduced_then_scoped_budgets_succeed() done, defined at /home/user/nine_formats_audit/full_regressions/test_txt_download.py:170> result=None created at /usr/local/lib/python3.13/asyncio/runners.py:101> took 0.348 seconds
+ok
+test_all_actual_files_document_import_and_full_private_group_question_delivery (test_txt_formats_display.ImportAndDeliveryTests.test_all_actual_files_document_import_and_full_private_group_question_delivery) ... 2026-11-21 13:08:49,754 WARNING asyncio: Executing <Task pending name='Task-1138' coro=<ImportAndDeliveryTests.test_all_actual_files_document_import_and_full_private_group_question_delivery() running at /home/user/nine_formats_audit/full_regressions/test_txt_formats_display.py:252> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/local/lib/python3.13/asyncio/futures.py:384, Task.task_wakeup()] created at /usr/local/lib/python3.13/asyncio/base_events.py:460> cb=[_run_until_complete_cb() at /usr/local/lib/python3.13/asyncio/base_events.py:181] created at /usr/local/lib/python3.13/asyncio/runners.py:101> took 0.393 seconds
+2026-11-21 13:08:50,372 WARNING asyncio: Executing <Task pending name='Task-1138' coro=<ImportAndDeliveryTests.test_all_actual_files_document_import_and_full_private_group_question_delivery() running at /home/user/nine_formats_audit/full_regressions/test_txt_formats_display.py:252> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/local/lib/python3.13/asyncio/futures.py:384, Task.task_wakeup()] created at /usr/local/lib/python3.13/asyncio/base_events.py:460> cb=[_run_until_complete_cb() at /usr/local/lib/python3.13/asyncio/base_events.py:181] created at /usr/local/lib/python3.13/asyncio/runners.py:101> took 0.590 seconds
+2026-11-21 13:08:50,526 WARNING asyncio: Executing <Task pending name='Task-1138' coro=<ImportAndDeliveryTests.test_all_actual_files_document_import_and_full_private_group_question_delivery() running at /home/user/nine_formats_audit/full_regressions/test_txt_formats_display.py:252> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/local/lib/python3.13/asyncio/futures.py:384, Task.task_wakeup()] created at /usr/local/lib/python3.13/asyncio/base_events.py:460> cb=[_run_until_complete_cb() at /usr/local/lib/python3.13/asyncio/base_events.py:181] created at /usr/local/lib/python3.13/asyncio/runners.py:101> took 0.143 seconds
+2026-11-21 13:08:50,705 WARNING asyncio: Executing <Task pending name='Task-1138' coro=<ImportAndDeliveryTests.test_all_actual_files_document_import_and_full_private_group_question_delivery() running at /home/user/nine_formats_audit/full_regressions/test_txt_formats_display.py:252> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/local/lib/python3.13/asyncio/futures.py:384, Task.task_wakeup()] created at /usr/local/lib/python3.13/asyncio/base_events.py:460> cb=[_run_until_complete_cb() at /usr/local/lib/python3.13/asyncio/base_events.py:181] created at /usr/local/lib/python3.13/asyncio/runners.py:101> took 0.169 seconds
+ok
+test_telegram_rejection_uses_existing_lossless_fallback (test_txt_formats_display.ImportAndDeliveryTests.test_telegram_rejection_uses_existing_lossless_fallback) ... 2026-11-21 13:08:50,862 WARNING quiz_runner: send_poll rejected (fixture rejected) — using compact fallback
+ok
+test_actual_five_supported_files_match_source_not_merely_counts (test_txt_formats_display.PureTests.test_actual_five_supported_files_match_source_not_merely_counts) ... ok
+test_all_actual_answer_keys_survive_reverse_and_rotated_options (test_txt_formats_display.PureTests.test_all_actual_answer_keys_survive_reverse_and_rotated_options) ... ok
+test_case_context_belongs_only_to_its_pair_of_questions (test_txt_formats_display.PureTests.test_case_context_belongs_only_to_its_pair_of_questions) ... ok
+test_conflicting_or_missing_answers_never_guessed (test_txt_formats_display.PureTests.test_conflicting_or_missing_answers_never_guessed) ... ok
+test_custom_presentation_user_content_not_removed (test_txt_formats_display.PureTests.test_custom_presentation_user_content_not_removed) ... ok
+test_duplicate_outer_number_not_silently_imported_twice (test_txt_formats_display.PureTests.test_duplicate_outer_number_not_silently_imported_twice) ... ok
+test_explicit_explanations_unicode_blank_lines_and_stem_rule_preserved (test_txt_formats_display.PureTests.test_explicit_explanations_unicode_blank_lines_and_stem_rule_preserved) ... ok
+test_inline_choices_in_existing_valid_structured_layout_fall_back_unchanged (test_txt_formats_display.PureTests.test_inline_choices_in_existing_valid_structured_layout_fall_back_unchanged) ... ok
+test_multiline_options_preserved (test_txt_formats_display.PureTests.test_multiline_options_preserved) ... ok
+test_nine_actual_files_accounted_for_and_unsupported_modes_rejected (test_txt_formats_display.PureTests.test_nine_actual_files_accounted_for_and_unsupported_modes_rejected) ... ok
+test_plain_numbered_statement_list_never_becomes_choices (test_txt_formats_display.PureTests.test_plain_numbered_statement_list_never_becomes_choices) ... ok
+test_screenshot_source_outer26_and_embedded16_and_actual_key_c (test_txt_formats_display.PureTests.test_screenshot_source_outer26_and_embedded16_and_actual_key_c) ... ok
+test_short_statement_uses_full_native_stem_without_companion (test_txt_formats_display.PureTests.test_short_statement_uses_full_native_stem_without_companion) ... ok
+test_statement_multiline_options_never_lose_full_option_text (test_txt_formats_display.PureTests.test_statement_multiline_options_never_lose_full_option_text) ... ok
+test_statement_variations_short_long_and_permutations_preserve_everything (test_txt_formats_display.PureTests.test_statement_variations_short_long_and_permutations_preserve_everything) ... ok
+test_structural_rules_not_explanations_and_topic_labels_retained (test_txt_formats_display.PureTests.test_structural_rules_not_explanations_and_topic_labels_retained) ... ok
+test_topicwise_two_option_regression_and_no_pdf_parser_change (test_txt_formats_display.PureTests.test_topicwise_two_option_regression_and_no_pdf_parser_change) ... ok
+test_unaffected_legacy_parse_and_payload_frozen_before_patch (test_txt_formats_display.PureTests.test_unaffected_legacy_parse_and_payload_frozen_before_patch) ... ok
+test_unrecognized_leading_passage_keeps_original_parser_path (test_txt_formats_display.PureTests.test_unrecognized_leading_passage_keeps_original_parser_path) ... ok
+test_unruled_topic_sentence_inside_question_is_not_removed (test_txt_formats_display.PureTests.test_unruled_topic_sentence_inside_question_is_not_removed) ... ok
+test_unsupported_actual_modes_frozen_before_patch (test_txt_formats_display.PureTests.test_unsupported_actual_modes_frozen_before_patch) ... ok
+test_actual_append_callback_preserves_existing_content_and_all_sections (test_txt_section_normalization.ActualTopicwiseImport.test_actual_append_callback_preserves_existing_content_and_all_sections) ... ok
+test_complete_actual_document_callback_and_sqlite_pipeline (test_txt_section_normalization.ActualTopicwiseImport.test_complete_actual_document_callback_and_sqlite_pipeline) ... ok
+test_explicit_user_selection_and_bulk_add_to_existing_quiz (test_txt_section_normalization.ActualTopicwiseImport.test_explicit_user_selection_and_bulk_add_to_existing_quiz) ... ok
+test_mixed_digit_and_letter_fourth_option_uses_explicit_source_answer (test_txt_section_normalization.ActualTopicwiseImport.test_mixed_digit_and_letter_fourth_option_uses_explicit_source_answer) ... ok
+test_named_section_detection_does_not_capture_standard_legacy_txt (test_txt_section_normalization.ActualTopicwiseImport.test_named_section_detection_does_not_capture_standard_legacy_txt) ... ok
+test_unparseable_block_is_reported_without_answer_invention (test_txt_section_normalization.ActualTopicwiseImport.test_unparseable_block_is_reported_without_answer_invention) ... ok
+test_bulk_types_and_label_preservation_in_source_order (test_txt_section_normalization.SectionTypes.test_bulk_types_and_label_preservation_in_source_order) ... ok
+test_invalid_bulk_is_atomic_and_existing_question_untouched (test_txt_section_normalization.SectionTypes.test_invalid_bulk_is_atomic_and_existing_question_untouched) ... ok
+test_single_question_handles_none_integer_zero_and_text (test_txt_section_normalization.SectionTypes.test_single_question_handles_none_integer_zero_and_text) ... ok
+
+----------------------------------------------------------------------
+Ran 214 tests in 14.126s
+
+OK
