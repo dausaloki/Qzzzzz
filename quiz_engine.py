@@ -219,7 +219,7 @@ def build_poll_payload(question: dict, perm: Sequence[int], index: int, total: i
     assert all(1 <= tg_len(o) <= config.POLL_OPTION_MAX and "\n" not in o for o in payload.options)
     assert config.MIN_OPTIONS <= len(payload.options) <= config.MAX_OPTIONS
     assert payload.explanation is None or tg_len(payload.explanation) <= config.POLL_EXPLANATION_MAX
-    return apply_presentation(payload, question, index, total, presentation, quiz_title) if presentation else payload
+    return apply_presentation(payload, question, index, total, presentation, quiz_title) if presentation else _prioritize_statement_text(payload, question, index, total)
 
 
 def compact_fallback(question: dict, perm: Sequence[int], index: int, total: int, *,
@@ -422,8 +422,8 @@ def _parse_topicwise_txt(text: str):
                 if any(line.strip() for line in block[ans_pos + 1:]):
                     raise ValueError("unrecognised content after answer; review source block")
                 opts = [(j, option.match(line)) for j, line in enumerate(block[:ans_pos]) if option.match(line)]
-                if [mapped[m.group(1).lower()] for _, m in opts] != [0, 1, 2, 3]:
-                    raise ValueError("four ordered options (1)-(4)/(a)-(d) are required")
+                if not (config.MIN_OPTIONS <= len(opts) <= 4) or [mapped[m.group(1).lower()] for _, m in opts] != list(range(len(opts))):
+                    raise ValueError("2–4 ordered options (1)-(4)/(a)-(d) are required")
                 stem = "\n".join(block[:opts[0][0]]).strip()
                 values = []
                 for n, (j, marker) in enumerate(opts):
@@ -440,6 +440,224 @@ def _parse_topicwise_txt(text: str):
     return result
 
 
+
+# TXT-only explicit teaching-sheet layout. Do not change PDF boundary heuristics.
+_TXT_RULE = re.compile(r"^[ \t]*[-=─━_]{3,}[ \t]*$")
+_TXT_TOPIC = re.compile(r"^[ \t]*Topic[ \t]+\d+[ \t]*[:：].+$", re.I)
+_TXT_CASE = re.compile(r"^[ \t]*\[(?:केस|Case)[ \t]+\d+[ \t]*[:：].+\][ \t]*$", re.I)
+_TXT_ANSWER = re.compile(r"^[ \t]*(?:उत्तर|Answer)[ \t]*[:：][ \t]*(?:\(([A-La-l1-9]|1[0-2])\)|\[([A-La-l1-9]|1[0-2])\]|([A-La-l]|1[0-2]|[1-9])(?:\.|(?=\s|$)))[ \t]*(.*)$", re.I)
+
+
+def _structured_txt_choices(lines):
+    """Locate the last ordered choice run; bare numerals need explicit context."""
+    runs, run = [], []
+    for i, line in enumerate(lines):
+        marker = pdf_parser.parse_marker(line)
+        bare = re.match(r"^[ \t]*(\d{1,2})\.[ \t]+(.+)$", line)
+        if marker:
+            family, index, body = marker
+        elif bare and 1 <= int(bare[1]) <= config.MAX_OPTIONS:
+            family, index, body = "bare-numeric", int(bare[1]) - 1, bare[2]
+        else:
+            continue
+        if index == 0:
+            if run:
+                runs.append(run)
+            run = [(i, family, index, body)]
+        elif run and family == run[0][1] and index == len(run):
+            run.append((i, family, index, body))
+        else:
+            if run:
+                runs.append(run)
+            run = []
+    if run:
+        runs.append(run)
+    complete = [r for r in runs if config.MIN_OPTIONS <= len(r) <= config.MAX_OPTIONS]
+    if not complete:
+        return None
+    chosen = complete[-1]
+    if chosen[0][1] == "bare-numeric":
+        lead = "\n".join(lines[:chosen[0][0]])
+        # Never turn an ordinary numbered statement list into choices.
+        cue = next((l for l in reversed(lines[:chosen[0][0]]) if l.strip()), "")
+        if not (re.search(r"Assertion|अभिकथन|कारण\s*\(\s*R\s*\)|सूची|Match|Column", lead, re.I)
+                and re.search(r"कूट|विकल्प|चयन|उत्तर.*चुन|options?|choose|select", cue, re.I)):
+            return None
+    return chosen
+
+
+def _parse_structured_txt(text: str):
+    """Repair only explicit TXT layouts proven broken in the nine-format audit.
+
+    Other dialects (including global answer keys and custom import grammars)
+    retain their previous path. Reuse the existing strict block validator and
+    answer mapping; only establish explicit boundaries/metadata and label syntax.
+    """
+    lines = text.splitlines()
+    duplicate_heads = re.search(r"(?m)^[ \t]*प्रश्न[ \t]+\d+\.[ \t]*\n\s*प्रश्न[ \t]+\d+\.", text)
+    if not (duplicate_heads or any(_TXT_CASE.match(l) for l in lines)
+            or (any(_TXT_TOPIC.match(l) for l in lines) and any(_TXT_RULE.match(l) for l in lines))):
+        return None
+    if not any(pdf_parser.STRONG_Q_RE.match(l) for l in lines):
+        return None
+    # Do not introduce new free-text, True/False-without-options or multi-select modes.
+    if not any(pdf_parser.parse_marker(l) for l in lines) and not re.search(r"Assertion|अभिकथन", text, re.I):
+        return None
+    result = pdf_parser.ParseResult()
+    records, current, topic, context = [], None, "", []
+    collecting_case = False
+    topic_lines = set()
+    for i,line in enumerate(lines):
+        if _TXT_TOPIC.match(line):
+            before = next((l for l in reversed(lines[:i]) if l.strip()), "")
+            after = next((l for l in lines[i+1:] if l.strip()), "")
+            if _TXT_RULE.match(before) or _TXT_RULE.match(after):
+                topic_lines.add(i)
+    for line_no,line in enumerate(lines):
+        if _TXT_CASE.match(line) or line_no in topic_lines:
+            if current is not None:
+                records.append(current)
+                current = None
+            if _TXT_CASE.match(line):
+                context = [line]
+                collecting_case = True
+            else:
+                topic = line.strip()
+                context = []
+                collecting_case = False
+            continue
+        match = pdf_parser.STRONG_Q_RE.match(line)
+        if match:
+            # Consecutive explicit headers are outer and embedded original numbers.
+            # Keep embedded headers verbatim in the stem, never renumber choices.
+            header_only = current is not None and all(not l.strip() or (pdf_parser.STRONG_Q_RE.match(l)
+                                                      and not pdf_parser.STRONG_Q_RE.match(l)["rest"].strip())
+                                                      for l in current["lines"])
+            if header_only:
+                current["lines"].append(line)
+            else:
+                if current is not None:
+                    records.append(current)
+                current = dict(number=int(match["num"]), lines=[line], topic=topic,
+                               pre_text="\n".join(context).strip())
+            collecting_case = False
+            continue
+        if current is not None:
+            # Only rule lines outside the question (after its explicit answer)
+            # are structural; a separator in the actual stem/option is retained.
+            answered = any(re.match(r"^[ \t]*(?:उत्तर|Answer)[ \t]*[:：]", l, re.I)
+                           for l in current["lines"])
+            if answered and _TXT_RULE.match(line):
+                result.removed.append(("TXT separator", line))
+            else:
+                current["lines"].append(line)
+        elif collecting_case:
+            if not _TXT_RULE.match(line):
+                context.append(line)
+        elif line.strip():
+            if not (_TXT_RULE.match(line) or (current is None and line_no+1 < len(lines)
+                        and _TXT_RULE.match(lines[line_no+1])
+                        and line_no > 0 and _TXT_RULE.match(lines[line_no-1]))
+                    or re.match(r"^[ \t]*निर्देश[ \t]*[:：]", line)):
+                # An unrecognized leading passage must not be silently discarded.
+                # Leave other teaching-sheet dialects on the original parser.
+                return None
+            result.removed.append(("TXT preamble", line))
+    if current is not None:
+        records.append(current)
+    if not records:
+        return None
+    seen = set()
+    for rec in records:
+        num, block, section = rec["number"], rec["lines"], rec["topic"]
+        result.detected_numbers.append(num)
+        try:
+            if (section, num) in seen:
+                raise ValueError("duplicate outer question number within this topic")
+            seen.add((section, num))
+            answer_positions = [i for i,l in enumerate(block) if re.match(r"^[ \t]*(?:उत्तर|Answer)[ \t]*[:：]", l, re.I)]
+            if len(answer_positions) != 1:
+                raise ValueError("exactly one explicit उत्तर:/Answer: line is required")
+            ai = answer_positions[0]
+            choices = _structured_txt_choices(block[:ai])
+            if choices is None:
+                raise ValueError("no unambiguous final answer-option block found")
+            values = ["\n".join([entry[3]] + block[entry[0]+1:(choices[j+1][0] if j+1<len(choices) else ai)]).strip()
+                      for j,entry in enumerate(choices)]
+            adapted = list(block)
+            if choices[0][1] == "bare-numeric":
+                for pos, family, index, body in choices:
+                    adapted[pos] = f"({index+1}) {body}"
+            answer = _TXT_ANSWER.match(block[ai])
+            if answer:
+                tok = next(t for t in answer.groups()[:3] if t is not None)
+                index = pdf_parser.token_to_index(tok)
+                rest = answer[4].strip()
+                if re.match(r"^(?:,|और\b|and\b|&|/|\+)", rest, re.I):
+                    raise ValueError("Multiple-correct answers are not supported; no answer was guessed")
+                suffix = re.search(r"\s*\[([a-lA-L1-9]|1[0-2])\]\s*$", rest)
+                repeated = rest[:suffix.start()].strip() if suffix else rest
+                if suffix and pdf_parser.token_to_index(suffix[1]) != index:
+                    raise ValueError("answer token conflicts with bracketed answer token")
+                if index is not None and 0 <= index < len(values):
+                    if pdf_parser._norm_cmp(repeated) == pdf_parser._norm_cmp(values[index]):
+                        adapted[ai] = f"Answer: ({tok})"
+            parsed = pdf_parser._parse_block(num, adapted, None, "", None)
+            # The block validator joins wrapped options. Restore their original
+            # newlines after validation; the sender handles multiline safely.
+            parsed.options = values
+            outer = pdf_parser.STRONG_Q_RE.match(block[0])
+            parsed.question = "\n".join(([outer["rest"]] if outer["rest"].strip() else []) + block[1:choices[0][0]]).strip()
+            parsed.pre_text = rec["pre_text"]
+            parsed.section_label = section
+            parsed.section = result.sections.index(section) if section in result.sections else len(result.sections)
+            if section and section not in result.sections:
+                result.sections.append(section)
+            result.questions.append(parsed)
+        except ValueError as exc:
+            result.errors.append(pdf_parser.ParseError(num, str(exc), section))
+    return result
+
+
+def _statement_combination(question: dict) -> bool:
+    """Structural display guard, not a broad qtype/keyword-only change."""
+    text = str(question.get("question") or "")
+    numbers = [int(m[1]) for m in re.finditer(r"(?m)^[ \t]*(\d+)\.[ \t]+\S", text)]
+    # A source may retain an earlier original-number heading (e.g. 26. ...).
+    # Only the final 1,2,... statement sequence identifies the statement block.
+    if 1 in numbers:
+        numbers = numbers[len(numbers)-1-numbers[::-1].index(1):]
+    options = question.get("options") or []
+    return (len(numbers) >= 2 and numbers == list(range(1,len(numbers)+1))
+            and bool(re.search(r"कथन|statements?", text, re.I))
+            and len(options) >= 2 and all(re.search(r"केवल|सभी|only|all|both|neither", str(o), re.I) for o in options))
+
+
+def _prioritize_statement_text(payload: PollPayload, question: dict, index: int, total: int) -> PollPayload:
+    """Keep the whole statement, never a clipped source; all other types unchanged."""
+    if not _statement_combination(question):
+        return payload
+    text = split_tag(str(question["question"]))
+    src = source_no(question,index)
+    prefix = f"[Q{src}] " if src else f"[{index+1}/{total}] "
+    shown = [str(question["options"][i]) for i in payload.perm]
+    safe_options = (not payload.compact and all("\n" not in o and 0 < tg_len(o) <= config.POLL_OPTION_MAX for o in shown)
+                    and len(set(shown)) == len(shown))
+    # Respect source numbering even when the stem fits but prefix does not.
+    # An embedded original header is already part of text and is never removed.
+    if safe_options and tg_len(prefix+text) <= config.POLL_QUESTION_MAX:
+        full = _tag_head()+prefix+text
+        payload.question = full if tg_len(full)<=config.POLL_QUESTION_MAX else prefix+text
+        payload.full_text_chunks = []
+        payload.options = shown
+        payload.long_question = False
+    else:
+        if not payload.full_text_chunks:
+            payload.full_text_chunks = split_message(full_question_text(text,shown,index,total,src))
+        payload.long_question = tg_len(text) > config.POLL_QUESTION_MAX
+    return payload
+
+
 def parse_txt_source(text: str):
     """Adapt checked A)–D) TXT options to the existing import parser.
 
@@ -447,6 +665,15 @@ def parse_txt_source(text: str):
     matching rows before those options are untouched; the original parser
     still determines question boundaries and preserves source order.
     """
+    structured = _parse_structured_txt(text)
+    if structured is not None:
+        # Do not regress an already valid dialect the narrow option recognizer
+        # does not cover (e.g. inline choices). Never fall back on answer conflicts.
+        if structured.errors and all(e.message == "no unambiguous final answer-option block found" for e in structured.errors):
+            legacy = pdf_parser.parse_source(text)
+            if legacy.questions and not legacy.errors:
+                return legacy
+        return structured
     topicwise = _parse_topicwise_txt(text)
     if topicwise is not None:
         return topicwise
