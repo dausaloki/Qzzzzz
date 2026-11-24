@@ -34,7 +34,6 @@ import keyboards as kb
 import quiz_engine as engine
 import quiz_modes
 import review_pdf
-import html_report
 from keyboards import esc
 
 log = logging.getLogger(__name__)
@@ -393,30 +392,6 @@ def result_text(s: dict, title: str, stopped: bool) -> str:
     return "\n".join(lines)
 
 
-def _group_leaderboard_attachment(session: dict, title: str, stopped: bool) -> bytes:
-    """Read-only view of the existing result's order and exact score conventions."""
-    total = int(session["total"])
-    asked = total if not stopped else int(session.get("asked") or 0)
-    denom = asked or total
-    board = db.group_leaderboard(session["id"])
-    neg = quiz_modes.negative_of(session)
-    if neg > 0:
-        # Identical stable ordering to result_text; elapsed/user ties remain as stored.
-        board = sorted(board, key=lambda r: -quiz_modes.compute_net_score(
-            int(r["correct"]), int(r["wrong"]), neg))
-    rows = []
-    for position, row in enumerate(board, 1):
-        correct, wrong = int(row["correct"]), int(row["wrong"])
-        score = (quiz_modes.format_score(quiz_modes.compute_net_score(correct, wrong, neg))
-                 if neg > 0 else str(int(row.get("score") or 0)))
-        rows.append(dict(rank=position, name=_name(row), correct=correct, wrong=wrong,
-                         score=f"{score}/{denom}", elapsed=float(row.get("elapsed") or 0),
-                         percentage=f"{100.0 * correct / denom if denom else 0.0:.2f}%"))
-    return html_report.build_group_leaderboard_html(
-        title, rows, asked=asked, total=total, stopped=stopped,
-        negative_label=quiz_modes.negative_label(neg) if neg > 0 else "")
-
-
 async def _finish_locked(app: Application, s: dict, status: str) -> Optional[dict]:
     _cancel(app, s["id"])
     done = db.finish_group_session(s["id"], status, time.time())
@@ -444,17 +419,6 @@ async def _finish_locked(app: Application, s: dict, status: str) -> Optional[dic
                 reply_markup=result_markup if i == len(chunks) - 1 else None)
     except TelegramError as exc:
         log.warning("could not send group result: %s", exc)
-    # Telegram message HTML cannot render tables/CSS. Deliver the same public
-    # leaderboard automatically as a browser-openable attachment, not a new button.
-    try:
-        document = await asyncio.to_thread(
-            _group_leaderboard_attachment, done, quiz["title"] if quiz else "Quiz", status == "stopped")
-        await app.bot.send_document(
-            chat_id=done["chat_id"], document=document,
-            filename=f"Leaderboard_Group_{done['id']}.html",
-            caption="🏆 Full Quiz Leaderboard — HTML file download करके browser में खोलें। Pages के लिए Previous / Next इस्तेमाल करें।")
-    except Exception:  # attachment problems must never affect saved results or PDF delivery
-        log.warning("could not deliver group HTML leaderboard for session %s", done["id"])
     try:
         await review_pdf.auto_group_after_finish(app, done)
     except Exception:                       # noqa: BLE001
