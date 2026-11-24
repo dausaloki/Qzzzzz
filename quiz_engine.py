@@ -151,7 +151,8 @@ def source_no(question: dict, index: int) -> Optional[int]:
 
 def full_question_text(question_text: str, options: Sequence[str], index: int, total: int,
                        src: Optional[int] = None) -> str:
-    head = f"❓ प्रश्न {src} ({index + 1}/{total})" if src else f"❓ प्रश्न {index + 1}/{total}"
+    # src is retained for caller compatibility, never used as the active number.
+    head = f"❓ Q{index + 1} · {index + 1}/{total}"
     lines = [head, "", split_tag(question_text), ""]
     if config.QUESTION_TAG:
         lines = [config.QUESTION_TAG, ""] + lines
@@ -180,7 +181,7 @@ def build_poll_payload(question: dict, perm: Sequence[int], index: int, total: i
     head = _tag_head()
 
     src = source_no(question, index)
-    prefix = f"[Q{src} · {index + 1}/{total}] " if src else f"[{index + 1}/{total}] "
+    prefix = f"[Q{index + 1} · {index + 1}/{total}] "
     # Poll options are single-line: an option with a line break is shown
     # flattened in the poll AND verbatim in the full-text message.
     multiline = any("\n" in o for o in shown)
@@ -188,7 +189,7 @@ def build_poll_payload(question: dict, perm: Sequence[int], index: int, total: i
     long_opts = any(tg_len(o) > config.POLL_OPTION_MAX or not o for o in poll_opts)
     dup_opts = len(set(poll_opts)) != len(poll_opts)
     # the tag counts toward the 300-unit poll question limit
-    long_q = tg_len(head + qtext) > config.POLL_QUESTION_MAX
+    long_q = tg_len(head + prefix + qtext) > config.POLL_QUESTION_MAX
 
     payload = PollPayload(question="", options=[], correct_option_id=correct, perm=perm)
     if not long_q and not long_opts and not dup_opts and not multiline:
@@ -228,7 +229,7 @@ def compact_fallback(question: dict, perm: Sequence[int], index: int, total: int
     perm = list(perm)
     shown = [str(question["options"][i]).strip() for i in perm]
     p = PollPayload(
-        question=f"{_tag_head()}[{index + 1}/{total}] ऊपर दिए गए प्रश्न का सही विकल्प चुनें",
+        question=f"{_tag_head()}[Q{index + 1} · {index + 1}/{total}] ऊपर दिए गए प्रश्न का सही विकल्प चुनें",
         options=[f"({LABELS[i]})" for i in range(len(shown))],
         correct_option_id=display_correct(perm, int(question["correct_index"])),
         perm=perm,
@@ -639,11 +640,11 @@ def _prioritize_statement_text(payload: PollPayload, question: dict, index: int,
         return payload
     text = split_tag(str(question["question"]))
     src = source_no(question,index)
-    prefix = f"[Q{src}] " if src else f"[{index+1}/{total}] "
+    prefix = f"[Q{index + 1} · {index + 1}/{total}] "
     shown = [str(question["options"][i]) for i in payload.perm]
     safe_options = (not payload.compact and all("\n" not in o and 0 < tg_len(o) <= config.POLL_OPTION_MAX for o in shown)
                     and len(set(shown)) == len(shown))
-    # Respect source numbering even when the stem fits but prefix does not.
+    # Keep the session number even when the stem fits but the tag does not.
     # An embedded original header is already part of text and is never removed.
     if safe_options and tg_len(prefix+text) <= config.POLL_QUESTION_MAX:
         full = _tag_head()+prefix+text
@@ -1038,15 +1039,16 @@ def apply_presentation(payload: PollPayload, question: dict, index: int, total: 
                "quiz_title":quiz_title,"quiz_id":question.get("quiz_id","")}
     label = lambda i: settings["option_labels"][i] if i < len(settings["option_labels"]) else LABELS[i]
     shown = [str(question["options"][i]) for i in payload.perm]
-    heading = settings["heading"].format(**context)
-    parts = [settings[k].format(**context) for k in ("header","branding","heading","accompanying_text")]
+    active_number = f"[Q{index + 1} · {index + 1}/{total}]"
+    heading = active_number + "\n" + settings["heading"].format(**context)
+    parts = [active_number] + [settings[k].format(**context) for k in ("header","branding","heading","accompanying_text")]
     parts += [str(question["question"]),"\n".join(f"{label(i)} {text}" for i,text in enumerate(shown)),settings["footer"].format(**context)]
     payload.full_text_chunks = split_message("\n\n".join(part for part in parts if part))
     full = heading + ("\n" if heading else "") + str(question["question"])
     if not compact and tg_len(full) <= config.POLL_QUESTION_MAX and full.strip():
         payload.question = full
     else:
-        prompt = (heading + "\n" if heading and tg_len(heading)<200 else "") + "ऊपर दिए गए पूरे प्रश्न का सही विकल्प चुनें।"
+        prompt = (heading + "\n" if tg_len(heading)<200 else active_number + "\n") + "ऊपर दिए गए पूरे प्रश्न का सही विकल्प चुनें।"
         payload.question = prompt
     opts = [f"{label(i)} {' '.join(text.split())}" for i,text in enumerate(shown)]
     if compact or any(tg_len(x)>config.POLL_OPTION_MAX for x in opts):
