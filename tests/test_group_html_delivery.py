@@ -86,16 +86,7 @@ class GroupHTMLDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Stored explanation',text);self.assertIn('katex.min.js',text)
         self.assertIn('marked.min.js',text);self.assertIn('report-rich',text)
         self.assertEqual(self.saved(),before);self.assertEqual(db.group_leaderboard(self.sid),board)
-        # The public aggregate leaderboard is now automatic; private answer-review
-        # HTML must still never be posted to the group.
-        self.client.send_document.assert_awaited_once()
-        aggregate=self.client.send_document.await_args.kwargs
-        self.assertEqual(aggregate['chat_id'],-10055)
-        self.assertEqual(aggregate['filename'],f'Leaderboard_Group_{self.sid}.html')
-        public_html=aggregate['document'].decode()
-        self.assertIn('Leaderboard',public_html)
-        self.assertNotIn('Saved **question** 0',public_html)
-        self.assertNotIn('Stored explanation',public_html)
+        self.client.send_document.assert_not_awaited()  # no participant HTML posted to group
     async def test_delivered_attachment_opens_in_real_browser_with_working_navigation(self):
         # Test-only dependency: pip install playwright; python -m playwright install chromium
         from playwright.async_api import async_playwright
