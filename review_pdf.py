@@ -1547,7 +1547,15 @@ class _BookCanvas(_Canvas):
             return
         wm = _load_watermark()
         if not wm:
-            raise ValueError("Book export requires the existing watermark image; check WATERMARK_IMAGE_PATH.")
+            # A source-only deployment may omit assets/. Keep the book usable
+            # and watermarked using existing branding, never alter Review PDFs.
+            for cy in (200.0, 440.0, 680.0):
+                text = OWNER_NAME
+                size = min(22.0, 300.0 / max(fitz.get_text_length(text, fontsize=1), 1))
+                width = fitz.get_text_length(text, fontsize=size)
+                page.insert_text((PAGE_W/2-width/2, cy), text, fontsize=size,
+                                 color=C_GREY, fill_opacity=0.10, overlay=False)
+            return
         raw, width, height, alpha = wm
         if not self._wm_smask_xref:
             self._wm_smask_xref = self.doc.get_new_xref()
@@ -1575,9 +1583,14 @@ def build_quiz_book(quiz_id: str, requester_id: int) -> tuple[bytes, int]:
     questions = db.get_questions(quiz_id)
     if not questions:
         raise ValueError("This quiz has no questions to export.")
-    if not _load_watermark():
-        raise ValueError("Existing watermark image unavailable. Check WATERMARK_IMAGE_PATH on the server.")
-    if fonts().degraded:
+    wm_available = bool(_load_watermark())
+    log.info("exportbook assets quiz=%s questions=%s watermark_image=%s path=%s fitz=%s",
+             quiz_id, len(questions), wm_available, config.WATERMARK_IMAGE_PATH, fitz.VersionBind)
+    if not wm_available:
+        log.warning("exportbook image unavailable; using three owner-brand text watermarks per internal page")
+    fb = fonts()
+    log.info("exportbook fonts degraded=%s devanagari=%s latin=%s", fb.degraded, getattr(fb, "dev_file", None), getattr(fb, "lat_file", None))
+    if fb.degraded:
         raise ValueError("Hindi/English PDF fonts unavailable. Check the existing PDF font configuration.")
     cv = _BookCanvas(header="Quiz Book · " + str(quiz.get("title") or "Quiz"))
     try:
@@ -1627,7 +1640,10 @@ def build_quiz_book(quiz_id: str, requester_id: int) -> tuple[bytes, int]:
             cv.rule(gap_before=8, gap_after=14)
         cv.doc.set_metadata({"title": str(quiz.get("title") or "Quiz Study Book"),
                              "author": OWNER_NAME, "subject": "Quiz study material"})
-        return cv.save(footer_left="Study Book"), cv.pages
+        pdf = cv.save(footer_left="Study Book")
+        validate_book_pdf(pdf, cv.pages)
+        log.info("exportbook rendered quiz=%s bytes=%s pages=%s", quiz_id, len(pdf), cv.pages)
+        return pdf, cv.pages
     finally:
         if not cv.doc.is_closed:
             cv.doc.close()
@@ -1646,12 +1662,24 @@ def build_latest_group_quiz_book(chat_id: int, requester_id: int) -> tuple[bytes
         raise ValueError("Book selection requires a Telegram group chat ID.")
     with db.connect() as con:
         row = con.execute(
-            """SELECT quiz_id FROM group_sessions
+            """SELECT id, quiz_id, status, finished_ts FROM group_sessions
                WHERE chat_id=? AND status IN ('finished','stopped')
                ORDER BY COALESCE(finished_ts, started_ts, 0) DESC, id DESC
                LIMIT 1""", (chat_id,)).fetchone()
     if row is None:
+        log.warning("exportbook selection none chat=%s db=%s", chat_id, db.get_db_path())
         raise ValueError("No completed or stopped quiz exists in this group yet.")
+    log.info("exportbook selected chat=%s session=%s quiz=%s status=%s finished_ts=%s db=%s",
+             chat_id, row["id"], row["quiz_id"], row["status"], row["finished_ts"], db.get_db_path())
     quiz_id = str(row["quiz_id"])
     pdf, pages = build_quiz_book(quiz_id, requester_id)
     return pdf, pages, quiz_id
+
+
+def validate_book_pdf(pdf: bytes, expected_pages: int) -> None:
+    """Validate actual bytes, not just a successful renderer return value."""
+    if not isinstance(pdf, bytes) or not pdf.startswith(b"%PDF-"):
+        raise ValueError("PDF generation returned empty or invalid PDF data.")
+    with fitz.open(stream=pdf, filetype="pdf") as doc:
+        if doc.is_encrypted or len(doc) < 2 or len(doc) != expected_pages:
+            raise ValueError("Generated book failed PDF page validation.")

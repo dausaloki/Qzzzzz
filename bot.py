@@ -548,50 +548,98 @@ async def backup_cmd(update: Update, context) -> None:
     await chat.send_message(BACKUP_HELP, parse_mode=ParseMode.HTML)
 
 
+# Literal marker identifies running code, not merely files uploaded to disk.
+BOOK_EXPORT_BUILD = "group-book-runtime-v3"
+
+
+def _book_runtime_log() -> None:
+    import hashlib
+    from pathlib import Path
+    for module_path in (__file__, review_pdf.__file__):
+        try:
+            path = Path(module_path).resolve()
+            log.info("exportbook runtime build=%s file=%s disk_sha256=%s",
+                     BOOK_EXPORT_BUILD, path, hashlib.sha256(path.read_bytes()).hexdigest())
+        except OSError:
+            log.exception("exportbook runtime fingerprint unavailable")
+    log.info("exportbook runtime db=%s renderer_selector=%s validator=%s",
+             db.get_db_path(), callable(getattr(review_pdf, "build_latest_group_quiz_book", None)),
+             callable(getattr(review_pdf, "validate_book_pdf", None)))
+
+
 async def exportbook_cmd(update: Update, context) -> None:
-    """Owner-only book: latest completed/stopped quiz in groups, ID in private."""
-    user = update.effective_user
-    chat = update.effective_chat
-    # Authorize BEFORE any quiz lookup, rendering, or content disclosure.
-    if not user or not config.is_owner(user.id):
+    """Owner-only full-bank export, with observable stages and group delivery."""
+    user, chat = update.effective_user, update.effective_chat
+    ref = f"{BOOK_EXPORT_BUILD}:{getattr(update, 'update_id', 'local')}"
+    stage = "authorize"
+    log.info("exportbook received ref=%s chat=%s type=%s actor=%s sender_chat=%s",
+             ref, getattr(chat, "id", None), getattr(chat, "type", None),
+             getattr(user, "id", None),
+             getattr(getattr(update.effective_message, "sender_chat", None), "id", None)
+             if getattr(update, "effective_message", None) else None)
+
+    async def notice(text):
         if chat:
-            await chat.send_message("🚫 Only the configured Bot Owner can export quiz books.")
-        return
-    if not chat:
-        return
-    in_group = chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
-    if not in_group and (chat.type != ChatType.PRIVATE or chat.id != user.id):
-        return
-    args = list(context.args or [])
-    if not in_group and len(args) != 1:
-        await chat.send_message("Usage: /exportbook <quiz_id> in private, or /exportbook in a quiz group.")
-        return
+            try:
+                await chat.send_message(text)
+            except Exception:
+                # Even error messages may be forbidden; never lose that evidence.
+                log.exception("exportbook notice failed ref=%s chat=%s stage=%s", ref, chat.id, stage)
+
     try:
+        if not user or not config.is_owner(user.id):
+            log.warning("exportbook unauthorized ref=%s actor=%s", ref, getattr(user, "id", None))
+            await notice("🚫 Only the configured Bot Owner can export quiz books. "
+                         "If posting anonymously/as a channel, switch to your personal Owner account. " + ref)
+            return
+        if not chat:
+            log.warning("exportbook no effective chat ref=%s", ref)
+            return
+        in_group = chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+        if not in_group and (chat.type != ChatType.PRIVATE or chat.id != user.id):
+            await notice("Use /exportbook in a quiz group, or /exportbook <quiz_id> privately.")
+            return
+        args = list(context.args or [])
+        if not in_group and len(args) != 1:
+            await notice("Usage: /exportbook <quiz_id> in private, or /exportbook in a quiz group.")
+            return
+        _book_runtime_log()
+        await notice("📚 Export request received; selecting the quiz and generating the complete book… " + ref)
+        stage = "select/render"
+        log.info("exportbook begin ref=%s stage=%s chat=%s", ref, stage, chat.id)
         if in_group:
-            # Group arguments never override the persisted same-chat selection.
             pdf, pages, quiz_id = await asyncio.to_thread(
                 review_pdf.build_latest_group_quiz_book, chat.id, user.id)
         else:
             quiz_id = args[0]
             pdf, pages = await asyncio.to_thread(review_pdf.build_quiz_book, quiz_id, user.id)
-        # Recheck authorization immediately before delivery, including config changes.
-        if not config.is_owner(user.id):
-            await chat.send_message("🚫 Owner authorization changed; export cancelled.")
-            return
+        stage = "validate"
         if review_pdf._too_big(pdf):
-            await chat.send_message("Book exceeds Telegram's configured PDF size limit; export not sent.")
-            return
-        await context.bot.send_document(
-            chat_id=chat.id if in_group else user.id, document=pdf,
-            filename=f"Quiz_Book_{quiz_id}.pdf",
-            caption=f"Quiz Study Book · {pages} pages", protect_content=True)
-    except ValueError as exc:
-        await chat.send_message(str(exc))
-    except PermissionError:
-        await chat.send_message("🚫 Only the configured Bot Owner can export quiz books.")
-    except Exception:
-        log.exception("owner book export failed")
-        await chat.send_message("Book export failed. Existing quiz data and Review PDF are unchanged; check server logs.")
+            raise ValueError("Book exceeds the 49 MiB upload guard; PDF not sent.")
+        await asyncio.to_thread(review_pdf.validate_book_pdf, pdf, pages)
+        if not config.is_owner(user.id):
+            raise PermissionError("Owner authorization changed; export cancelled.")
+        stage = "send_document"
+        destination = chat.id if in_group else user.id
+        log.info("exportbook sending ref=%s destination=%s quiz=%s bytes=%s pages=%s",
+                 ref, destination, quiz_id, len(pdf), pages)
+        sent = await context.bot.send_document(
+            chat_id=destination, document=pdf, filename=f"Quiz_Book_{quiz_id}.pdf",
+            caption=f"Quiz Study Book · {pages} pages", protect_content=True,
+            write_timeout=180, read_timeout=180, connect_timeout=30, pool_timeout=30)
+        log.info("exportbook delivered ref=%s chat=%s message=%s", ref, destination,
+                 getattr(sent, "message_id", None))
+    except (ValueError, PermissionError) as exc:
+        log.exception("exportbook rejected ref=%s stage=%s", ref, stage)
+        await notice(f"Book export failed ({stage}): {exc} [{ref}]")
+    except TelegramError as exc:
+        log.exception("exportbook Telegram failure ref=%s stage=%s", ref, stage)
+        await notice(f"Book export failed ({stage}): {type(exc).__name__}: {exc}. "
+                     f"Check bot document-send permissions/network. [{ref}]")
+    except Exception as exc:
+        log.exception("exportbook failure ref=%s stage=%s", ref, stage)
+        await notice(f"Book export failed ({stage}, {type(exc).__name__}). "
+                     f"Check server logs for [{ref}]. Quiz data is unchanged.")
 
 
 async def review_cmd(update: Update, context) -> None:
@@ -1668,6 +1716,8 @@ def build_application(token: str, request=None, get_updates_request=None, rate_l
     app.add_handler(CommandHandler("share", share_cmd))
     app.add_handler(CommandHandler("review", review_cmd))
     app.add_handler(CommandHandler("exportbook", exportbook_cmd))
+    log.info("exportbook handler registered build=%s group=0 (all chat types)", BOOK_EXPORT_BUILD)
+    _book_runtime_log()
     app.add_handler(CommandHandler(["htmlreport", "report"], htmlreport_cmd))
     app.add_handler(CommandHandler("aiquiz", aiquiz_cmd))
     app.add_handler(CommandHandler("quizmode", quizmode_cmd))
