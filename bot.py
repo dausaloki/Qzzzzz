@@ -549,7 +549,7 @@ async def backup_cmd(update: Update, context) -> None:
 
 
 async def exportbook_cmd(update: Update, context) -> None:
-    """/exportbook <quiz_id> — separate, private, bot-owner-only study export."""
+    """Owner-only book: latest completed/stopped quiz in groups, ID in private."""
     user = update.effective_user
     chat = update.effective_chat
     # Authorize BEFORE any quiz lookup, rendering, or content disclosure.
@@ -557,16 +557,23 @@ async def exportbook_cmd(update: Update, context) -> None:
         if chat:
             await chat.send_message("🚫 Only the configured Bot Owner can export quiz books.")
         return
-    if not chat or chat.type != ChatType.PRIVATE or chat.id != user.id:
-        if chat:
-            await chat.send_message("Send /exportbook <quiz_id> in your private chat with this bot.")
+    if not chat:
+        return
+    in_group = chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+    if not in_group and (chat.type != ChatType.PRIVATE or chat.id != user.id):
         return
     args = list(context.args or [])
-    if len(args) != 1:
-        await chat.send_message("Usage: /exportbook <quiz_id>")
+    if not in_group and len(args) != 1:
+        await chat.send_message("Usage: /exportbook <quiz_id> in private, or /exportbook in a quiz group.")
         return
     try:
-        pdf, pages = await asyncio.to_thread(review_pdf.build_quiz_book, args[0], user.id)
+        if in_group:
+            # Group arguments never override the persisted same-chat selection.
+            pdf, pages, quiz_id = await asyncio.to_thread(
+                review_pdf.build_latest_group_quiz_book, chat.id, user.id)
+        else:
+            quiz_id = args[0]
+            pdf, pages = await asyncio.to_thread(review_pdf.build_quiz_book, quiz_id, user.id)
         # Recheck authorization immediately before delivery, including config changes.
         if not config.is_owner(user.id):
             await chat.send_message("🚫 Owner authorization changed; export cancelled.")
@@ -575,7 +582,8 @@ async def exportbook_cmd(update: Update, context) -> None:
             await chat.send_message("Book exceeds Telegram's configured PDF size limit; export not sent.")
             return
         await context.bot.send_document(
-            chat_id=user.id, document=pdf, filename=f"Quiz_Book_{args[0]}.pdf",
+            chat_id=chat.id if in_group else user.id, document=pdf,
+            filename=f"Quiz_Book_{quiz_id}.pdf",
             caption=f"Quiz Study Book · {pages} pages", protect_content=True)
     except ValueError as exc:
         await chat.send_message(str(exc))

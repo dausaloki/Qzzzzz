@@ -1631,3 +1631,27 @@ def build_quiz_book(quiz_id: str, requester_id: int) -> tuple[bytes, int]:
     finally:
         if not cv.doc.is_closed:
             cv.doc.close()
+
+
+def build_latest_group_quiz_book(chat_id: int, requester_id: int) -> tuple[bytes, int, str]:
+    """Export the latest eligible session's whole quiz bank, strictly same chat.
+
+    Admin stop/cancellation is persisted as 'stopped' in the current runners.
+    Do not require participant answers, Review PDF consent, or a completed bank.
+    Missing/deleted latest quiz content is reported, never replaced by another quiz.
+    """
+    if not config.is_owner(requester_id):
+        raise PermissionError("Only the configured bot owner may export books.")
+    if not isinstance(chat_id, int) or isinstance(chat_id, bool) or chat_id >= 0:
+        raise ValueError("Book selection requires a Telegram group chat ID.")
+    with db.connect() as con:
+        row = con.execute(
+            """SELECT quiz_id FROM group_sessions
+               WHERE chat_id=? AND status IN ('finished','stopped')
+               ORDER BY COALESCE(finished_ts, started_ts, 0) DESC, id DESC
+               LIMIT 1""", (chat_id,)).fetchone()
+    if row is None:
+        raise ValueError("No completed or stopped quiz exists in this group yet.")
+    quiz_id = str(row["quiz_id"])
+    pdf, pages = build_quiz_book(quiz_id, requester_id)
+    return pdf, pages, quiz_id
