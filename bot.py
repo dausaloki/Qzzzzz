@@ -548,6 +548,44 @@ async def backup_cmd(update: Update, context) -> None:
     await chat.send_message(BACKUP_HELP, parse_mode=ParseMode.HTML)
 
 
+async def exportbook_cmd(update: Update, context) -> None:
+    """/exportbook <quiz_id> — separate, private, bot-owner-only study export."""
+    user = update.effective_user
+    chat = update.effective_chat
+    # Authorize BEFORE any quiz lookup, rendering, or content disclosure.
+    if not user or not config.is_owner(user.id):
+        if chat:
+            await chat.send_message("🚫 Only the configured Bot Owner can export quiz books.")
+        return
+    if not chat or chat.type != ChatType.PRIVATE or chat.id != user.id:
+        if chat:
+            await chat.send_message("Send /exportbook <quiz_id> in your private chat with this bot.")
+        return
+    args = list(context.args or [])
+    if len(args) != 1:
+        await chat.send_message("Usage: /exportbook <quiz_id>")
+        return
+    try:
+        pdf, pages = await asyncio.to_thread(review_pdf.build_quiz_book, args[0], user.id)
+        # Recheck authorization immediately before delivery, including config changes.
+        if not config.is_owner(user.id):
+            await chat.send_message("🚫 Owner authorization changed; export cancelled.")
+            return
+        if review_pdf._too_big(pdf):
+            await chat.send_message("Book exceeds Telegram's configured PDF size limit; export not sent.")
+            return
+        await context.bot.send_document(
+            chat_id=user.id, document=pdf, filename=f"Quiz_Book_{args[0]}.pdf",
+            caption=f"Quiz Study Book · {pages} pages", protect_content=True)
+    except ValueError as exc:
+        await chat.send_message(str(exc))
+    except PermissionError:
+        await chat.send_message("🚫 Only the configured Bot Owner can export quiz books.")
+    except Exception:
+        log.exception("owner book export failed")
+        await chat.send_message("Book export failed. Existing quiz data and Review PDF are unchanged; check server logs.")
+
+
 async def review_cmd(update: Update, context) -> None:
     """/review — re-send the complete review PDF of the last finished quiz (explicit request)."""
     if not is_private(update):
@@ -1621,6 +1659,7 @@ def build_application(token: str, request=None, get_updates_request=None, rate_l
     app.add_handler(CommandHandler("quiz", quiz_cmd))
     app.add_handler(CommandHandler("share", share_cmd))
     app.add_handler(CommandHandler("review", review_cmd))
+    app.add_handler(CommandHandler("exportbook", exportbook_cmd))
     app.add_handler(CommandHandler(["htmlreport", "report"], htmlreport_cmd))
     app.add_handler(CommandHandler("aiquiz", aiquiz_cmd))
     app.add_handler(CommandHandler("quizmode", quizmode_cmd))

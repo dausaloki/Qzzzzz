@@ -1536,3 +1536,98 @@ async def deliver_latest_review(bot, user_id: int, *, target: Optional[dict] = N
     if not canonical or int(canonical["user_id"]) != int(user_id):
         return {"ok": False, "error": "wrong-user"}
     return await deliver_attempt(bot, canonical, force=True, reason="command")
+
+
+# Separate owner-only study-book export. Never uses participant/attempt records.
+class _BookCanvas(_Canvas):
+    def _draw_watermark(self, page) -> None:
+        # Page one is the dedicated cover; all subsequent pages get exactly
+        # three low-opacity instances of the existing configured image.
+        if self.pages == 1:
+            return
+        wm = _load_watermark()
+        if not wm:
+            raise ValueError("Book export requires the existing watermark image; check WATERMARK_IMAGE_PATH.")
+        raw, width, height, alpha = wm
+        if not self._wm_smask_xref:
+            self._wm_smask_xref = self.doc.get_new_xref()
+            self.doc.update_object(self._wm_smask_xref,
+                f"<< /Type /XObject /Subtype /Image /Width {width} /Height {height} "
+                "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode >>")
+            self.doc.update_stream(self._wm_smask_xref, alpha, compress=False)
+            self.doc.xref_set_key(self._wm_smask_xref, "Filter", "/FlateDecode")
+        for cy in (200.0, 440.0, 680.0):
+            rect = fitz.Rect(PAGE_W/2-92, cy-92, PAGE_W/2+92, cy+92)
+            self._wm_xref = page.insert_image(rect, stream=raw, xref=self._wm_xref,
+                                              keep_proportion=True, overlay=False)
+            self.doc.xref_set_key(self._wm_xref, "SMask", f"{self._wm_smask_xref} 0 R")
+
+
+def build_quiz_book(quiz_id: str, requester_id: int) -> tuple[bytes, int]:
+    """Read-only owner export → PDF bytes/pages. Review-PDF behavior is untouched."""
+    if not config.is_owner(requester_id):
+        raise PermissionError("Only the configured bot owner may export books.")
+    if not isinstance(quiz_id, str) or not re.fullmatch(r"[A-Za-z0-9]{4,32}", quiz_id):
+        raise ValueError("Invalid quiz ID. Use /exportbook <quiz_id>.")
+    quiz = db.get_quiz(quiz_id)
+    if not quiz:
+        raise ValueError("Quiz not found.")
+    questions = db.get_questions(quiz_id)
+    if not questions:
+        raise ValueError("This quiz has no questions to export.")
+    if not _load_watermark():
+        raise ValueError("Existing watermark image unavailable. Check WATERMARK_IMAGE_PATH on the server.")
+    if fonts().degraded:
+        raise ValueError("Hindi/English PDF fonts unavailable. Check the existing PDF font configuration.")
+    cv = _BookCanvas(header="Quiz Book · " + str(quiz.get("title") or "Quiz"))
+    try:
+        cv.new_page()
+        cv.page.draw_rect(fitz.Rect(0, 0, PAGE_W, 155), color=C_BLUE, fill=C_BLUE)
+        cv._draw_runs(MARGIN_L, 66, "QUIZ STUDY BOOK", 24, (1, 1, 1), bold=True)
+        cv._draw_runs(MARGIN_L, 99, "Competitive Examination Series", 13, (0.86, 0.90, 0.97))
+        cv.y = 195
+        # Flow the entire title, even if exceptionally long; never truncate it.
+        cv.line(str(quiz.get("title") or "Quiz"), TITLE_PT, C_BLUE, bold=True, gap=25)
+        cv.rule()
+        cv.line("अध्ययन सामग्री · Practice & Revision", SECTION_PT, C_DARK, gap=18)
+        cv.line(f"{len(questions)} Questions · Answers & Explanations", BODY_PT, gap=12)
+        cv.line(OWNER_LINE_OWNER, BODY_PT, C_GREY, gap=6)
+        cv.line(OWNER_LINE_USER, BODY_PT, C_GREY, gap=6)
+        cv.line(OFFICIAL_GROUP_URL, BODY_PT, C_BLUE, gap=20)
+        cv.line("Complete questions · Original options · Study notes", BODY_PT, C_GREY)
+        cv.new_page()  # questions always begin after the cover, never on it
+        last_section = last_pre = None
+        for number, q in enumerate(questions, 1):
+            section = str(q.get("section") or "")
+            if section and section != last_section:
+                cv.ensure(100)
+                cv.line(section, SECTION_PT, C_BLUE, bold=True, gap=8)
+            last_section = section
+            pre = str(q.get("pre_text") or "")
+            if pre and pre != last_pre:
+                cv.box(pre.splitlines(), size=BODY_PT, color=C_GREY)
+            last_pre = pre
+            cv.ensure(80)
+            cv.line(f"Q{number} · {number}/{len(questions)}", SECTION_PT, C_BLUE, bold=True, gap=5)
+            for line in str(q.get("question") or "").splitlines():
+                cv.line(line, QUESTION_PT, gap=2)
+            cv.space(7)
+            options = list(q.get("options") or [])
+            for i, option in enumerate(options):
+                for j, line in enumerate(str(option).splitlines() or [""]):
+                    cv.line((f"{_label(i)} " if j == 0 else "") + line, BODY_PT, indent=10, gap=2)
+            correct = _correct_set(q)
+            valid = [i for i in correct if 0 <= i < len(options)]
+            cv.space(8)
+            cv.line("सही उत्तर / Answer: " + (", ".join(_label(i) for i in valid)
+                    if valid else "Not verified in source"), BODY_PT, C_GREEN, bold=True, gap=5)
+            explanation = str(q.get("explanation") or "")
+            if explanation:
+                cv.box(["व्याख्या / Explanation", *explanation.splitlines()], size=BODY_PT)
+            cv.rule(gap_before=8, gap_after=14)
+        cv.doc.set_metadata({"title": str(quiz.get("title") or "Quiz Study Book"),
+                             "author": OWNER_NAME, "subject": "Quiz study material"})
+        return cv.save(footer_left="Study Book"), cv.pages
+    finally:
+        if not cv.doc.is_closed:
+            cv.doc.close()
